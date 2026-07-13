@@ -490,6 +490,10 @@ impl App {
         let _ = std::io::stdin().read_line(&mut buf);
 
         *terminal = ratatui::init();
+        // An installer may have appended the tool's dir to the persisted PATH
+        // (winget does this for VICE) without updating this running process —
+        // pull those entries in so the check below actually finds the new tool.
+        gwm_core::tools::refresh_path_from_registry();
         self.refresh_tool_status();
         self.screen = Screen::Tools;
 

@@ -1469,12 +1469,31 @@ mod tests {
         assert_eq!(parse_c1541_free(text), Some(662));
     }
 
+    /// A `Command` that prints `lines` to stdout and exits 0, using the host shell
+    /// — a stand-in for real `c1541` so `run_c1541`'s output parsing can be tested
+    /// on any platform (cargo's Windows environment has no `sh`).
+    fn fake_c1541(lines: &[&str]) -> Command {
+        #[cfg(windows)]
+        {
+            // cmd.exe echoes its args literally (no quoting); `&` chains commands.
+            let script = lines.iter().map(|l| format!("echo {l}")).collect::<Vec<_>>().join(" & ");
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(script);
+            c
+        }
+        #[cfg(not(windows))]
+        {
+            let script = lines.iter().map(|l| format!("echo '{l}'")).collect::<Vec<_>>().join("; ");
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(script);
+            c
+        }
+    }
+
     #[test]
     fn c1541_run_detects_silent_failure() {
         // c1541 exits 0 even when it can't find a file; catch the message.
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg("echo 'OPENCBM: warning'; echo 'ERR = 62, FILE NOT FOUND, 00, 00'; exit 0");
+        let cmd = fake_c1541(&["OPENCBM: warning", "ERR = 62, FILE NOT FOUND, 00, 00"]);
         let err = run_c1541(cmd).unwrap_err();
         assert!(err.to_string().contains("FILE NOT FOUND"));
     }
@@ -1489,7 +1508,15 @@ mod tests {
         // Exact match.
         assert_eq!(find_extracted(&dir, "STOR.DAT"), Some(dir.join("STOR.DAT")));
         // Case-folded match (c1541 may have folded PETSCII case on the host name).
-        assert_eq!(find_extracted(&dir, "stor.dat"), Some(dir.join("STOR.DAT")));
+        // On a case-insensitive filesystem (Windows) the exact-match branch already
+        // resolves `stor.dat` to the same file and returns the query's casing, so
+        // compare case-insensitively rather than on the exact string.
+        let folded = find_extracted(&dir, "stor.dat").expect("should locate STOR.DAT");
+        assert!(folded.is_file());
+        assert_eq!(
+            folded.file_name().and_then(|n| n.to_str()).map(str::to_lowercase),
+            Some("stor.dat".to_string())
+        );
         // Absent.
         assert_eq!(find_extracted(&dir, "nope.prg"), None);
 
@@ -1498,8 +1525,7 @@ mod tests {
 
     #[test]
     fn c1541_run_ignores_opencbm_warning() {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("echo 'OPENCBM: opening dynamic library failed'; echo ok");
+        let cmd = fake_c1541(&["OPENCBM: opening dynamic library failed", "ok"]);
         assert!(run_c1541(cmd).is_ok());
     }
 

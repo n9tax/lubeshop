@@ -417,6 +417,64 @@ pub fn ensure_user_path() {
 #[cfg(windows)]
 pub fn ensure_user_path() {}
 
+/// After an interactive install returns, pull any newly-persisted PATH entries
+/// into *this* process so the post-install `installed()` check sees them.
+///
+/// On Windows this matters: `winget install` writes the new tool's directory to
+/// the **registry** PATH (e.g. VICE's `c1541.exe` lands in a versioned
+/// `…\WinGet\Packages\VICE-Team.VICE.GTK3_…\bin`, which winget appends to the
+/// User PATH), but it can't update an already-running process's environment. Our
+/// running app therefore still has the *old* PATH, so `where c1541` fails and we'd
+/// wrongly tell the user VICE "isn't packaged for your system" right after a
+/// successful install. Re-reading the registry PATH and merging in the missing
+/// entries fixes that without the user restarting the app.
+#[cfg(windows)]
+pub fn refresh_path_from_registry() {
+    use std::path::PathBuf;
+    // PowerShell expands REG_EXPAND_SZ and joins Machine + User exactly as a
+    // freshly-launched shell would compute PATH.
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')",
+        ])
+        .stderr(Stdio::null())
+        .output();
+    let Ok(out) = out else { return };
+    if !out.status.success() {
+        return;
+    }
+    let persisted = String::from_utf8_lossy(&out.stdout);
+    let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let mut changed = false;
+    for entry in persisted.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let p = PathBuf::from(entry);
+        if !paths.iter().any(|e| e == &p) {
+            paths.push(p);
+            changed = true;
+        }
+    }
+    if changed {
+        if let Ok(joined) = std::env::join_paths(paths) {
+            std::env::set_var("PATH", joined);
+        }
+    }
+}
+
+/// Non-Windows: `pipx`/build recipes install into `~/.local/bin`, which
+/// [`ensure_user_path`] already added to this process's PATH at startup, so
+/// there's nothing to re-read after an install.
+#[cfg(not(windows))]
+pub fn refresh_path_from_registry() {}
+
 /// Is a tool's command available on PATH?
 pub fn installed(cmd: &str) -> bool {
     #[cfg(windows)]
@@ -464,10 +522,16 @@ mod tests {
 
     #[test]
     fn detects_present_and_absent_commands() {
-        assert!(installed("sh"));
+        // A command that always exists on the host OS: the shell on Unix, `cmd` on
+        // Windows (both are on PATH by definition of the platform).
+        let always = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(installed(always));
         assert!(!installed("gwm-definitely-not-a-real-command-xyz"));
     }
 
+    // `run_streamed` drives a POSIX shell (`sh -c`), so its tests only apply where
+    // that shell exists.
+    #[cfg(not(windows))]
     #[test]
     fn streams_lines_and_reports_success() {
         let mut lines = Vec::new();
@@ -476,12 +540,35 @@ mod tests {
         assert_eq!(lines, vec!["alpha", "beta"]);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn reports_failure_exit() {
         let ok = run_streamed("exit 3", |_| {}).unwrap();
         assert!(!ok);
     }
 
+    // The Windows installer resolver: winget id → a `winget install` line; a
+    // not-yet-ported tool → manual guidance pointing at its homepage.
+    #[cfg(windows)]
+    #[test]
+    fn win_resolver_uses_winget_or_falls_back_to_homepage() {
+        assert_eq!(
+            win_resolve(WinSource::Winget("VICE-Team.VICE.GTK3"), HP),
+            InstallPlan::Run(
+                "winget install --id VICE-Team.VICE.GTK3 -e \
+                 --accept-package-agreements --accept-source-agreements"
+                    .to_string()
+            )
+        );
+        assert!(matches!(
+            win_resolve(WinSource::Todo, HP),
+            InstallPlan::Manual { site, .. } if site == HP
+        ));
+    }
+
+    // The remaining resolver tests exercise the Linux `resolve`/`PkgMgr` path, which
+    // is `#[cfg(not(windows))]` — so are the tests.
+    #[cfg(not(windows))]
     #[test]
     fn system_package_uses_the_detected_manager() {
         let deb = resolve(Source::System("cpmtools"), HP, Some(PkgMgr::Apt), false);
@@ -490,6 +577,7 @@ mod tests {
         assert_eq!(arch, InstallPlan::Run("paru -S --needed cpmtools".to_string()));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn pip_tool_uses_pipx_and_ensurepath() {
         assert_eq!(
@@ -502,6 +590,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn pipgit_ensures_git_then_installs_from_the_url() {
         // greaseweazle isn't on PyPI; install from git, ensuring git first.
@@ -521,6 +610,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn aur_only_tool_is_manual_off_arch() {
         assert!(matches!(
@@ -529,6 +619,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn build_recipe_maps_prereqs_per_distro() {
         // Debian: build-essential + git + the download steps.
@@ -554,6 +645,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn vice_builds_from_source_on_debian_but_uses_the_package_on_arch() {
         // Apt → the "try package, else build c1541 from source" script.
