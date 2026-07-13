@@ -27,15 +27,43 @@ release workflow (`.github/workflows/release.yml`) fires on version tags.
    git push origin main --tags
    ```
 
-3. `release.yml` builds three Linux targets and attaches tarballs (+ `.sha256`) to
-   a GitHub Release named after the tag:
+3. `release.yml` builds these and attaches them (+ `.sha256`) to a GitHub Release
+   named after the tag:
    - `x86_64-unknown-linux-gnu` — smallest, for recent distros
    - `x86_64-unknown-linux-musl` — fully static, runs on any distro (hand this to
      testers when unsure)
    - `aarch64-unknown-linux-gnu` — Raspberry Pi 4/5 etc.
+   - **`lubeshop_<ver>_amd64.deb`** — Debian/Ubuntu package
 
    Each tarball contains the `lubeshop` binary + `README.md`. Testers just extract
    and run `./lubeshop`; the in-app **Tools** menu installs the external tools.
+
+## Debian/Ubuntu package (.deb)
+
+The `.deb` is configured in `crates/gwm-tui/Cargo.toml` under
+`[package.metadata.deb]`. It installs `lubeshop` to `/usr/bin`, and marks the
+Debian-packaged disk tools (`cpmtools`, `mtools`, `vice`) as **Recommends** so apt
+offers them; the Python tools (gw, amitools) and unpackaged ones (AppleCommander,
+HxC) are handled by the app's own distro-aware Tools menu.
+
+Build it:
+
+```sh
+cargo install cargo-deb        # one-time
+cargo deb -p gwm-tui           # → target/debian/lubeshop_<ver>_amd64.deb
+```
+
+Install / test it on Debian or Ubuntu:
+
+```sh
+sudo apt install ./lubeshop_0.1.0-1_amd64.deb   # pulls in the Recommends too
+```
+
+> **Build it on Debian/Ubuntu (or let CI do it).** On a non-Debian host (e.g. Arch)
+> `dpkg-shlibdeps` isn't available, so the `Depends:` line comes out empty — the
+> package still runs on a real Debian box (libc is always present) but won't
+> declare its libc dependency. The release workflow builds the `.deb` on Ubuntu so
+> that dependency is filled in correctly; prefer that artifact for distribution.
 
 You can also trigger it manually from the Actions tab (`workflow_dispatch`) to
 smoke-test the build before tagging.

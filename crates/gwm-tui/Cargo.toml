@@ -9,6 +9,30 @@ license.workspace = true
 name = "lubeshop"
 path = "src/main.rs"
 
+# Debian packaging (built with `cargo deb -p gwm-tui`). The wrapped disk tools that
+# Debian actually ships go in Recommends so apt offers them; the Python ones (gw,
+# amitools) and the unpackaged ones (AppleCommander, HxC) are handled by the app's
+# own distro-aware Tools menu.
+[package.metadata.deb]
+name = "lubeshop"
+maintainer = "Joe <joe@n9tax.com>"
+copyright = "2026 Joe <joe@n9tax.com>"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+recommends = "cpmtools, mtools, vice"
+suggests = "pipx"
+extended-description = """\
+The Lube Shop is a terminal front-end for the Greaseweazle floppy reader/writer \
+and a manager for a library of flux captures and decoded disk images. Read old \
+floppies to image files, write images back, and browse inside images to extract, \
+insert, or edit files across CP/M, MS-DOS/FAT, Commodore, TRS-80, Amiga, and \
+Apple II disks."""
+assets = [
+    ["target/release/lubeshop", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/lubeshop/README.md", "644"],
+]
+
 [dependencies]
 gwm-core = { path = "../gwm-core" }
 # Use ratatui's re-exported crossterm (ratatui::crossterm) rather than a separate
