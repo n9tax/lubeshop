@@ -10,7 +10,8 @@
 //! running system:
 //! - `System` — a distro package via the detected manager (apt/dnf/zypper, or an
 //!   AUR helper on Arch which also covers the AUR).
-//! - `Pip` — a Python tool via `pipx` (and `pipx ensurepath`).
+//! - `Pip` / `PipGit` — a Python tool via `pipx` (from PyPI, or a `git+…` URL for
+//!   projects like greaseweazle that aren't on PyPI).
 //! - `Aur` — an AUR package on Arch; elsewhere a manual download.
 //! - `Build` — no distro package anywhere, so we install the prerequisites and
 //!   build/download it into `~/.local/bin` ourselves (validated recipes).
@@ -52,8 +53,11 @@ pub struct Recipe {
 pub enum Source {
     /// A distro package — same name across apt/dnf/zypper and Arch's repos+AUR.
     System(&'static str),
-    /// A Python package installed with `pipx` (works on every distro).
+    /// A Python package on PyPI installed with `pipx`.
     Pip(&'static str),
+    /// A Python tool installed with `pipx` from a `git+…` URL (some projects, like
+    /// greaseweazle, aren't published to PyPI). `pipx` needs `git` to clone it.
+    PipGit(&'static str),
     /// Only in the Arch User Repository; elsewhere a manual download.
     Aur(&'static str),
     /// Not packaged anywhere — build/download it ourselves into `~/.local/bin`.
@@ -123,7 +127,7 @@ echo "Installed applecommander-ac to ~/.local/bin"
 
 /// The tools the app can drive, in menu order.
 pub const TOOLS: &[Tool] = &[
-    Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::Pip("greaseweazle"), homepage: "https://github.com/keirf/greaseweazle" },
+    Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), homepage: "https://github.com/keirf/greaseweazle" },
     Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), homepage: "http://www.moria.de/~michael/cpmtools/" },
     Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), homepage: "https://www.gnu.org/software/mtools/" },
     Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::System("vice"), homepage: "https://vice-emu.sourceforge.io/" },
@@ -249,6 +253,22 @@ fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx:
                 }
             }
         }
+        Source::PipGit(url) => {
+            if !has_pipx {
+                InstallPlan::Manual {
+                    note: format!("Needs Python's pipx. Install pipx, then run: pipx install {url} —"),
+                    site: "https://pipx.pypa.io/stable/installation/",
+                }
+            } else {
+                // pipx clones the git+ URL, so ensure git is present first
+                // (idempotent if it already is).
+                let prep = match pm {
+                    Some(pm) => format!("{} && ", pm.install("git")),
+                    None => String::new(),
+                };
+                InstallPlan::Run(format!("{prep}pipx install {url} && pipx ensurepath"))
+            }
+        }
         Source::Aur(pkg) => match pm {
             Some(PkgMgr::Aur(helper)) => InstallPlan::Run(format!("{helper} -S --needed {pkg}")),
             _ => InstallPlan::Manual {
@@ -359,6 +379,24 @@ mod tests {
         );
         assert!(matches!(
             resolve(Source::Pip("greaseweazle"), HP, Some(PkgMgr::Apt), false),
+            InstallPlan::Manual { .. }
+        ));
+    }
+
+    #[test]
+    fn pipgit_ensures_git_then_installs_from_the_url() {
+        // greaseweazle isn't on PyPI; install from git, ensuring git first.
+        let url = "git+https://github.com/keirf/greaseweazle@latest";
+        let deb = resolve(Source::PipGit(url), HP, Some(PkgMgr::Apt), true);
+        assert_eq!(
+            deb,
+            InstallPlan::Run(format!(
+                "sudo apt-get install -y git && pipx install {url} && pipx ensurepath"
+            ))
+        );
+        // No pipx → manual guidance.
+        assert!(matches!(
+            resolve(Source::PipGit(url), HP, Some(PkgMgr::Apt), false),
             InstallPlan::Manual { .. }
         ));
     }
