@@ -479,6 +479,9 @@ impl App {
         let _ = writeln!(out, "\n\x1b[1;36m== The Lube Shop ==\x1b[0m running:\n  {cmd}\n");
         let _ = out.flush();
 
+        #[cfg(windows)]
+        let _ = std::process::Command::new("cmd").arg("/c").arg(cmd).status();
+        #[cfg(not(windows))]
         let _ = std::process::Command::new("sh").arg("-c").arg(cmd).status();
 
         let _ = writeln!(out, "\n\x1b[1m== Finished. Press Enter to return to The Lube Shop. ==\x1b[0m");

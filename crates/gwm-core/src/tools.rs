@@ -22,7 +22,6 @@
 //! after install.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// A prerequisite a build recipe needs, mapped to the right package name per
@@ -70,13 +69,28 @@ pub enum Source {
     Manual,
 }
 
+/// How a tool installs on **Windows** (native). Resolved by [`install_plan`] there.
+/// Separate from [`Source`] because Windows delivery is completely different:
+/// winget for what's packaged (VICE, Python, Java, Git), our own bundled prebuilt
+/// binaries for the Unix tools (cpmtools/mtools), official downloads for the rest.
+#[derive(Debug, Clone, Copy)]
+pub enum WinSource {
+    /// A winget package id, e.g. `VICE-Team.VICE.GTK3`.
+    Winget(&'static str),
+    /// Not ported to Windows yet — shown honestly as "coming", with the homepage.
+    Todo,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Tool {
     /// Command used to detect whether it is installed.
     pub cmd: &'static str,
     pub label: &'static str,
     pub purpose: &'static str,
+    /// How it installs on Linux.
     pub source: Source,
+    /// How it installs on Windows.
+    pub win: WinSource,
     /// Project/download page, shown when it can't be installed automatically.
     pub homepage: &'static str,
 }
@@ -141,6 +155,7 @@ echo "Installed applecommander-ac to ~/.local/bin (bundled Java 21)"
 /// build just `c1541` from source headlessly (Debian). Deps + flags validated in a
 /// Debian 12 container. The `file` package is easy to miss — VICE's Makefile calls
 /// `file --mime-encoding` while generating a header.
+#[cfg(not(windows))]
 const VICE_APT: &str = r#"
 if sudo apt-get install -y vice >/dev/null 2>&1 && command -v c1541 >/dev/null 2>&1; then
   echo "Installed VICE from your distribution's repositories."
@@ -165,18 +180,19 @@ echo "Built and installed c1541 to ~/.local/bin"
 
 /// The tools the app can drive, in menu order.
 pub const TOOLS: &[Tool] = &[
-    Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), homepage: "https://github.com/keirf/greaseweazle" },
-    Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), homepage: "http://www.moria.de/~michael/cpmtools/" },
-    Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), homepage: "https://www.gnu.org/software/mtools/" },
-    Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::Vice, homepage: "https://vice-emu.sourceforge.io/" },
-    Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), homepage: "https://github.com/cnvogelg/amitools" },
-    Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Build(APPLECOMMANDER), homepage: "https://applecommander.github.io/" },
-    Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), homepage: "https://github.com/jhallen/atari-tools" },
-    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), homepage: "https://github.com/jfdelnero/HxCFloppyEmulator" },
+    Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), win: WinSource::Todo, homepage: "https://github.com/keirf/greaseweazle" },
+    Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), win: WinSource::Todo, homepage: "http://www.moria.de/~michael/cpmtools/" },
+    Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), win: WinSource::Todo, homepage: "https://www.gnu.org/software/mtools/" },
+    Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::Vice, win: WinSource::Winget("VICE-Team.VICE.GTK3"), homepage: "https://vice-emu.sourceforge.io/" },
+    Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), win: WinSource::Todo, homepage: "https://github.com/cnvogelg/amitools" },
+    Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Build(APPLECOMMANDER), win: WinSource::Todo, homepage: "https://applecommander.github.io/" },
+    Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), win: WinSource::Todo, homepage: "https://github.com/jhallen/atari-tools" },
+    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), win: WinSource::Todo, homepage: "https://github.com/jfdelnero/HxCFloppyEmulator" },
 ];
 
 /// A system package manager we know how to drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(windows))]
 pub enum PkgMgr {
     /// An Arch AUR helper (`paru`/`yay`) — covers official repos *and* the AUR.
     Aur(&'static str),
@@ -185,6 +201,7 @@ pub enum PkgMgr {
     Zypper,
 }
 
+#[cfg(not(windows))]
 impl PkgMgr {
     /// Command that installs one or more space-separated packages.
     fn install(self, pkgs: &str) -> String {
@@ -232,6 +249,7 @@ impl PkgMgr {
 
 /// Detect the system package manager, preferring an AUR helper on Arch (so it can
 /// reach AUR-only tools), then the common base managers.
+#[cfg(not(windows))]
 pub fn detect_pkg_mgr() -> Option<PkgMgr> {
     for helper in ["paru", "yay"] {
         if installed(helper) {
@@ -260,18 +278,41 @@ pub enum InstallPlan {
 }
 
 /// Resolve how to install `tool` on the running system.
+#[cfg(not(windows))]
 pub fn install_plan(tool: &Tool) -> InstallPlan {
     resolve(tool.source, tool.homepage, detect_pkg_mgr(), installed("pipx"))
 }
 
+/// Resolve how to install `tool` on Windows (uses [`Tool::win`]).
+#[cfg(windows)]
+pub fn install_plan(tool: &Tool) -> InstallPlan {
+    win_resolve(tool.win, tool.homepage)
+}
+
+/// Windows resolver. winget for packaged tools; everything else still to do.
+#[cfg(windows)]
+fn win_resolve(win: WinSource, homepage: &'static str) -> InstallPlan {
+    match win {
+        WinSource::Winget(id) => InstallPlan::Run(format!(
+            "winget install --id {id} -e --accept-package-agreements --accept-source-agreements"
+        )),
+        WinSource::Todo => InstallPlan::Manual {
+            note: "Windows support for this tool is coming — for now, get it from:".to_string(),
+            site: homepage,
+        },
+    }
+}
+
 /// Assemble a build recipe's full script: install prerequisites via `pm`, then run
 /// the (distro-agnostic) steps under `set -e`.
+#[cfg(not(windows))]
 fn build_script(recipe: Recipe, pm: PkgMgr) -> String {
     let pkgs: Vec<&str> = recipe.prereqs.iter().map(|p| pm.pkg_for(*p)).collect();
     format!("set -e\n{}\n{}", pm.install(&pkgs.join(" ")), recipe.steps)
 }
 
 /// Pure resolver (no process spawning) so it can be unit-tested.
+#[cfg(not(windows))]
 fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx: bool) -> InstallPlan {
     match source {
         Source::System(pkg) => match pm {
@@ -352,7 +393,9 @@ fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx:
 /// Prepend `~/.local/bin` to this process's `PATH` if it's missing, so tools that
 /// `pipx` and our build recipes install there are found and runnable immediately —
 /// without the user having to fix their shell's PATH first. Called once at startup.
+#[cfg(not(windows))]
 pub fn ensure_user_path() {
+    use std::path::PathBuf;
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
@@ -369,11 +412,28 @@ pub fn ensure_user_path() {
     }
 }
 
+/// Windows: winget-installed tools manage their own PATH; the bundled-binary
+/// location (for cpmtools/mtools) gets added here when that installer lands.
+#[cfg(windows)]
+pub fn ensure_user_path() {}
+
 /// Is a tool's command available on PATH?
 pub fn installed(cmd: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {cmd} >/dev/null 2>&1"))
+    #[cfg(windows)]
+    let mut probe = {
+        let mut c = Command::new("where");
+        c.arg(cmd);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut probe = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(format!("command -v {cmd} >/dev/null 2>&1"));
+        c
+    };
+    probe
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
