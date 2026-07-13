@@ -30,7 +30,11 @@ pass(){ echo "PASS: $1"; }; fail(){ echo "FAIL: $1"; }
 
 apt-get install -y -qq cpmtools >/dev/null 2>&1 && command -v cpmls >/dev/null && pass cpmtools || fail cpmtools
 apt-get install -y -qq mtools   >/dev/null 2>&1 && command -v mdir  >/dev/null && pass mtools   || fail mtools
-apt-get install -y -qq vice     >/dev/null 2>&1 && command -v c1541 >/dev/null && pass vice     || fail "vice (no Debian package; Ubuntu-only)"
+# vice: the package where it exists (Ubuntu), else build c1541 from source (Debian).
+if apt-get install -y -qq vice >/dev/null 2>&1 && command -v c1541 >/dev/null; then pass vice; else
+  apt-get install -y -qq build-essential flex bison dos2unix xa65 pkg-config zlib1g-dev libcurl4-openssl-dev libpng-dev texinfo file >/dev/null 2>&1
+  ( d=$(mktemp -d); curl -fsSL "https://sourceforge.net/projects/vice-emu/files/releases/vice-3.9.tar.gz/download" -o "$d/v.tgz" && tar xzf "$d/v.tgz" -C "$d" && cd "$d/vice-3.9" && ./configure --enable-headlessui --without-pulse --without-alsa >/dev/null 2>&1 && make -j"$(nproc)" -C src c1541 >/dev/null 2>&1 && test -x src/c1541 ) && pass vice || fail vice
+fi
 
 apt-get install -y -qq git build-essential python3-dev >/dev/null 2>&1
 pipx install "git+https://github.com/keirf/greaseweazle@latest" >/dev/null 2>&1 && command -v gw >/dev/null && pass gw || fail gw
@@ -58,7 +62,6 @@ for img in "${IMAGES[@]}"; do
   echo "############ $img ############"
   out=$($PODMAN run --rm -i "$img" bash -s <<<"$SCRIPT" 2>&1)
   echo "$out" | grep -E "PASS:|FAIL:|DONE"
-  # vice failing on Debian is expected; any other FAIL is a real problem.
-  if echo "$out" | grep "FAIL:" | grep -qv "vice"; then rc=1; fi
+  if echo "$out" | grep -q "FAIL:"; then rc=1; fi
 done
 exit $rc

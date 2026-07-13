@@ -62,6 +62,10 @@ pub enum Source {
     Aur(&'static str),
     /// Not packaged anywhere — build/download it ourselves into `~/.local/bin`.
     Build(Recipe),
+    /// VICE's `c1541`: a distro package where one exists (Arch, Ubuntu), but on
+    /// Debian — which dropped VICE over ROM licensing — build just `c1541` from
+    /// source (headless, no GUI). Special-cased because the build is apt-specific.
+    Vice,
     /// Nothing automatic — always a manual download.
     Manual,
 }
@@ -133,12 +137,38 @@ echo "Installed applecommander-ac to ~/.local/bin (bundled Java 21)"
 "#,
 };
 
+/// VICE on an apt system: install the `vice` package if it exists (Ubuntu), else
+/// build just `c1541` from source headlessly (Debian). Deps + flags validated in a
+/// Debian 12 container. The `file` package is easy to miss — VICE's Makefile calls
+/// `file --mime-encoding` while generating a header.
+const VICE_APT: &str = r#"
+if sudo apt-get install -y vice >/dev/null 2>&1 && command -v c1541 >/dev/null 2>&1; then
+  echo "Installed VICE from your distribution's repositories."
+  exit 0
+fi
+echo "VICE isn't in your distribution's repositories — building c1541 from source."
+echo "This takes a minute or two..."
+set -e
+sudo apt-get install -y build-essential flex bison dos2unix xa65 pkg-config \
+  zlib1g-dev libcurl4-openssl-dev libpng-dev texinfo file curl
+d=$(mktemp -d)
+curl -fsSL "https://sourceforge.net/projects/vice-emu/files/releases/vice-3.9.tar.gz/download" -o "$d/vice.tar.gz"
+tar xzf "$d/vice.tar.gz" -C "$d"
+cd "$d/vice-3.9"
+./configure --enable-headlessui --without-pulse --without-alsa >/dev/null
+make -j"$(nproc)" -C src c1541 >/dev/null
+mkdir -p "$HOME/.local/bin"
+cp src/c1541 "$HOME/.local/bin/"
+cd /; rm -rf "$d"
+echo "Built and installed c1541 to ~/.local/bin"
+"#;
+
 /// The tools the app can drive, in menu order.
 pub const TOOLS: &[Tool] = &[
     Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), homepage: "https://github.com/keirf/greaseweazle" },
     Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), homepage: "http://www.moria.de/~michael/cpmtools/" },
     Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), homepage: "https://www.gnu.org/software/mtools/" },
-    Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::System("vice"), homepage: "https://vice-emu.sourceforge.io/" },
+    Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::Vice, homepage: "https://vice-emu.sourceforge.io/" },
     Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), homepage: "https://github.com/cnvogelg/amitools" },
     Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Build(APPLECOMMANDER), homepage: "https://applecommander.github.io/" },
     Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), homepage: "https://github.com/jhallen/atari-tools" },
@@ -301,6 +331,17 @@ fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx:
                 site: homepage,
             },
         },
+        Source::Vice => match pm {
+            // Debian/Ubuntu: try the package, else build c1541 from source.
+            Some(PkgMgr::Apt) => InstallPlan::Run(VICE_APT.to_string()),
+            // Arch has it (repo/AUR); Fedora/openSUSE: try the package (best effort,
+            // the post-install check falls back to the homepage if it's absent).
+            Some(pm) => InstallPlan::Run(pm.install("vice")),
+            None => InstallPlan::Manual {
+                note: "Install VICE (for its c1541 tool) — get it from:".to_string(),
+                site: homepage,
+            },
+        },
         Source::Manual => InstallPlan::Manual {
             note: "Download and install this tool from:".to_string(),
             site: homepage,
@@ -451,5 +492,18 @@ mod tests {
             resolve(Source::Build(ATARI_TOOLS), HP, None, false),
             InstallPlan::Manual { .. }
         ));
+    }
+
+    #[test]
+    fn vice_builds_from_source_on_debian_but_uses_the_package_on_arch() {
+        // Apt → the "try package, else build c1541 from source" script.
+        let apt = resolve(Source::Vice, HP, Some(PkgMgr::Apt), false);
+        assert!(matches!(apt, InstallPlan::Run(s)
+            if s.contains("apt-get install -y vice") && s.contains("make -j") && s.contains("c1541")));
+        // Arch just installs the package.
+        assert_eq!(
+            resolve(Source::Vice, HP, Some(PkgMgr::Aur("paru")), false),
+            InstallPlan::Run("paru -S --needed vice".to_string())
+        );
     }
 }
