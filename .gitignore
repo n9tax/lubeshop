@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Source-transfer tarballs
+*.tar.gz
+
+# Local editor / OS noise
+.idea/
+.vscode/
+*.swp
+*.kate-swp
+.DS_Store
+
+# Personal notes / local working guidance — not for the repo
+/GW-TUI_Notes
+/CLAUDE.md

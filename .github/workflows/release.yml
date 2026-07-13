@@ -1,0 +1,95 @@
+name: release
+
+# Build prebuilt Linux binaries and attach them to a GitHub Release whenever a
+# version tag (v0.1.0, v0.2.0, …) is pushed. Phase 0 of the porting plan: get the
+# app into testers' hands without them needing a Rust toolchain. Windows/macOS
+# targets get added to the matrix in later phases.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc build — smallest, runs on any reasonably recent distro.
+          - target: x86_64-unknown-linux-gnu
+          # Fully static musl build — distro-agnostic, the safest thing to hand a
+          # tester whose glibc might be older than the runner's.
+          - target: x86_64-unknown-linux-musl
+            apt: musl-tools
+            cc: musl-gcc
+          # 64-bit ARM (Raspberry Pi 4/5 and similar).
+          - target: aarch64-unknown-linux-gnu
+            apt: gcc-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            linker: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + target
+        run: |
+          rustup update stable --no-self-update
+          rustup target add ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Build lubeshop
+        env:
+          # The bundled SQLite (rusqlite) is compiled from C by the `cc` crate, so
+          # cross targets need the matching compiler/linker. Empty vars are ignored.
+          CC_x86_64_unknown_linux_musl: ${{ matrix.cc }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.cc }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p gwm-tui
+
+      - name: Package tarball
+        run: |
+          dist="lubeshop-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$dist"
+          cp "target/${{ matrix.target }}/release/lubeshop" "$dist/"
+          cp README.md "$dist/"
+          [ -f LICENSE ] && cp LICENSE "$dist/" || true
+          [ -f COPYING ] && cp COPYING "$dist/" || true
+          tar czf "$dist.tar.gz" "$dist"
+          sha256sum "$dist.tar.gz" > "$dist.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish on real version tags; a manual dispatch just builds artifacts.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create / update the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            || gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber

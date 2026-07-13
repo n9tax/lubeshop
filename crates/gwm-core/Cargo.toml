@@ -1,0 +1,17 @@
+[package]
+name = "gwm-core"
+description = "Core library for the Greaseweazle Manager: catalog, device wrapper, models."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+directories = "5"
+sha2 = "0.10"
+sha1 = "0.10"
+toml = "0.8"

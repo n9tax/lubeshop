@@ -1,0 +1,63 @@
+# Maintainer: <your name> <your email>
+#
+# AUR package for "The Lube Shop" — the lubeshop TUI front-end for Greaseweazle.
+#
+# Before publishing to the AUR:
+#   1. Replace GITHUB_USER below with the real GitHub owner (and the Maintainer line).
+#   2. Push a matching `v$pkgver` git tag so the source tarball URL resolves.
+#   3. Regenerate .SRCINFO:  makepkg --printsrcinfo > .SRCINFO
+#   4. Fill in the real sha256 (or keep 'SKIP'):  updpkgsums
+pkgname=lubeshop
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="TUI front-end for the Greaseweazle floppy flux reader/writer + a manager for flux captures and decoded disk images"
+arch=('x86_64' 'aarch64')
+url="https://github.com/GITHUB_USER/GW_TUI"
+license=('GPL-3.0-or-later')
+depends=('gcc-libs')
+makedepends=('cargo')
+# The wrapped tools are optional — the app detects them at runtime, degrades
+# gracefully, and can install them from its own Tools menu. Listed here so users
+# can pull in whichever platforms they care about.
+optdepends=(
+  'greaseweazle: read & write physical floppies (the core dependency)'
+  'cpmtools: browse CP/M disk images'
+  'mtools: browse FAT / MS-DOS / Atari ST / MSX images'
+  'vice: browse Commodore D64/D71/D81 images (c1541)'
+  'python-amitools: browse Amiga ADF/HDF images (xdftool)'
+  'applecommander: browse Apple II images'
+  'atari-tools: browse Atari 8-bit ATR images'
+  'hxc-floppy-emulator: decode TRS-80 flux captures to DMK (hxcfe)'
+)
+options=('!lto')  # the workspace release profile already sets lto=true
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+_srcdir="GW_TUI-$pkgver"
+
+prepare() {
+  cd "$_srcdir"
+  # Fetch dependencies up front so build() can run offline (AUR best practice).
+  export CARGO_HOME="$srcdir/cargo-home"
+  cargo fetch --locked
+}
+
+build() {
+  cd "$_srcdir"
+  export CARGO_HOME="$srcdir/cargo-home"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo build --release --frozen -p gwm-tui
+}
+
+check() {
+  cd "$_srcdir"
+  export CARGO_HOME="$srcdir/cargo-home"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --release --frozen --workspace
+}
+
+package() {
+  cd "$_srcdir"
+  install -Dm755 "target/release/lubeshop" "$pkgdir/usr/bin/lubeshop"
+  install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

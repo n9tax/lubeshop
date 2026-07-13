@@ -1,0 +1,26 @@
+name: ci
+
+# Build + test on every push and PR so release tags are always cut from green.
+# The suite needs neither a device nor the network (network tests are #[ignore]d).
+#
+# fmt/clippy are deliberately not gated: the codebase is written in a consistent
+# hand-style that isn't rustfmt's default, and pinning `clippy -D warnings` to the
+# floating stable toolchain makes CI brittle against new lints. Run them locally.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request: {}
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable --no-self-update
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Test
+        run: cargo test --workspace --locked

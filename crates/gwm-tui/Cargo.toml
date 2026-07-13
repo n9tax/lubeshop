@@ -1,0 +1,18 @@
+[package]
+name = "gwm-tui"
+description = "Terminal UI front-end for the Greaseweazle Manager."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lubeshop"
+path = "src/main.rs"
+
+[dependencies]
+gwm-core = { path = "../gwm-core" }
+# Use ratatui's re-exported crossterm (ratatui::crossterm) rather than a separate
+# crossterm dependency, so the event types can never version-skew from the renderer.
+ratatui = "0.29"
+anyhow = { workspace = true }
+chrono = { workspace = true }
