@@ -32,8 +32,6 @@ pub enum Prereq {
     /// A C compiler + make.
     Build,
     Git,
-    /// A Java runtime.
-    Java,
     /// libusb development headers.
     Libusb,
     /// Python development headers (`Python.h`), needed to build C extensions.
@@ -109,21 +107,29 @@ echo "Installed hxcfe to ~/.local/bin"
 "#,
 };
 
-/// AppleCommander: a Java jar + a small launcher script. Fetches the latest
-/// `-ac` release, falling back to a known version if the API is unreachable.
+/// AppleCommander: a Java jar. Recent releases need Java 21, which many distros
+/// (e.g. Debian 12) don't ship, so we bundle a portable Temurin 21 JRE and point
+/// a launcher script at it — making it work regardless of the system Java.
 const APPLECOMMANDER: Recipe = Recipe {
-    prereqs: &[Prereq::Java, Prereq::Curl],
+    prereqs: &[Prereq::Curl],
     steps: r#"
-url=$(curl -sL https://api.github.com/repos/AppleCommander/AppleCommander/releases/latest | grep -oE 'https://[^"]*AppleCommander-ac-[0-9.]*\.jar' | head -1)
+arch=$(uname -m); case "$arch" in x86_64) j=x64;; aarch64) j=aarch64;; *) j=x64;; esac
+share="$HOME/.local/share/lubeshop"
+mkdir -p "$share/jre" "$share/tools" "$HOME/.local/bin"
+echo "Downloading a Java 21 runtime (Temurin)..."
+curl -fsSL "https://api.adoptium.net/v3/binary/latest/21/ga/linux/$j/jre/hotspot/normal/eclipse" -o "$share/jre.tar.gz"
+tar xzf "$share/jre.tar.gz" -C "$share/jre" --strip-components=1
+rm -f "$share/jre.tar.gz"
+echo "Downloading AppleCommander..."
+url=$(curl -fsSL https://api.github.com/repos/AppleCommander/AppleCommander/releases/latest | grep -oE 'https://[^"]*AppleCommander-ac-[0-9.]*\.jar' | head -1)
 [ -n "$url" ] || url=https://github.com/AppleCommander/AppleCommander/releases/download/13.1/AppleCommander-ac-13.1.jar
-mkdir -p "$HOME/.local/share/lubeshop/tools" "$HOME/.local/bin"
-curl -L -o "$HOME/.local/share/lubeshop/tools/AppleCommander-ac.jar" "$url"
+curl -fsSL -o "$share/tools/AppleCommander-ac.jar" "$url"
 cat > "$HOME/.local/bin/applecommander-ac" <<'WRAP'
 #!/bin/sh
-exec java -jar "$HOME/.local/share/lubeshop/tools/AppleCommander-ac.jar" "$@"
+exec "$HOME/.local/share/lubeshop/jre/bin/java" -jar "$HOME/.local/share/lubeshop/tools/AppleCommander-ac.jar" "$@"
 WRAP
 chmod +x "$HOME/.local/bin/applecommander-ac"
-echo "Installed applecommander-ac to ~/.local/bin"
+echo "Installed applecommander-ac to ~/.local/bin (bundled Java 21)"
 "#,
 };
 
@@ -171,10 +177,6 @@ impl PkgMgr {
             (Aur(_), Build) => "base-devel",
             (Dnf, Build) => "gcc make",
             (Zypper, Build) => "gcc make",
-            (Apt, Java) => "default-jre",
-            (Aur(_), Java) => "jre-openjdk",
-            (Dnf, Java) => "java-latest-openjdk",
-            (Zypper, Java) => "java-openjdk",
             (Apt, Libusb) => "libusb-1.0-0-dev",
             (Aur(_), Libusb) => "libusb",
             (Dnf, Libusb) => "libusb1-devel",
