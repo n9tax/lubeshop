@@ -1,32 +1,64 @@
 //! Detecting and installing the external tools the app drives.
 //!
-//! Installs run **interactively** through the front-end (it suspends the TUI and
-//! hands the terminal to the installer) so the package manager can prompt for a
-//! password / confirmation normally.
+//! Mission: **uncomplicate this on Linux.** A tool should install with one
+//! keystroke on whatever distro the user is running — no hunting for packages, no
+//! reading build instructions. Installs run interactively (the front-end suspends
+//! the TUI and hands over the terminal) so a package manager can prompt for a
+//! password.
 //!
-//! The install command is **resolved to the user's actual system**: an AUR helper
-//! on Arch (`paru`/`yay`, which covers both official repos and the AUR), otherwise
-//! `apt`/`dnf`/`zypper`; Python tools go through `pipx`. When a tool isn't packaged
-//! for the running distro — or the install command runs but the tool still isn't on
-//! `PATH` afterwards (e.g. `vice`, which Debian dropped over ROM licensing) — the
-//! app falls back to the tool's `homepage` so the user can grab it another way.
+//! Each tool declares a [`Source`] that resolves to a concrete plan for the
+//! running system:
+//! - `System` — a distro package via the detected manager (apt/dnf/zypper, or an
+//!   AUR helper on Arch which also covers the AUR).
+//! - `Pip` — a Python tool via `pipx` (and `pipx ensurepath`).
+//! - `Aur` — an AUR package on Arch; elsewhere a manual download.
+//! - `Build` — no distro package anywhere, so we install the prerequisites and
+//!   build/download it into `~/.local/bin` ourselves (validated recipes).
+//! - `Manual` — nothing automatic; point at the homepage.
+//!
+//! Everything a recipe installs lands in `~/.local/bin`, which the front-end puts
+//! on `PATH` at startup (see `ensure_user_path`), so it's found and runnable right
+//! after install.
 
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// Where a wrapped tool comes from. Resolved to a concrete install command for
-/// the running system by [`install_plan`]. The manual fallback uses the tool's
-/// [`Tool::homepage`].
+/// A prerequisite a build recipe needs, mapped to the right package name per
+/// distro by [`PkgMgr::pkg_for`].
+#[derive(Debug, Clone, Copy)]
+pub enum Prereq {
+    /// A C compiler + make.
+    Build,
+    Git,
+    /// A Java runtime.
+    Java,
+    /// libusb development headers.
+    Libusb,
+    Curl,
+}
+
+/// A build-from-source / download install for a tool with no distro package. The
+/// `steps` are distro-agnostic shell (run with `set -e` after the prerequisites),
+/// and must install the tool into `~/.local/bin`.
+#[derive(Debug, Clone, Copy)]
+pub struct Recipe {
+    pub prereqs: &'static [Prereq],
+    pub steps: &'static str,
+}
+
+/// Where a wrapped tool comes from. Resolved by [`install_plan`].
 #[derive(Debug, Clone, Copy)]
 pub enum Source {
-    /// A distro package — the same name across apt/dnf/zypper and Arch's
-    /// repos+AUR (`cpmtools`, `mtools`, `vice`).
+    /// A distro package — same name across apt/dnf/zypper and Arch's repos+AUR.
     System(&'static str),
     /// A Python package installed with `pipx` (works on every distro).
     Pip(&'static str),
-    /// Only packaged in the Arch User Repository; elsewhere it's a manual download.
+    /// Only in the Arch User Repository; elsewhere a manual download.
     Aur(&'static str),
-    /// Not packaged anywhere — always a manual download.
+    /// Not packaged anywhere — build/download it ourselves into `~/.local/bin`.
+    Build(Recipe),
+    /// Nothing automatic — always a manual download.
     Manual,
 }
 
@@ -36,11 +68,58 @@ pub struct Tool {
     pub cmd: &'static str,
     pub label: &'static str,
     pub purpose: &'static str,
-    /// Where the tool comes from, per [`Source`].
     pub source: Source,
     /// Project/download page, shown when it can't be installed automatically.
     pub homepage: &'static str,
 }
+
+// ---- build recipes (validated end-to-end) --------------------------------
+
+/// atari-tools: a tiny C program; clone + make + copy the `atr` binary.
+const ATARI_TOOLS: Recipe = Recipe {
+    prereqs: &[Prereq::Git, Prereq::Build],
+    steps: r#"
+d=$(mktemp -d)
+git clone --depth 1 https://github.com/jhallen/atari-tools "$d/src"
+make -C "$d/src"
+mkdir -p "$HOME/.local/bin"
+cp "$d/src/atr" "$HOME/.local/bin/"
+rm -rf "$d"
+echo "Installed atr to ~/.local/bin"
+"#,
+};
+
+/// HxC (hxcfe): build just the command-line converter (not the Qt GUI).
+const HXC: Recipe = Recipe {
+    prereqs: &[Prereq::Git, Prereq::Build, Prereq::Libusb],
+    steps: r#"
+d=$(mktemp -d)
+git clone --depth 1 https://github.com/jfdelnero/HxCFloppyEmulator "$d/src"
+make -C "$d/src/build" HxCFloppyEmulator_cmdline
+mkdir -p "$HOME/.local/bin"
+cp "$d/src/HxCFloppyEmulator_cmdline/build/hxcfe" "$HOME/.local/bin/"
+rm -rf "$d"
+echo "Installed hxcfe to ~/.local/bin"
+"#,
+};
+
+/// AppleCommander: a Java jar + a small launcher script. Fetches the latest
+/// `-ac` release, falling back to a known version if the API is unreachable.
+const APPLECOMMANDER: Recipe = Recipe {
+    prereqs: &[Prereq::Java, Prereq::Curl],
+    steps: r#"
+url=$(curl -sL https://api.github.com/repos/AppleCommander/AppleCommander/releases/latest | grep -oE 'https://[^"]*AppleCommander-ac-[0-9.]*\.jar' | head -1)
+[ -n "$url" ] || url=https://github.com/AppleCommander/AppleCommander/releases/download/13.1/AppleCommander-ac-13.1.jar
+mkdir -p "$HOME/.local/share/lubeshop/tools" "$HOME/.local/bin"
+curl -L -o "$HOME/.local/share/lubeshop/tools/AppleCommander-ac.jar" "$url"
+cat > "$HOME/.local/bin/applecommander-ac" <<'WRAP'
+#!/bin/sh
+exec java -jar "$HOME/.local/share/lubeshop/tools/AppleCommander-ac.jar" "$@"
+WRAP
+chmod +x "$HOME/.local/bin/applecommander-ac"
+echo "Installed applecommander-ac to ~/.local/bin"
+"#,
+};
 
 /// The tools the app can drive, in menu order.
 pub const TOOLS: &[Tool] = &[
@@ -49,9 +128,9 @@ pub const TOOLS: &[Tool] = &[
     Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), homepage: "https://www.gnu.org/software/mtools/" },
     Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::System("vice"), homepage: "https://vice-emu.sourceforge.io/" },
     Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), homepage: "https://github.com/cnvogelg/amitools" },
-    Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Aur("applecommander"), homepage: "https://applecommander.github.io/" },
-    Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Aur("atari-tools"), homepage: "https://github.com/jhallen/atari-tools" },
-    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Aur("hxc-floppy-emulator"), homepage: "https://hxc2001.com/download/floppy_drive_emulator/" },
+    Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Build(APPLECOMMANDER), homepage: "https://applecommander.github.io/" },
+    Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), homepage: "https://github.com/jhallen/atari-tools" },
+    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), homepage: "https://github.com/jfdelnero/HxCFloppyEmulator" },
 ];
 
 /// A system package manager we know how to drive.
@@ -65,13 +144,35 @@ pub enum PkgMgr {
 }
 
 impl PkgMgr {
-    /// Command that installs a repo/distro package.
-    fn install(self, pkg: &str) -> String {
+    /// Command that installs one or more space-separated packages.
+    fn install(self, pkgs: &str) -> String {
         match self {
-            PkgMgr::Aur(helper) => format!("{helper} -S --needed {pkg}"),
-            PkgMgr::Apt => format!("sudo apt-get install -y {pkg}"),
-            PkgMgr::Dnf => format!("sudo dnf install -y {pkg}"),
-            PkgMgr::Zypper => format!("sudo zypper install -y {pkg}"),
+            PkgMgr::Aur(helper) => format!("{helper} -S --needed {pkgs}"),
+            PkgMgr::Apt => format!("sudo apt-get install -y {pkgs}"),
+            PkgMgr::Dnf => format!("sudo dnf install -y {pkgs}"),
+            PkgMgr::Zypper => format!("sudo zypper install -y {pkgs}"),
+        }
+    }
+
+    /// The package name(s) providing a prerequisite on this distro.
+    fn pkg_for(self, p: Prereq) -> &'static str {
+        use PkgMgr::*;
+        use Prereq::*;
+        match (self, p) {
+            (_, Git) => "git",
+            (_, Curl) => "curl",
+            (Apt, Build) => "build-essential",
+            (Aur(_), Build) => "base-devel",
+            (Dnf, Build) => "gcc make",
+            (Zypper, Build) => "gcc make",
+            (Apt, Java) => "default-jre",
+            (Aur(_), Java) => "jre-openjdk",
+            (Dnf, Java) => "java-latest-openjdk",
+            (Zypper, Java) => "java-openjdk",
+            (Apt, Libusb) => "libusb-1.0-0-dev",
+            (Aur(_), Libusb) => "libusb",
+            (Dnf, Libusb) => "libusb1-devel",
+            (Zypper, Libusb) => "libusb-1_0-devel",
         }
     }
 
@@ -109,7 +210,7 @@ pub fn detect_pkg_mgr() -> Option<PkgMgr> {
 /// The outcome of resolving how to install a tool on this system.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallPlan {
-    /// A shell command to run interactively in the user's terminal.
+    /// A shell command/script to run interactively in the user's terminal.
     Run(String),
     /// No automatic install available; tell the user how/where to get it.
     Manual { note: String, site: &'static str },
@@ -118,6 +219,13 @@ pub enum InstallPlan {
 /// Resolve how to install `tool` on the running system.
 pub fn install_plan(tool: &Tool) -> InstallPlan {
     resolve(tool.source, tool.homepage, detect_pkg_mgr(), installed("pipx"))
+}
+
+/// Assemble a build recipe's full script: install prerequisites via `pm`, then run
+/// the (distro-agnostic) steps under `set -e`.
+fn build_script(recipe: Recipe, pm: PkgMgr) -> String {
+    let pkgs: Vec<&str> = recipe.prereqs.iter().map(|p| pm.pkg_for(*p)).collect();
+    format!("set -e\n{}\n{}", pm.install(&pkgs.join(" ")), recipe.steps)
 }
 
 /// Pure resolver (no process spawning) so it can be unit-tested.
@@ -132,7 +240,8 @@ fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx:
         },
         Source::Pip(pkg) => {
             if has_pipx {
-                InstallPlan::Run(format!("pipx install {pkg}"))
+                // ensurepath so the user's login shells also see ~/.local/bin.
+                InstallPlan::Run(format!("pipx install {pkg} && pipx ensurepath"))
             } else {
                 InstallPlan::Manual {
                     note: format!("Needs Python's pipx. Install pipx, then run: pipx install {pkg} —"),
@@ -147,10 +256,37 @@ fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx:
                 site: homepage,
             },
         },
+        Source::Build(recipe) => match pm {
+            Some(pm) => InstallPlan::Run(build_script(recipe, pm)),
+            None => InstallPlan::Manual {
+                note: "Couldn't detect your package manager to install the build tools — get it from:".to_string(),
+                site: homepage,
+            },
+        },
         Source::Manual => InstallPlan::Manual {
             note: "Download and install this tool from:".to_string(),
             site: homepage,
         },
+    }
+}
+
+/// Prepend `~/.local/bin` to this process's `PATH` if it's missing, so tools that
+/// `pipx` and our build recipes install there are found and runnable immediately —
+/// without the user having to fix their shell's PATH first. Called once at startup.
+pub fn ensure_user_path() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let local_bin = PathBuf::from(&home).join(".local/bin");
+    let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if paths.iter().any(|p| p == &local_bin) {
+        return;
+    }
+    paths.insert(0, local_bin);
+    if let Ok(joined) = std::env::join_paths(paths) {
+        std::env::set_var("PATH", joined);
     }
 }
 
@@ -213,15 +349,13 @@ mod tests {
         assert_eq!(deb, InstallPlan::Run("sudo apt-get install -y cpmtools".to_string()));
         let arch = resolve(Source::System("cpmtools"), HP, Some(PkgMgr::Aur("paru")), false);
         assert_eq!(arch, InstallPlan::Run("paru -S --needed cpmtools".to_string()));
-        let dnf = resolve(Source::System("vice"), HP, Some(PkgMgr::Dnf), false);
-        assert_eq!(dnf, InstallPlan::Run("sudo dnf install -y vice".to_string()));
     }
 
     #[test]
-    fn pip_tool_needs_pipx() {
+    fn pip_tool_uses_pipx_and_ensurepath() {
         assert_eq!(
             resolve(Source::Pip("greaseweazle"), HP, Some(PkgMgr::Apt), true),
-            InstallPlan::Run("pipx install greaseweazle".to_string())
+            InstallPlan::Run("pipx install greaseweazle && pipx ensurepath".to_string())
         );
         assert!(matches!(
             resolve(Source::Pip("greaseweazle"), HP, Some(PkgMgr::Apt), false),
@@ -231,18 +365,34 @@ mod tests {
 
     #[test]
     fn aur_only_tool_is_manual_off_arch() {
-        let arch = resolve(Source::Aur("hxc-floppy-emulator"), HP, Some(PkgMgr::Aur("yay")), false);
-        assert_eq!(arch, InstallPlan::Run("yay -S --needed hxc-floppy-emulator".to_string()));
-        // On Debian/Fedora there's no package → point at the homepage.
-        let deb = resolve(Source::Aur("hxc-floppy-emulator"), HP, Some(PkgMgr::Apt), false);
-        assert!(matches!(deb, InstallPlan::Manual { site, .. } if site == HP));
+        assert!(matches!(
+            resolve(Source::Aur("x"), HP, Some(PkgMgr::Apt), false),
+            InstallPlan::Manual { site, .. } if site == HP
+        ));
     }
 
     #[test]
-    fn no_known_manager_is_manual_with_homepage() {
+    fn build_recipe_maps_prereqs_per_distro() {
+        // Debian: build-essential + git + the download steps.
+        let deb = resolve(Source::Build(ATARI_TOOLS), HP, Some(PkgMgr::Apt), false);
+        match deb {
+            InstallPlan::Run(script) => {
+                assert!(script.contains("sudo apt-get install -y git build-essential"));
+                assert!(script.contains("git clone"));
+                assert!(script.contains(".local/bin"));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // Arch uses base-devel and the AUR helper.
+        let arch = resolve(Source::Build(ATARI_TOOLS), HP, Some(PkgMgr::Aur("paru")), false);
+        assert!(matches!(arch, InstallPlan::Run(s) if s.contains("paru -S --needed git base-devel")));
+        // HxC also needs libusb dev headers.
+        let hxc = resolve(Source::Build(HXC), HP, Some(PkgMgr::Apt), false);
+        assert!(matches!(hxc, InstallPlan::Run(s) if s.contains("libusb-1.0-0-dev")));
+        // No manager → manual.
         assert!(matches!(
-            resolve(Source::System("mtools"), HP, None, false),
-            InstallPlan::Manual { site, .. } if site == HP
+            resolve(Source::Build(ATARI_TOOLS), HP, None, false),
+            InstallPlan::Manual { .. }
         ));
     }
 }

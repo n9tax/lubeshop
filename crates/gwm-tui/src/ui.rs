@@ -58,12 +58,23 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Paint the whole surface in the theme background first.
     frame.render_widget(Block::default().style(base()), area);
 
+    // The bottom bar is one line for a key hint, but a notice can be long (e.g.
+    // an install link), so grow it enough to wrap the whole message instead of
+    // running off the edge.
+    let status_h = match &app.notice {
+        Some(notice) => {
+            let w = area.width.saturating_sub(2).max(1) as usize;
+            (((notice.chars().count() + 2) / w) as u16 + 1).clamp(1, 5)
+        }
+        None => 1,
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(status_h),
         ])
         .split(area);
 
@@ -1357,7 +1368,7 @@ fn render_tools(app: &App, frame: &mut Frame, area: Rect) {
         dim(),
     )));
     lines.push(Line::from(Span::styled(
-        "  Tools with no package for your distro show a download link instead.",
+        "  Tools with no package for your distro are built from source for you.",
         dim(),
     )));
     frame.render_widget(para(lines).block(bordered("Tools")), area);
@@ -1643,7 +1654,7 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
         Span::raw(text)
     };
 
-    frame.render_widget(para(vec![Line::from(hint)]), area);
+    frame.render_widget(para(vec![Line::from(hint)]).wrap(Wrap { trim: false }), area);
 }
 
 #[cfg(test)]

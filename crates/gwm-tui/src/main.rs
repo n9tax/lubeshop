@@ -20,6 +20,10 @@ use app::App;
 use gwm_core::Core;
 
 fn main() -> Result<()> {
+    // Make sure ~/.local/bin is on PATH so tools installed by pipx and our build
+    // recipes are found and runnable without the user first fixing their shell.
+    gwm_core::tools::ensure_user_path();
+
     let core = Core::init().context("failed to initialise the gwm core")?;
 
     let mut terminal = ratatui::init();
