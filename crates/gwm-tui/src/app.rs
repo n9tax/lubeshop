@@ -274,6 +274,9 @@ pub struct App {
     install_return: Screen,
     /// A shell command to run interactively (suspending the TUI) next frame.
     run_interactive: Option<String>,
+    /// Index of the tool whose install command is running, so we can tell whether
+    /// it actually landed once the command returns.
+    installing_tool: Option<usize>,
 
     // --- archive.org import ---------------------------------------------
     pub archive_query: TextInput,
@@ -383,6 +386,7 @@ impl App {
             install_job: None,
             install_return: Screen::Tools,
             run_interactive: None,
+            installing_tool: None,
             archive_query: TextInput::new(),
             archive_hits: Vec::new(),
             archive_hits_state: ListState::default(),
@@ -485,6 +489,19 @@ impl App {
         *terminal = ratatui::init();
         self.refresh_tool_status();
         self.screen = Screen::Tools;
+
+        // If the command ran but the tool still isn't on PATH, the package likely
+        // doesn't exist for this distro (e.g. Debian dropped `vice`). Point the
+        // user at the tool's homepage instead of leaving them with a raw error.
+        if let Some(i) = self.installing_tool.take() {
+            if !self.tool_status.get(i).copied().unwrap_or(false) {
+                let tool = gwm_core::tools::TOOLS[i];
+                self.notice = Some(format!(
+                    "{} still isn't installed — it may not be packaged for your system. Get it from: {}",
+                    tool.label, tool.homepage
+                ));
+            }
+        }
     }
 
     /// Open the Library, first importing any new files dropped into the storage
@@ -2935,16 +2952,14 @@ impl App {
         match gwm_core::tools::install_plan(&tool) {
             gwm_core::tools::InstallPlan::Run(cmd) => {
                 // Run interactively — the run loop suspends the TUI so the package
-                // manager can prompt for a password / confirmation.
+                // manager can prompt for a password / confirmation. Remember which
+                // tool so we can tell if it actually landed (some distros accept
+                // the command but have no such package).
+                self.installing_tool = Some(self.tools_index);
                 self.run_interactive = Some(cmd);
             }
             gwm_core::tools::InstallPlan::Manual { note, site } => {
-                let mut msg = format!("{}: {note}", tool.label);
-                if let Some(site) = site {
-                    msg.push(' ');
-                    msg.push_str(site);
-                }
-                self.notice = Some(msg);
+                self.notice = Some(format!("{}: {note} {site}", tool.label));
             }
         }
     }

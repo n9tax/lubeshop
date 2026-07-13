@@ -6,14 +6,17 @@
 //!
 //! The install command is **resolved to the user's actual system**: an AUR helper
 //! on Arch (`paru`/`yay`, which covers both official repos and the AUR), otherwise
-//! `apt`/`dnf`/`zypper`; Python tools go through `pipx`. Tools that aren't packaged
-//! for a given distro fall back to a "download it from here" note.
+//! `apt`/`dnf`/`zypper`; Python tools go through `pipx`. When a tool isn't packaged
+//! for the running distro — or the install command runs but the tool still isn't on
+//! `PATH` afterwards (e.g. `vice`, which Debian dropped over ROM licensing) — the
+//! app falls back to the tool's `homepage` so the user can grab it another way.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
 /// Where a wrapped tool comes from. Resolved to a concrete install command for
-/// the running system by [`install_plan`].
+/// the running system by [`install_plan`]. The manual fallback uses the tool's
+/// [`Tool::homepage`].
 #[derive(Debug, Clone, Copy)]
 pub enum Source {
     /// A distro package — the same name across apt/dnf/zypper and Arch's
@@ -22,9 +25,9 @@ pub enum Source {
     /// A Python package installed with `pipx` (works on every distro).
     Pip(&'static str),
     /// Only packaged in the Arch User Repository; elsewhere it's a manual download.
-    Aur { pkg: &'static str, site: &'static str },
-    /// Not packaged anywhere — the user downloads it themselves.
-    Manual { site: &'static str },
+    Aur(&'static str),
+    /// Not packaged anywhere — always a manual download.
+    Manual,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,18 +38,20 @@ pub struct Tool {
     pub purpose: &'static str,
     /// Where the tool comes from, per [`Source`].
     pub source: Source,
+    /// Project/download page, shown when it can't be installed automatically.
+    pub homepage: &'static str,
 }
 
 /// The tools the app can drive, in menu order.
 pub const TOOLS: &[Tool] = &[
-    Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::Pip("greaseweazle") },
-    Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools") },
-    Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools") },
-    Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::System("vice") },
-    Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools") },
-    Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Aur { pkg: "applecommander", site: "https://applecommander.github.io/" } },
-    Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Aur { pkg: "atari-tools", site: "https://github.com/jhallen/atari-tools" } },
-    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Aur { pkg: "hxc-floppy-emulator", site: "https://hxc2001.com/download/floppy_drive_emulator/" } },
+    Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::Pip("greaseweazle"), homepage: "https://github.com/keirf/greaseweazle" },
+    Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), homepage: "http://www.moria.de/~michael/cpmtools/" },
+    Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), homepage: "https://www.gnu.org/software/mtools/" },
+    Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::System("vice"), homepage: "https://vice-emu.sourceforge.io/" },
+    Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), homepage: "https://github.com/cnvogelg/amitools" },
+    Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Aur("applecommander"), homepage: "https://applecommander.github.io/" },
+    Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Aur("atari-tools"), homepage: "https://github.com/jhallen/atari-tools" },
+    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Aur("hxc-floppy-emulator"), homepage: "https://hxc2001.com/download/floppy_drive_emulator/" },
 ];
 
 /// A system package manager we know how to drive.
@@ -107,22 +112,22 @@ pub enum InstallPlan {
     /// A shell command to run interactively in the user's terminal.
     Run(String),
     /// No automatic install available; tell the user how/where to get it.
-    Manual { note: String, site: Option<&'static str> },
+    Manual { note: String, site: &'static str },
 }
 
 /// Resolve how to install `tool` on the running system.
 pub fn install_plan(tool: &Tool) -> InstallPlan {
-    resolve(tool.source, detect_pkg_mgr(), installed("pipx"))
+    resolve(tool.source, tool.homepage, detect_pkg_mgr(), installed("pipx"))
 }
 
 /// Pure resolver (no process spawning) so it can be unit-tested.
-fn resolve(source: Source, pm: Option<PkgMgr>, has_pipx: bool) -> InstallPlan {
+fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx: bool) -> InstallPlan {
     match source {
         Source::System(pkg) => match pm {
             Some(pm) => InstallPlan::Run(pm.install(pkg)),
             None => InstallPlan::Manual {
-                note: format!("Install the '{pkg}' package with your system's package manager."),
-                site: None,
+                note: format!("Install the '{pkg}' package with your package manager, or get it from:"),
+                site: homepage,
             },
         },
         Source::Pip(pkg) => {
@@ -130,21 +135,21 @@ fn resolve(source: Source, pm: Option<PkgMgr>, has_pipx: bool) -> InstallPlan {
                 InstallPlan::Run(format!("pipx install {pkg}"))
             } else {
                 InstallPlan::Manual {
-                    note: format!("Needs Python's pipx. Install pipx, then run: pipx install {pkg}"),
-                    site: Some("https://pipx.pypa.io/stable/installation/"),
+                    note: format!("Needs Python's pipx. Install pipx, then run: pipx install {pkg} —"),
+                    site: "https://pipx.pypa.io/stable/installation/",
                 }
             }
         }
-        Source::Aur { pkg, site } => match pm {
+        Source::Aur(pkg) => match pm {
             Some(PkgMgr::Aur(helper)) => InstallPlan::Run(format!("{helper} -S --needed {pkg}")),
             _ => InstallPlan::Manual {
                 note: "Not packaged for your distribution — download it from:".to_string(),
-                site: Some(site),
+                site: homepage,
             },
         },
-        Source::Manual { site } => InstallPlan::Manual {
+        Source::Manual => InstallPlan::Manual {
             note: "Download and install this tool from:".to_string(),
-            site: Some(site),
+            site: homepage,
         },
     }
 }
@@ -180,6 +185,8 @@ pub fn run_streamed<F: FnMut(&str)>(shell_cmd: &str, mut on_line: F) -> std::io:
 mod tests {
     use super::*;
 
+    const HP: &str = "https://example.test/tool";
+
     #[test]
     fn detects_present_and_absent_commands() {
         assert!(installed("sh"));
@@ -202,49 +209,40 @@ mod tests {
 
     #[test]
     fn system_package_uses_the_detected_manager() {
-        let deb = resolve(Source::System("cpmtools"), Some(PkgMgr::Apt), false);
+        let deb = resolve(Source::System("cpmtools"), HP, Some(PkgMgr::Apt), false);
         assert_eq!(deb, InstallPlan::Run("sudo apt-get install -y cpmtools".to_string()));
-        let arch = resolve(Source::System("cpmtools"), Some(PkgMgr::Aur("paru")), false);
+        let arch = resolve(Source::System("cpmtools"), HP, Some(PkgMgr::Aur("paru")), false);
         assert_eq!(arch, InstallPlan::Run("paru -S --needed cpmtools".to_string()));
-        let dnf = resolve(Source::System("vice"), Some(PkgMgr::Dnf), false);
+        let dnf = resolve(Source::System("vice"), HP, Some(PkgMgr::Dnf), false);
         assert_eq!(dnf, InstallPlan::Run("sudo dnf install -y vice".to_string()));
     }
 
     #[test]
     fn pip_tool_needs_pipx() {
         assert_eq!(
-            resolve(Source::Pip("greaseweazle"), Some(PkgMgr::Apt), true),
+            resolve(Source::Pip("greaseweazle"), HP, Some(PkgMgr::Apt), true),
             InstallPlan::Run("pipx install greaseweazle".to_string())
         );
-        // Without pipx it becomes manual guidance, regardless of the distro.
         assert!(matches!(
-            resolve(Source::Pip("greaseweazle"), Some(PkgMgr::Apt), false),
+            resolve(Source::Pip("greaseweazle"), HP, Some(PkgMgr::Apt), false),
             InstallPlan::Manual { .. }
         ));
     }
 
     #[test]
     fn aur_only_tool_is_manual_off_arch() {
-        let arch = resolve(
-            Source::Aur { pkg: "hxc-floppy-emulator", site: "https://x" },
-            Some(PkgMgr::Aur("yay")),
-            false,
-        );
+        let arch = resolve(Source::Aur("hxc-floppy-emulator"), HP, Some(PkgMgr::Aur("yay")), false);
         assert_eq!(arch, InstallPlan::Run("yay -S --needed hxc-floppy-emulator".to_string()));
-        // On Debian/Fedora there's no package → point at the download site.
-        let deb = resolve(
-            Source::Aur { pkg: "hxc-floppy-emulator", site: "https://x" },
-            Some(PkgMgr::Apt),
-            false,
-        );
-        assert!(matches!(deb, InstallPlan::Manual { site: Some("https://x"), .. }));
+        // On Debian/Fedora there's no package → point at the homepage.
+        let deb = resolve(Source::Aur("hxc-floppy-emulator"), HP, Some(PkgMgr::Apt), false);
+        assert!(matches!(deb, InstallPlan::Manual { site, .. } if site == HP));
     }
 
     #[test]
-    fn no_known_manager_is_manual() {
+    fn no_known_manager_is_manual_with_homepage() {
         assert!(matches!(
-            resolve(Source::System("mtools"), None, false),
-            InstallPlan::Manual { site: None, .. }
+            resolve(Source::System("mtools"), HP, None, false),
+            InstallPlan::Manual { site, .. } if site == HP
         ));
     }
 }
