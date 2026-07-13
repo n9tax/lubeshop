@@ -17,15 +17,24 @@ release workflow (`.github/workflows/release.yml`) fires on version tags.
 
 ## Cutting a release
 
-1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`) and refresh the
-   lockfile: `cargo update -p gwm-core -p gwm-tui --precise <new-version>` — or
-   just `cargo build` and commit the changed `Cargo.lock`.
-2. Commit, then tag and push:
+**The version lives in `Cargo.toml`, not the git tag.** The `.deb` version comes
+from `[workspace.package].version`, while the tarballs are named from the tag — so
+if you tag `v0.1.1` without bumping `Cargo.toml`, the `.deb` still says `0.1.0` and
+they disagree. Use the helper script so they can't drift:
 
-   ```sh
-   git tag v0.2.0
-   git push origin main --tags
-   ```
+```sh
+packaging/release.sh 0.1.1     # bumps Cargo.toml, syncs Cargo.lock, commits, tags
+git push && git push origin v0.1.1
+```
+
+<details><summary>Doing it by hand instead</summary>
+
+1. Set `version` in the root `Cargo.toml` (`[workspace.package]`).
+2. `cargo update --workspace` to sync `Cargo.lock` (keeps `--locked` builds happy).
+3. `git commit -am "Release vX.Y.Z"`, then `git tag vX.Y.Z`.
+4. `git push && git push origin vX.Y.Z`.
+
+</details>
 
 3. `release.yml` builds these and attaches them (+ `.sha256`) to a GitHub Release
    named after the tag:
