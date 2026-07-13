@@ -77,8 +77,21 @@ pub enum Source {
 pub enum WinSource {
     /// A winget package id, e.g. `VICE-Team.VICE.GTK3`.
     Winget(&'static str),
+    /// Prebuilt binaries we build+host ourselves (the Unix tools with no Windows
+    /// package): download a zip from the given URL and extract it into the
+    /// per-user bin dir ([`windows_bin_dir`]), which is on this process's PATH.
+    Bundle(&'static str),
     /// Not ported to Windows yet — shown honestly as "coming", with the homepage.
     Todo,
+}
+
+/// The per-user directory our bundled Windows binaries (cpmtools/mtools/…) live
+/// in: `%LOCALAPPDATA%\lubeshop\bin`. Kept on this process's PATH by
+/// [`ensure_user_path`] so anything extracted here is immediately runnable.
+#[cfg(windows)]
+pub fn windows_bin_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|l| std::path::PathBuf::from(l).join("lubeshop").join("bin"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -181,7 +194,7 @@ echo "Built and installed c1541 to ~/.local/bin"
 /// The tools the app can drive, in menu order.
 pub const TOOLS: &[Tool] = &[
     Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), win: WinSource::Todo, homepage: "https://github.com/keirf/greaseweazle" },
-    Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), win: WinSource::Todo, homepage: "http://www.moria.de/~michael/cpmtools/" },
+    Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop/releases/download/windows-tools/cpmtools-win64.zip"), homepage: "http://www.moria.de/~michael/cpmtools/" },
     Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), win: WinSource::Todo, homepage: "https://www.gnu.org/software/mtools/" },
     Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::Vice, win: WinSource::Winget("VICE-Team.VICE.GTK3"), homepage: "https://vice-emu.sourceforge.io/" },
     Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), win: WinSource::Todo, homepage: "https://github.com/cnvogelg/amitools" },
@@ -289,6 +302,38 @@ pub fn install_plan(tool: &Tool) -> InstallPlan {
     win_resolve(tool.win, tool.homepage)
 }
 
+/// Wrap a PowerShell script as `powershell -EncodedCommand <base64>`. The base64
+/// is of the script encoded as UTF-16LE, per PowerShell's `-EncodedCommand`. The
+/// result is one whitespace-free token (base64 uses only `A–Za–z0–9+/=`), so it
+/// passes intact through `cmd /c` and Rust's argument quoting.
+#[cfg(windows)]
+fn powershell_encoded(script: &str) -> String {
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    format!(
+        "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+        base64(&utf16le)
+    )
+}
+
+/// Standard base64 (with `=` padding). Small and dependency-free — the only use
+/// is encoding a PowerShell script above.
+#[cfg(windows)]
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
 /// Windows resolver. winget for packaged tools; everything else still to do.
 #[cfg(windows)]
 fn win_resolve(win: WinSource, homepage: &'static str) -> InstallPlan {
@@ -296,6 +341,27 @@ fn win_resolve(win: WinSource, homepage: &'static str) -> InstallPlan {
         WinSource::Winget(id) => InstallPlan::Run(format!(
             "winget install --id {id} -e --accept-package-agreements --accept-source-agreements"
         )),
+        // Download our prebuilt zip and extract it into %LOCALAPPDATA%\lubeshop\bin.
+        // The bin dir is already on this process's PATH (ensure_user_path), so the
+        // post-install check finds the tools without a restart. We hand this to the
+        // interactive `cmd /c` runner as a PowerShell `-EncodedCommand` (base64 of
+        // the UTF-16LE script): a single quote-free token, so neither cmd nor Rust's
+        // argument quoting can mangle the script's own quotes.
+        WinSource::Bundle(url) => {
+            let script = format!(
+                "$ErrorActionPreference='Stop'; \
+                 $bin = Join-Path $env:LOCALAPPDATA 'lubeshop\\bin'; \
+                 New-Item -ItemType Directory -Force $bin | Out-Null; \
+                 $zip = Join-Path $env:TEMP 'lubeshop-tool.zip'; \
+                 Write-Host 'Downloading...'; \
+                 Invoke-WebRequest -UseBasicParsing -Uri '{url}' -OutFile $zip; \
+                 Write-Host 'Extracting...'; \
+                 Expand-Archive -LiteralPath $zip -DestinationPath $bin -Force; \
+                 Remove-Item $zip; \
+                 Write-Host 'Installed to' $bin"
+            );
+            InstallPlan::Run(powershell_encoded(&script))
+        }
         WinSource::Todo => InstallPlan::Manual {
             note: "Windows support for this tool is coming — for now, get it from:".to_string(),
             site: homepage,
@@ -412,10 +478,30 @@ pub fn ensure_user_path() {
     }
 }
 
-/// Windows: winget-installed tools manage their own PATH; the bundled-binary
-/// location (for cpmtools/mtools) gets added here when that installer lands.
+/// Windows: winget-installed tools manage their own PATH (see
+/// [`refresh_path_from_registry`]); our *bundled* binaries land in
+/// [`windows_bin_dir`], so create that dir and prepend it to this process's PATH
+/// at startup. Doing it unconditionally (even before anything is installed) means
+/// a tool extracted there mid-session is instantly on PATH — the post-install
+/// `installed()` check passes without the user restarting the app.
 #[cfg(windows)]
-pub fn ensure_user_path() {}
+pub fn ensure_user_path() {
+    use std::path::PathBuf;
+    let Some(bin) = windows_bin_dir() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&bin);
+    let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if paths.iter().any(|p| p == &bin) {
+        return;
+    }
+    paths.insert(0, bin);
+    if let Ok(joined) = std::env::join_paths(paths) {
+        std::env::set_var("PATH", joined);
+    }
+}
 
 /// After an interactive install returns, pull any newly-persisted PATH entries
 /// into *this* process so the post-install `installed()` check sees them.
@@ -564,6 +650,61 @@ mod tests {
             win_resolve(WinSource::Todo, HP),
             InstallPlan::Manual { site, .. } if site == HP
         ));
+    }
+
+    // base64 encoder used for PowerShell `-EncodedCommand` (Windows installer).
+    #[cfg(windows)]
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"M"), "TQ==");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert_eq!(base64(b"any carnal pleasure."), "YW55IGNhcm5hbCBwbGVhc3VyZS4=");
+    }
+
+    // A Bundle install resolves to a PowerShell `-EncodedCommand` whose base64
+    // decodes (UTF-16LE) back to a script that downloads the given URL.
+    #[cfg(windows)]
+    #[test]
+    fn bundle_encodes_a_download_script_for_the_url() {
+        let url = "https://example.test/cpmtools-win64.zip";
+        let InstallPlan::Run(cmd) = win_resolve(WinSource::Bundle(url), HP) else {
+            panic!("Bundle should resolve to a Run command");
+        };
+        let b64 = cmd.rsplit(' ').next().unwrap();
+        // Decode base64 → UTF-16LE bytes → String, and check the URL survived.
+        let bytes = decode_base64(b64);
+        let utf16: Vec<u16> = bytes
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let script = String::from_utf16(&utf16).unwrap();
+        assert!(cmd.starts_with("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand "));
+        assert!(script.contains(url), "script should embed the URL: {script}");
+        assert!(script.contains("Expand-Archive"));
+    }
+
+    #[cfg(windows)]
+    fn decode_base64(s: &str) -> Vec<u8> {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let val = |c: u8| T.iter().position(|&t| t == c).unwrap() as u32;
+        let clean: Vec<u8> = s.bytes().filter(|&c| c != b'=').collect();
+        let mut out = Vec::new();
+        for chunk in clean.chunks(4) {
+            let mut n = 0u32;
+            for (i, &c) in chunk.iter().enumerate() {
+                n |= val(c) << (18 - 6 * i);
+            }
+            out.push((n >> 16) as u8);
+            if chunk.len() > 2 {
+                out.push((n >> 8) as u8);
+            }
+            if chunk.len() > 3 {
+                out.push(n as u8);
+            }
+        }
+        out
     }
 
     // The remaining resolver tests exercise the Linux `resolve`/`PkgMgr` path, which

@@ -69,7 +69,7 @@ pub trait ImageFs {
 
 /// Is the cpmtools suite available on this system?
 pub fn cpmtools_available() -> bool {
-    Command::new("cpmls")
+    cpm_command("cpmls")
         .arg("-h")
         .output()
         .map(|o| o.status.code().is_some())
@@ -106,6 +106,16 @@ fn diskdef_table() -> &'static std::collections::HashMap<String, DiskGeom> {
     static TABLE: std::sync::OnceLock<std::collections::HashMap<String, DiskGeom>> =
         std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
+        // Windows: the diskdefs we bundle beside the cpmtools binaries.
+        #[cfg(windows)]
+        if let Some(dir) = crate::tools::windows_bin_dir() {
+            if let Ok(text) = std::fs::read_to_string(dir.join("diskdefs")) {
+                let table = parse_diskdefs(&text);
+                if !table.is_empty() {
+                    return table;
+                }
+            }
+        }
         for path in DISKDEF_CANDIDATES {
             if let Ok(text) = std::fs::read_to_string(path) {
                 let table = parse_diskdefs(&text);
@@ -208,9 +218,29 @@ fn diskdef_family(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Build a `Command` for a cpmtools program. On Windows the bundled binaries find
+/// their `diskdefs` by `fopen("diskdefs")` relative to the working directory (see
+/// cpmfs.c), so run them from the bundle dir when a bundled `diskdefs` is present
+/// there. Image/file arguments the app passes are absolute, so the changed cwd
+/// doesn't affect them. Elsewhere cpmtools uses its compiled-in datadir path.
+fn cpm_command(prog: &str) -> Command {
+    let cmd = Command::new(prog);
+    #[cfg(windows)]
+    let cmd = {
+        let mut cmd = cmd;
+        if let Some(dir) = crate::tools::windows_bin_dir() {
+            if dir.join("diskdefs").is_file() {
+                cmd.current_dir(dir);
+            }
+        }
+        cmd
+    };
+    cmd
+}
+
 /// Create a new, blank CP/M image formatted for the given diskdef.
 pub fn cpm_mkfs(format: &str, image: &Path) -> Result<()> {
-    let mut cmd = Command::new("mkfs.cpm");
+    let mut cmd = cpm_command("mkfs.cpm");
     cmd.args(["-f", format]).arg(image);
     run(cmd).map(|_| ())
 }
@@ -230,7 +260,7 @@ impl CpmFs {
 
 impl ImageFs for CpmFs {
     fn list(&self, image: &Path) -> Result<Vec<FileEntry>> {
-        let mut cmd = Command::new("cpmls");
+        let mut cmd = cpm_command("cpmls");
         cmd.args(["-f", &self.format, "-l"]).arg(image);
         let text = run(cmd)?;
         Ok(parse_cpmls(&text))
@@ -238,7 +268,7 @@ impl ImageFs for CpmFs {
 
     fn extract(&self, image: &Path, entry: &FileEntry, dest: &Path) -> Result<()> {
         let source = format!("{}:{}", entry.user, entry.name);
-        let mut cmd = Command::new("cpmcp");
+        let mut cmd = cpm_command("cpmcp");
         cmd.args(["-f", &self.format])
             .arg(image)
             .arg(&source)
@@ -248,20 +278,20 @@ impl ImageFs for CpmFs {
 
     fn insert(&self, image: &Path, src: &Path, name: &str, user: u8) -> Result<()> {
         let dest = format!("{user}:{name}");
-        let mut cmd = Command::new("cpmcp");
+        let mut cmd = cpm_command("cpmcp");
         cmd.args(["-f", &self.format]).arg(image).arg(src).arg(&dest);
         run(cmd).map(|_| ())
     }
 
     fn delete(&self, image: &Path, entry: &FileEntry) -> Result<()> {
         let target = format!("{}:{}", entry.user, entry.name);
-        let mut cmd = Command::new("cpmrm");
+        let mut cmd = cpm_command("cpmrm");
         cmd.args(["-f", &self.format]).arg(image).arg(&target);
         run(cmd).map(|_| ())
     }
 
     fn usage(&self, image: &Path) -> Result<FsUsage> {
-        let mut cmd = Command::new("cpmls");
+        let mut cmd = cpm_command("cpmls");
         cmd.args(["-f", &self.format, "-D"]).arg(image);
         let text = run(cmd)?;
         parse_cpm_usage(&text)
