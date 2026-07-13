@@ -1,0 +1,34 @@
+name: windows-build
+
+# Native Windows build (work in progress). Produces a downloadable lubeshop.exe
+# artifact on every push so it can be smoke-tested on real Windows while the
+# Windows tool-installer / device work is done. Not attached to public releases
+# yet — the Tools menu (package managers) and gw USB path still need porting.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup update stable --no-self-update
+      # rusqlite is bundled (compiled from C); windows-latest ships the MSVC
+      # toolchain, so no extra setup is needed.
+      - name: Build
+        run: cargo build --release --locked -p gwm-tui
+      - name: Stage
+        shell: bash
+        run: |
+          d="lubeshop-windows-x86_64"
+          mkdir "$d"
+          cp target/release/lubeshop.exe "$d/"
+          cp README.md "$d/"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: lubeshop-windows-x86_64
+          path: lubeshop-windows-x86_64/
