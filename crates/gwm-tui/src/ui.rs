@@ -22,6 +22,15 @@ use crate::count_job::CountState;
 use crate::text_input::TextInput;
 use crate::theme::{self, Theme};
 
+/// Success check-mark. The default Windows console font frequently lacks U+2713
+/// and renders it as a tofu box (a block with a `?`), so use an ASCII mark there;
+/// keep the nicer glyph everywhere else. Kept to one column so the `[x]`/`[ ]`
+/// tool badges stay aligned.
+#[cfg(not(windows))]
+const CHECK: &str = "✓";
+#[cfg(windows)]
+const CHECK: &str = "x";
+
 thread_local! {
     static THEME: Cell<Theme> = const { Cell::new(theme::DARK) };
 }
@@ -719,7 +728,7 @@ fn render_outcome(app: &App, job: &crate::read_job::ReadJob, frame: &mut Frame, 
     match &app.read_outcome {
         Some(Ok(name)) => {
             lines.push(Line::from(Span::styled(
-                format!("  ✓ Saved “{name}” to the library"),
+                format!("  {CHECK} Saved “{name}” to the library"),
                 Style::default().fg(theme().success).add_modifier(Modifier::BOLD),
             )));
             if let Some((found, total, pct)) = job.summary {
@@ -857,7 +866,7 @@ fn render_write_outcome(app: &App, job: &crate::write_job::WriteJob, frame: &mut
     match &app.write_outcome {
         Some(Ok(name)) => {
             lines.push(Line::from(Span::styled(
-                format!("  ✓ Wrote “{name}” to the disk"),
+                format!("  {CHECK} Wrote “{name}” to the disk"),
                 Style::default().fg(theme().success).add_modifier(Modifier::BOLD),
             )));
             if job.all_verified {
@@ -1342,9 +1351,9 @@ fn render_tools(app: &App, frame: &mut Frame, area: Rect) {
         let selected = i == app.tools_index;
         let marker = if selected { "▸ " } else { "  " };
         let (badge, badge_style) = if installed {
-            ("[✓]", Style::default().fg(theme().success))
+            (format!("[{CHECK}]"), Style::default().fg(theme().success))
         } else {
-            ("[ ]", Style::default().fg(theme().danger))
+            ("[ ]".to_string(), Style::default().fg(theme().danger))
         };
         let label_style = if selected {
             accented()
@@ -1387,7 +1396,7 @@ fn render_installing(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled(format!("  {}…", job.label), accented())
     } else if job.success {
         Span::styled(
-            format!("  ✓ {} — done", job.label),
+            format!("  {CHECK} {} — done", job.label),
             Style::default().fg(theme().success).add_modifier(Modifier::BOLD),
         )
     } else {
