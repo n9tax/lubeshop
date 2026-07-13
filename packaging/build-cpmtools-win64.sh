@@ -52,7 +52,12 @@ tar xzf libdsk.tar.gz
 
 echo ">> building libdsk (static)"
 cd "$WORK/libdsk-${LIBDSK_VER}"
-./configure $host_arg --prefix="$PREFIX" --enable-static --disable-shared CFLAGS="$RELAX"
+# --without-zlib/--without-bzlib: we drive plain CP/M image files, not compressed
+# ones, so drop the compression support. This keeps libdsk.a from referencing
+# zlib/bz2 — which the Linux mingw cross-sysroot (apt gcc-mingw-w64-x86-64) doesn't
+# ship — so cpmtools needs no -lz/-lbz2 and configure+link work on both toolchains.
+./configure $host_arg --prefix="$PREFIX" --enable-static --disable-shared \
+  --without-zlib --without-bzlib CFLAGS="$RELAX"
 make -j"$(nproc)"
 make install   # installs libdsk.a + libdsk.h (its own tools/ may warn; we don't need them)
 
@@ -62,7 +67,7 @@ cd "$WORK/cpmtools-${CPMTOOLS_VER}"
 # built and -lncurses isn't dragged into every static link.
 ./configure $host_arg --with-libdsk="$PREFIX" \
   ac_cv_lib_curses_printw=no ac_cv_lib_ncurses_printw=no \
-  CFLAGS="$RELAX -DNOTWINDLL" LDFLAGS="-static" LIBS="-lz -lbz2"
+  CFLAGS="$RELAX -DNOTWINDLL" LDFLAGS="-static"
 make
 
 echo ">> packaging"

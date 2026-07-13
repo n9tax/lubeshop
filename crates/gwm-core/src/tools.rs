@@ -194,7 +194,7 @@ echo "Built and installed c1541 to ~/.local/bin"
 /// The tools the app can drive, in menu order.
 pub const TOOLS: &[Tool] = &[
     Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), win: WinSource::Todo, homepage: "https://github.com/keirf/greaseweazle" },
-    Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop/releases/download/windows-tools/cpmtools-win64.zip"), homepage: "http://www.moria.de/~michael/cpmtools/" },
+    Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/cpmtools-win64.zip"), homepage: "http://www.moria.de/~michael/cpmtools/" },
     Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), win: WinSource::Todo, homepage: "https://www.gnu.org/software/mtools/" },
     Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::Vice, win: WinSource::Winget("VICE-Team.VICE.GTK3"), homepage: "https://vice-emu.sourceforge.io/" },
     Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), win: WinSource::Todo, homepage: "https://github.com/cnvogelg/amitools" },
