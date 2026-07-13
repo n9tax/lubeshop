@@ -441,8 +441,8 @@ impl App {
                 }
             }
 
-            // An interactive command (paru/pipx) suspends the TUI, runs in the
-            // real terminal, then resumes.
+            // An interactive install command suspends the TUI, runs in the real
+            // terminal (so the package manager can prompt), then resumes.
             if let Some(cmd) = self.run_interactive.take() {
                 self.run_interactive_command(terminal, &cmd);
                 continue;
@@ -2931,9 +2931,22 @@ impl App {
             self.notice = Some(format!("{} is already installed.", tool.label));
             return;
         }
-        // Run the installer interactively (paru/pipx) — the run loop suspends the
-        // TUI so it can prompt for the sudo password / review the PKGBUILD.
-        self.run_interactive = Some(tool.install_cmd.to_string());
+        // Resolve how to install it on *this* system (apt/dnf/zypper/AUR + pipx).
+        match gwm_core::tools::install_plan(&tool) {
+            gwm_core::tools::InstallPlan::Run(cmd) => {
+                // Run interactively — the run loop suspends the TUI so the package
+                // manager can prompt for a password / confirmation.
+                self.run_interactive = Some(cmd);
+            }
+            gwm_core::tools::InstallPlan::Manual { note, site } => {
+                let mut msg = format!("{}: {note}", tool.label);
+                if let Some(site) = site {
+                    msg.push(' ');
+                    msg.push_str(site);
+                }
+                self.notice = Some(msg);
+            }
+        }
     }
 
     /// Clean the (default) drive with a zig-zag pattern via `gw clean`.

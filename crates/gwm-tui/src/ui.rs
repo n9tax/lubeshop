@@ -1349,11 +1349,15 @@ fn render_tools(app: &App, frame: &mut Frame, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  Enter installs the selected tool (via paru/pipx in the terminal — it may",
+        "  Enter installs the selected tool with your system's package manager",
         dim(),
     )));
     lines.push(Line::from(Span::styled(
-        "  ask for your sudo password and to review a PKGBUILD).",
+        "  (apt/dnf/zypper/AUR, or pipx) in the terminal — it may ask for your password.",
+        dim(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Tools with no package for your distro show a download link instead.",
         dim(),
     )));
     frame.render_widget(para(lines).block(bordered("Tools")), area);
