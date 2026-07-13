@@ -36,6 +36,8 @@ pub enum Prereq {
     Java,
     /// libusb development headers.
     Libusb,
+    /// Python development headers (`Python.h`), needed to build C extensions.
+    PythonDev,
     Curl,
 }
 
@@ -177,6 +179,11 @@ impl PkgMgr {
             (Aur(_), Libusb) => "libusb",
             (Dnf, Libusb) => "libusb1-devel",
             (Zypper, Libusb) => "libusb-1_0-devel",
+            // Arch's `python` package already ships Python.h.
+            (Apt, PythonDev) => "python3-dev",
+            (Aur(_), PythonDev) => "python",
+            (Dnf, PythonDev) => "python3-devel",
+            (Zypper, PythonDev) => "python3-devel",
         }
     }
 
@@ -260,10 +267,19 @@ fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx:
                     site: "https://pipx.pypa.io/stable/installation/",
                 }
             } else {
-                // pipx clones the git+ URL, so ensure git is present first
-                // (idempotent if it already is).
+                // pipx clones the git+ URL and may build a C extension (greaseweazle
+                // has one), so ensure git, a compiler, and Python headers first
+                // (all idempotent if already present).
                 let prep = match pm {
-                    Some(pm) => format!("{} && ", pm.install("git")),
+                    Some(pm) => {
+                        let pkgs = [
+                            pm.pkg_for(Prereq::Git),
+                            pm.pkg_for(Prereq::Build),
+                            pm.pkg_for(Prereq::PythonDev),
+                        ]
+                        .join(" ");
+                        format!("{} && ", pm.install(&pkgs))
+                    }
                     None => String::new(),
                 };
                 InstallPlan::Run(format!("{prep}pipx install {url} && pipx ensurepath"))
@@ -391,7 +407,8 @@ mod tests {
         assert_eq!(
             deb,
             InstallPlan::Run(format!(
-                "sudo apt-get install -y git && pipx install {url} && pipx ensurepath"
+                "sudo apt-get install -y git build-essential python3-dev && \
+                 pipx install {url} && pipx ensurepath"
             ))
         );
         // No pipx → manual guidance.
