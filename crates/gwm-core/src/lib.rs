@@ -18,6 +18,7 @@ pub mod paths;
 pub mod proc;
 pub mod read;
 pub mod settings;
+pub mod textedit;
 pub mod tools;
 pub mod trs_disk;
 pub mod util;

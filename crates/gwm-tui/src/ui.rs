@@ -113,6 +113,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::BrowseConfirmDelete => render_browse_confirm_delete(app, frame, chunks[1]),
         Screen::FileBrowse => render_file_browse(app, frame, chunks[1]),
         Screen::HexView => render_hex(app, frame, chunks[1]),
+        Screen::TextEdit => render_text(app, frame, chunks[1]),
         Screen::NewImageName => render_new_image(app, frame, chunks[1]),
         Screen::Tools => render_tools(app, frame, chunks[1]),
         Screen::Installing => render_installing(app, frame, chunks[1]),
@@ -383,6 +384,65 @@ fn render_delete_confirm(app: &App, frame: &mut Frame, area: Rect) {
         ]),
     ];
     frame.render_widget(para(lines).block(bordered("Delete from library")), area);
+}
+
+/// Substitute a visible glyph for control/C1 characters so they don't garble the
+/// terminal. Display-only — the editor buffer keeps the real character, and one
+/// glyph == one char so the cursor column still lines up.
+fn display_char(c: char) -> char {
+    let u = c as u32;
+    match c {
+        '\t' => '→',
+        _ if u < 0x20 || (0x7f..=0x9f).contains(&u) => '·',
+        _ => c,
+    }
+}
+
+fn render_text(app: &mut App, frame: &mut Frame, area: Rect) {
+    let rows = area.height.saturating_sub(2) as usize;
+    app.text_rows = rows.max(1);
+
+    let total = app.text_lines.len();
+    let title = format!(
+        "{} — text · {} · ln {}/{} col {}{}  (Ctrl-S save · Esc leave)",
+        app.text_title,
+        app.text_eol.label(),
+        app.text_row + 1,
+        total,
+        app.text_col + 1,
+        if app.text_dirty { " *" } else { "" },
+    );
+
+    let base_style = Style::default().fg(theme().text);
+    let cursor_style = Style::default()
+        .fg(theme().hl_fg)
+        .bg(theme().hl_bg)
+        .add_modifier(Modifier::BOLD);
+
+    let start = app.text_scroll.min(total.saturating_sub(1));
+    let end = (start + rows).min(total);
+    let mut lines: Vec<Line> = Vec::new();
+    for r in start..end {
+        let chars = &app.text_lines[r];
+        if r == app.text_row {
+            let col = app.text_col.min(chars.len());
+            let before: String = chars[..col].iter().map(|&c| display_char(c)).collect();
+            let mut spans = vec![Span::styled(before, base_style)];
+            if col < chars.len() {
+                spans.push(Span::styled(display_char(chars[col]).to_string(), cursor_style));
+                let after: String = chars[col + 1..].iter().map(|&c| display_char(c)).collect();
+                spans.push(Span::styled(after, base_style));
+            } else {
+                // Cursor sits past the last character: highlight a trailing space.
+                spans.push(Span::styled(" ", cursor_style));
+            }
+            lines.push(Line::from(spans));
+        } else {
+            let s: String = chars.iter().map(|&c| display_char(c)).collect();
+            lines.push(Line::from(Span::styled(s, base_style)));
+        }
+    }
+    frame.render_widget(para(lines).block(bordered(&title)), area);
 }
 
 fn render_hex(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -1625,6 +1685,9 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
             Screen::Menu => "  ↑/↓ move · Enter select · q quit",
             Screen::Library => "  ↑/↓ · Enter open · m mkdir · b browse · f format · h hex · n notes · r rename · d del",
             Screen::NewFolder => "  type name · Enter create · Esc cancel",
+            Screen::TextEdit => {
+                "  arrows move · type to edit · Enter/Backspace/Del · Ctrl-S save · Esc leave"
+            }
             Screen::HexView => {
                 if app.hex_edit {
                     "  arrows move · Tab hex/ascii · type to overtype · Ctrl-S save · Esc leave"
@@ -1656,7 +1719,7 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
                 "  type to filter · ↑/↓ · Enter pick · Ctrl+E edit label · Esc back"
             }
             Screen::Browse => match app.browse_focus {
-                Focus::Files => "  Tab · f format · x extract · i insert · c copy · h hex/edit · R restore · d delete · Esc",
+                Focus::Files => "  Tab · x extract · i insert · c copy · t text · h hex · R restore · d delete · Esc",
                 Focus::Clip => "  Tab panes · Enter/p paste into image · d remove · Esc",
             },
             Screen::BrowseInput => "  type a path · Enter confirm · Esc cancel",

@@ -97,6 +97,7 @@ pub enum Screen {
     BrowseConfirmDelete,
     FileBrowse,
     HexView,
+    TextEdit,
     NewImageName,
     Tools,
     Installing,
@@ -286,6 +287,29 @@ pub struct App {
     /// Armed after a first Esc with unsaved changes (second Esc discards).
     hex_confirm_discard: bool,
 
+    // --- text editor (format-preserving; parallel to the hex cluster) ---
+    /// Editable buffer: logical lines as `char` vectors (cursor col is a char index).
+    pub text_lines: Vec<Vec<char>>,
+    /// Line ending + trailing-newline state carried from open, re-applied on save.
+    pub text_eol: gwm_core::textedit::Eol,
+    text_trailing: bool,
+    /// Filesystem the file lives in — picks the text codec (v1: always raw/Latin-1).
+    text_fs: FsKind,
+    pub text_title: String,
+    text_return: Screen,
+    pub text_row: usize,
+    pub text_col: usize,
+    /// Top visible logical line (scroll), and rows the editor last rendered.
+    pub text_scroll: usize,
+    pub text_rows: usize,
+    pub text_dirty: bool,
+    /// The file-in-image being edited (write-back target).
+    text_entry: Option<FileEntry>,
+    /// The extracted temp file the edited bytes are written back through.
+    text_temp: PathBuf,
+    /// Armed after a first Esc with unsaved changes (second Esc discards).
+    text_confirm_discard: bool,
+
     pub tools_index: usize,
     pub tool_status: Vec<bool>,
     /// Per-tool installed version / update state (parallel to `TOOLS`), filled in
@@ -404,6 +428,21 @@ impl App {
             hex_entry: None,
             hex_temp: PathBuf::new(),
             hex_confirm_discard: false,
+
+            text_lines: Vec::new(),
+            text_eol: gwm_core::textedit::Eol::Lf,
+            text_trailing: false,
+            text_fs: FsKind::Cpm,
+            text_title: String::new(),
+            text_return: Screen::Browse,
+            text_row: 0,
+            text_col: 0,
+            text_scroll: 0,
+            text_rows: 0,
+            text_dirty: false,
+            text_entry: None,
+            text_temp: PathBuf::new(),
+            text_confirm_discard: false,
             tools_index: 0,
             tool_status: Vec::new(),
             tool_versions: Vec::new(),
@@ -649,6 +688,7 @@ impl App {
             Screen::BrowseConfirmDelete => self.on_browse_delete_key(code),
             Screen::FileBrowse => self.on_file_browse_key(code, mods),
             Screen::HexView => self.on_hex_key(code, mods),
+            Screen::TextEdit => self.on_text_key(code, mods),
             Screen::NewImageName => self.on_new_image_key(code, mods),
             Screen::Tools => self.on_tools_key(code),
             Screen::Installing => self.on_installing_key(code),
@@ -1305,6 +1345,17 @@ impl App {
                             Ok(()) => {
                                 self.open_hex(&temp, entry.name.clone(), Screen::Browse, Some(entry.clone()))
                             }
+                            Err(err) => self.notice = Some(format!("Could not read file: {err}")),
+                        }
+                    }
+                }
+                KeyCode::Char('t') => {
+                    if let Some(entry) = self.selected_entry() {
+                        let dir = self.clip_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        let temp = dir.join(format!("txt-{}", safe_host_name(&entry.name)));
+                        match self.browse_fs().extract(&self.browse_image, &entry, &temp) {
+                            Ok(()) => self.open_text(&temp, entry.name.clone(), entry.clone()),
                             Err(err) => self.notice = Some(format!("Could not read file: {err}")),
                         }
                     }
@@ -2261,6 +2312,198 @@ impl App {
     /// image). Used by the UI to show the edit affordance.
     pub fn hex_editable(&self) -> bool {
         self.hex_entry.is_some()
+    }
+
+    // --- format-preserving text editor ----------------------------------
+
+    /// Open a file-in-image for text editing. Decodes with the codec for the
+    /// image's filesystem (v1: raw/Latin-1), remembering line-ending + trailing
+    /// state so an unedited save is byte-identical.
+    fn open_text(&mut self, path: &Path, title: String, entry: FileEntry) {
+        const MAX: usize = 8 * 1024 * 1024;
+        let mut bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(err) => {
+                self.notice = Some(format!("Could not read file: {err}"));
+                return;
+            }
+        };
+        bytes.truncate(MAX);
+        let fs = self.browse_driver;
+        let doc = gwm_core::textedit::TextDoc::open(&bytes, gwm_core::textedit::codec_for_fs(fs));
+        self.text_lines = doc.lines.iter().map(|l| l.chars().collect()).collect();
+        if self.text_lines.is_empty() {
+            self.text_lines.push(Vec::new());
+        }
+        self.text_eol = doc.eol();
+        self.text_trailing = doc.trailing_newline();
+        self.text_fs = fs;
+        self.text_title = title;
+        self.text_return = Screen::Browse;
+        self.text_row = 0;
+        self.text_col = 0;
+        self.text_scroll = 0;
+        self.text_dirty = false;
+        self.text_confirm_discard = false;
+        self.text_entry = Some(entry);
+        self.text_temp = path.to_path_buf();
+        self.screen = Screen::TextEdit;
+    }
+
+    fn on_text_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        if mods.contains(KeyModifiers::CONTROL) {
+            if code == KeyCode::Char('s') {
+                self.text_save();
+            }
+            return;
+        }
+        // Any key other than Esc disarms the "second Esc discards" prompt.
+        if code != KeyCode::Esc {
+            self.text_confirm_discard = false;
+        }
+        let last = self.text_lines.len().saturating_sub(1);
+        match code {
+            KeyCode::Esc => {
+                if self.text_dirty && !self.text_confirm_discard {
+                    self.text_confirm_discard = true;
+                    self.notice =
+                        Some("Unsaved changes — Esc again to discard, Ctrl-S to save.".to_string());
+                } else {
+                    self.text_confirm_discard = false;
+                    self.screen = self.text_return;
+                }
+            }
+            KeyCode::Up => {
+                if self.text_row > 0 {
+                    self.text_row -= 1;
+                    self.text_col = self.text_col.min(self.text_lines[self.text_row].len());
+                }
+            }
+            KeyCode::Down => {
+                if self.text_row < last {
+                    self.text_row += 1;
+                    self.text_col = self.text_col.min(self.text_lines[self.text_row].len());
+                }
+            }
+            KeyCode::Left => {
+                if self.text_col > 0 {
+                    self.text_col -= 1;
+                } else if self.text_row > 0 {
+                    self.text_row -= 1;
+                    self.text_col = self.text_lines[self.text_row].len();
+                }
+            }
+            KeyCode::Right => {
+                if self.text_col < self.text_lines[self.text_row].len() {
+                    self.text_col += 1;
+                } else if self.text_row < last {
+                    self.text_row += 1;
+                    self.text_col = 0;
+                }
+            }
+            KeyCode::Home => self.text_col = 0,
+            KeyCode::End => self.text_col = self.text_lines[self.text_row].len(),
+            KeyCode::PageUp => {
+                let step = self.text_rows.max(1);
+                self.text_row = self.text_row.saturating_sub(step);
+                self.text_col = self.text_col.min(self.text_lines[self.text_row].len());
+            }
+            KeyCode::PageDown => {
+                let step = self.text_rows.max(1);
+                self.text_row = (self.text_row + step).min(last);
+                self.text_col = self.text_col.min(self.text_lines[self.text_row].len());
+            }
+            KeyCode::Enter => {
+                let tail = self.text_lines[self.text_row].split_off(self.text_col);
+                self.text_lines.insert(self.text_row + 1, tail);
+                self.text_row += 1;
+                self.text_col = 0;
+                self.text_dirty = true;
+            }
+            KeyCode::Backspace => {
+                if self.text_col > 0 {
+                    self.text_lines[self.text_row].remove(self.text_col - 1);
+                    self.text_col -= 1;
+                    self.text_dirty = true;
+                } else if self.text_row > 0 {
+                    let cur = self.text_lines.remove(self.text_row);
+                    self.text_row -= 1;
+                    self.text_col = self.text_lines[self.text_row].len();
+                    self.text_lines[self.text_row].extend(cur);
+                    self.text_dirty = true;
+                }
+            }
+            KeyCode::Delete => {
+                if self.text_col < self.text_lines[self.text_row].len() {
+                    self.text_lines[self.text_row].remove(self.text_col);
+                    self.text_dirty = true;
+                } else if self.text_row < last {
+                    let next = self.text_lines.remove(self.text_row + 1);
+                    self.text_lines[self.text_row].extend(next);
+                    self.text_dirty = true;
+                }
+            }
+            KeyCode::Tab => {
+                self.text_lines[self.text_row].insert(self.text_col, '\t');
+                self.text_col += 1;
+                self.text_dirty = true;
+            }
+            KeyCode::Char(c) if is_typing(mods) => {
+                self.text_lines[self.text_row].insert(self.text_col, c);
+                self.text_col += 1;
+                self.text_dirty = true;
+            }
+            _ => {}
+        }
+        self.keep_text_cursor_visible();
+    }
+
+    /// Adjust the scroll so the cursor row stays within the last-rendered window.
+    fn keep_text_cursor_visible(&mut self) {
+        if self.text_row < self.text_scroll {
+            self.text_scroll = self.text_row;
+        }
+        let rows = self.text_rows.max(1);
+        if self.text_row >= self.text_scroll + rows {
+            self.text_scroll = self.text_row + 1 - rows;
+        }
+    }
+
+    /// Re-encode the buffer (preserving EOL + trailing newline via the codec) and
+    /// write it back into the image through the same path the hex editor uses.
+    fn text_save(&mut self) {
+        let Some(entry) = self.text_entry.clone() else {
+            return;
+        };
+        if !self.text_dirty {
+            self.notice = Some("No changes to save.".to_string());
+            return;
+        }
+        if let Err(err) = self.backup_original(&entry) {
+            self.notice = Some(format!("Could not stash original: {err}"));
+            return;
+        }
+        let lines: Vec<String> = self
+            .text_lines
+            .iter()
+            .map(|cs| cs.iter().collect())
+            .collect();
+        let doc = gwm_core::textedit::TextDoc::from_parts(lines, self.text_eol, self.text_trailing);
+        let bytes = doc.to_bytes(gwm_core::textedit::codec_for_fs(self.text_fs));
+        if let Err(err) = std::fs::write(&self.text_temp, &bytes) {
+            self.notice = Some(format!("Could not write temp file: {err}"));
+            return;
+        }
+        match self.write_back(&entry, &self.text_temp.clone()) {
+            Ok(()) => {
+                self.text_dirty = false;
+                self.text_confirm_discard = false;
+                self.browse_originals.insert(entry.name.clone());
+                self.after_image_modified();
+                self.notice = Some(format!("Saved {} back into the image.", entry.name));
+            }
+            Err(err) => self.notice = Some(format!("Save failed: {err}")),
+        }
     }
 
     fn hex_last_line(&self) -> usize {
