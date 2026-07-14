@@ -103,6 +103,7 @@ pub enum Screen {
     TextEdit,
     NewImageName,
     Tools,
+    ToolConfirm,
     Installing,
     DriverPicker,
     OptionPicker,
@@ -349,6 +350,9 @@ pub struct App {
     /// Index of the tool whose install command is running, so we can tell whether
     /// it actually landed once the command returns.
     installing_tool: Option<usize>,
+    /// A tool install awaiting the user's confirmation: (tool index, command).
+    /// Nothing runs until they agree on the ToolConfirm screen.
+    pub tool_confirm: Option<(usize, String)>,
 
     // --- archive.org import ---------------------------------------------
     pub archive_query: TextInput,
@@ -489,6 +493,7 @@ impl App {
             install_return: Screen::Tools,
             run_interactive: None,
             installing_tool: None,
+            tool_confirm: None,
             archive_query: TextInput::new(),
             archive_hits: Vec::new(),
             archive_hits_state: ListState::default(),
@@ -752,6 +757,7 @@ impl App {
             }
             Screen::NewImageName => self.on_new_image_key(code, mods),
             Screen::Tools => self.on_tools_key(code),
+            Screen::ToolConfirm => self.on_tool_confirm_key(code),
             Screen::Installing => self.on_installing_key(code),
             Screen::ArchiveSearch => self.on_archive_search_key(code, mods),
             Screen::ArchiveFetching => self.on_archive_fetching_key(code),
@@ -3428,16 +3434,34 @@ impl App {
         // Resolve how to install it on *this* system (apt/dnf/zypper/AUR + pipx).
         match gwm_core::tools::install_plan(&tool) {
             gwm_core::tools::InstallPlan::Run(cmd) => {
-                // Run interactively — the run loop suspends the TUI so the package
-                // manager can prompt for a password / confirmation. Remember which
-                // tool so we can tell if it actually landed (some distros accept
-                // the command but have no such package).
-                self.installing_tool = Some(self.tools_index);
-                self.run_interactive = Some(cmd);
+                // Don't touch the system yet: show a plain-English warning and make
+                // the user agree first (see on_tool_confirm_key).
+                self.tool_confirm = Some((self.tools_index, cmd));
+                self.screen = Screen::ToolConfirm;
             }
             gwm_core::tools::InstallPlan::Manual { note, site } => {
                 self.notice = Some(format!("{}: {note} {site}", tool.label));
             }
+        }
+    }
+
+    fn on_tool_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some((idx, cmd)) = self.tool_confirm.take() {
+                    // Run interactively — the run loop suspends the TUI so the
+                    // package manager can prompt for a password. Remember the tool
+                    // so we can tell if it actually landed once the command returns.
+                    self.installing_tool = Some(idx);
+                    self.run_interactive = Some(cmd);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+                self.tool_confirm = None;
+                self.screen = Screen::Tools;
+                self.notice = Some("Install cancelled — nothing was changed.".to_string());
+            }
+            _ => {}
         }
     }
 

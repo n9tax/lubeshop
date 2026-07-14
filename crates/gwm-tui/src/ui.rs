@@ -116,6 +116,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::TextEdit => render_text(app, frame, chunks[1]),
         Screen::NewImageName => render_new_image(app, frame, chunks[1]),
         Screen::Tools => render_tools(app, frame, chunks[1]),
+        Screen::ToolConfirm => render_tool_confirm(app, frame, chunks[1]),
         Screen::Installing => render_installing(app, frame, chunks[1]),
         Screen::ArchiveSearch => render_archive_search(app, frame, chunks[1]),
         Screen::ArchiveFetching => render_archive_fetching(app, frame, chunks[1]),
@@ -1511,6 +1512,58 @@ fn render_tools(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para(lines).block(bordered("Tools")), area);
 }
 
+fn render_tool_confirm(app: &App, frame: &mut Frame, area: Rect) {
+    let Some((idx, cmd)) = &app.tool_confirm else {
+        return;
+    };
+    let tool = gwm_core::tools::TOOLS[*idx];
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Install {} ?", tool.label),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(format!("  {} — used for {}.", tool.label, tool.purpose), dim())),
+        Line::from(""),
+        // The plain-English heads-up.
+        Line::from(Span::styled(
+            "  ⚠ This installs software on your computer and changes what's installed.",
+            Style::default().fg(theme().warning).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "  It runs in your terminal and may ask for your password.",
+            dim(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("  It will run:", dim())),
+    ];
+
+    // Show the command; cap long build scripts so the screen isn't a wall of shell.
+    let cmd_lines: Vec<&str> = cmd.lines().filter(|l| !l.trim().is_empty()).collect();
+    let shown = cmd_lines.len().min(8);
+    for l in &cmd_lines[..shown] {
+        lines.push(Line::from(Span::styled(
+            format!("    {}", l.trim()),
+            Style::default().fg(theme().accent),
+        )));
+    }
+    if cmd_lines.len() > shown {
+        lines.push(Line::from(Span::styled(
+            format!("    … (+{} more lines — full script runs in the terminal)", cmd_lines.len() - shown),
+            dim(),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press Enter (or Y) to install · Esc (or N) to cancel — nothing runs until you agree.",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    frame.render_widget(para(lines).block(bordered("Confirm install")), area);
+}
+
 fn render_gotek_format(app: &App, frame: &mut Frame, area: Rect) {
     let mut lines = vec![
         Line::from(Span::styled(
@@ -1867,6 +1920,7 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
                     "  ↑/↓ pick drive · Enter continue · r rescan · Esc back"
                 }
             }
+            Screen::ToolConfirm => "  Enter/Y install · Esc/N cancel",
             Screen::GotekName => "  type a filename · Enter send · Esc back",
             Screen::GotekSending => "  working… please wait",
             Screen::GotekDone => "  Enter to return",
