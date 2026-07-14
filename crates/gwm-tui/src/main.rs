@@ -12,6 +12,7 @@ mod read_job;
 mod text_input;
 mod theme;
 mod ui;
+mod version_job;
 mod write_job;
 
 use anyhow::{Context, Result};

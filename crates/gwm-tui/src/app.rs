@@ -18,6 +18,7 @@ use gwm_core::models::{MediaItem, MediaKind, NewMediaItem, Source};
 use gwm_core::Core;
 
 use crate::count_job::{CountJob, CountState};
+use crate::version_job::{VersionJob, VersionState};
 use crate::download_job::{DlOutcome, DownloadJob};
 use crate::file_browser::FileBrowser;
 use crate::install_job::InstallJob;
@@ -287,6 +288,10 @@ pub struct App {
 
     pub tools_index: usize,
     pub tool_status: Vec<bool>,
+    /// Per-tool installed version / update state (parallel to `TOOLS`), filled in
+    /// off the render thread by [`VersionJob`].
+    pub tool_versions: Vec<VersionState>,
+    version_job: Option<VersionJob>,
     pub install_job: Option<InstallJob>,
     install_return: Screen,
     /// A shell command to run interactively (suspending the TUI) next frame.
@@ -401,6 +406,8 @@ impl App {
             hex_confirm_discard: false,
             tools_index: 0,
             tool_status: Vec::new(),
+            tool_versions: Vec::new(),
+            version_job: None,
             install_job: None,
             install_return: Screen::Tools,
             run_interactive: None,
@@ -460,6 +467,14 @@ impl App {
                 job.pump(&mut self.archive_counts);
                 if !job.is_done() {
                     self.count_job = Some(job);
+                }
+            }
+
+            // Tool versions fill in the background too (probing spawns the tools).
+            if let Some(mut job) = self.version_job.take() {
+                job.pump(&mut self.tool_versions);
+                if !job.is_done() {
+                    self.version_job = Some(job);
                 }
             }
 
@@ -2960,6 +2975,10 @@ impl App {
             .iter()
             .map(|t| gwm_core::tools::installed(t.cmd))
             .collect();
+        // Probe each tool's version in the background (spawns the tools, so it must
+        // not block the render). Fills in `tool_versions` as results arrive.
+        self.tool_versions = vec![VersionState::Pending; gwm_core::tools::TOOLS.len()];
+        self.version_job = Some(VersionJob::start());
     }
 
     fn enter_tools(&mut self) {

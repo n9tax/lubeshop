@@ -19,6 +19,7 @@ use gwm_core::models::MediaItem;
 
 use crate::app::{App, Focus, LibRow, Screen, DRIVE_OPTIONS, MENU_ITEMS, TUNE_PARAMS};
 use crate::count_job::CountState;
+use crate::version_job::VersionState;
 use crate::text_input::TextInput;
 use crate::theme::{self, Theme};
 
@@ -1367,12 +1368,31 @@ fn render_tools(app: &App, frame: &mut Frame, area: Rect) {
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(marker.to_string(), Style::default().fg(theme().accent)),
             Span::styled(format!("{badge} "), badge_style),
             Span::styled(format!("{:<20}", tool.label), label_style),
-            Span::styled(tool.purpose.to_string(), dim()),
-        ]));
+            Span::styled(format!("{:<38}", tool.purpose), dim()),
+        ];
+        // Installed version + "update available" badge, filled in asynchronously.
+        match app.tool_versions.get(i) {
+            Some(VersionState::Ready(Some(v))) => {
+                spans.push(Span::styled(format!("v{v}"), dim()));
+                if let Some(target) = tool.version {
+                    if gwm_core::tools::is_outdated(v, target) {
+                        spans.push(Span::styled(
+                            format!("  ⬆ update → v{target}"),
+                            Style::default().fg(theme().warning),
+                        ));
+                    }
+                }
+            }
+            Some(VersionState::Pending) if installed => {
+                spans.push(Span::styled("…", dim()));
+            }
+            _ => {}
+        }
+        lines.push(Line::from(spans));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(

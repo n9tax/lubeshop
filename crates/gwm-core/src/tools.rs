@@ -100,6 +100,15 @@ pub fn windows_bin_dir() -> Option<std::path::PathBuf> {
         .map(|l| std::path::PathBuf::from(l).join("lubeshop").join("bin"))
 }
 
+/// How to read a tool's **installed** version: run `cmd` with `args`, then pick
+/// the first version-looking token (`\d+(\.\d+)+`) on the line containing `marker`.
+/// Tools report versions inconsistently — some via a flag, some in a bare banner.
+#[derive(Debug, Clone, Copy)]
+pub struct VersionProbe {
+    pub args: &'static [&'static str],
+    pub marker: &'static str,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Tool {
     /// Command used to detect whether it is installed.
@@ -112,6 +121,12 @@ pub struct Tool {
     pub win: WinSource,
     /// Project/download page, shown when it can't be installed automatically.
     pub homepage: &'static str,
+    /// The version we install/pin. Compared against the probed installed version to
+    /// flag "update available". `None` where we don't pin a version to compare to.
+    pub version: Option<&'static str>,
+    /// How to read the installed version, or `None` if the tool has no version
+    /// command (then we just show "installed").
+    pub probe: Option<VersionProbe>,
 }
 
 // ---- build recipes (validated end-to-end) --------------------------------
@@ -199,14 +214,14 @@ echo "Built and installed c1541 to ~/.local/bin"
 
 /// The tools the app can drive, in menu order.
 pub const TOOLS: &[Tool] = &[
-    Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), win: WinSource::BundleFolder { url: "https://github.com/keirf/greaseweazle/releases/download/v1.23/greaseweazle-1.23-win64.zip", dir: "gw" }, homepage: "https://github.com/keirf/greaseweazle" },
-    Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/cpmtools-win64.zip"), homepage: "http://www.moria.de/~michael/cpmtools/" },
-    Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/mtools-win64.zip"), homepage: "https://www.gnu.org/software/mtools/" },
-    Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::Vice, win: WinSource::Winget("VICE-Team.VICE.GTK3"), homepage: "https://vice-emu.sourceforge.io/" },
-    Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/amitools-win64.zip", dir: "xdftool" }, homepage: "https://github.com/cnvogelg/amitools" },
-    Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Build(APPLECOMMANDER), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/applecommander-win64.zip", dir: "applecommander-ac" }, homepage: "https://applecommander.github.io/" },
-    Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), win: WinSource::Todo, homepage: "https://github.com/jhallen/atari-tools" },
-    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/hxc-win64.zip", dir: "hxc" }, homepage: "https://github.com/jfdelnero/HxCFloppyEmulator" },
+    Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), win: WinSource::BundleFolder { url: "https://github.com/keirf/greaseweazle/releases/download/v1.23/greaseweazle-1.23-win64.zip", dir: "gw" }, homepage: "https://github.com/keirf/greaseweazle" , version: Some("1.23"), probe: Some(VersionProbe { args: &["info"], marker: "Host Tools:" }) },
+    Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/cpmtools-win64.zip"), homepage: "http://www.moria.de/~michael/cpmtools/" , version: None, probe: None },
+    Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/mtools-win64.zip"), homepage: "https://www.gnu.org/software/mtools/" , version: Some("4.0.49"), probe: Some(VersionProbe { args: &["--version"], marker: "mtools" }) },
+    Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::Vice, win: WinSource::Winget("VICE-Team.VICE.GTK3"), homepage: "https://vice-emu.sourceforge.io/" , version: None, probe: None },
+    Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/amitools-win64.zip", dir: "xdftool" }, homepage: "https://github.com/cnvogelg/amitools" , version: None, probe: None },
+    Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Build(APPLECOMMANDER), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/applecommander-win64.zip", dir: "applecommander-ac" }, homepage: "https://applecommander.github.io/" , version: Some("13.1"), probe: Some(VersionProbe { args: &[], marker: "options [" }) },
+    Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), win: WinSource::Todo, homepage: "https://github.com/jhallen/atari-tools" , version: None, probe: None },
+    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/hxc-win64.zip", dir: "hxc" }, homepage: "https://github.com/jfdelnero/HxCFloppyEmulator" , version: Some("2.16.13.1"), probe: Some(VersionProbe { args: &[], marker: "converter v" }) },
 ];
 
 /// A system package manager we know how to drive.
@@ -629,6 +644,66 @@ pub fn installed(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Read a tool's installed version by running its [`VersionProbe`]. Returns `None`
+/// if the command can't run or no version token is found. Blocking (some probes,
+/// e.g. `gw info`, are slow) — call it off the render thread.
+pub fn installed_version(cmd: &str, probe: &VersionProbe) -> Option<String> {
+    let out = Command::new(cmd)
+        .args(probe.args)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    // Tools print the version to stdout or stderr; search both.
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    extract_version(&text, probe.marker)
+}
+
+/// First version-looking token (`\d+(\.\d+)+`) on the first line containing `marker`.
+fn extract_version(text: &str, marker: &str) -> Option<String> {
+    text.lines()
+        .find(|l| l.contains(marker))
+        .and_then(first_version_token)
+}
+
+/// The first dotted-numeric run in `line` (needs at least one `.` so a lone integer
+/// like a year or a bracketed count isn't mistaken for a version).
+fn first_version_token(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            let tok = line[start..i].trim_end_matches('.');
+            if tok.contains('.') {
+                return Some(tok.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Whether `installed` is strictly older than `target` (both dotted-numeric). False
+/// if either can't be parsed, or installed ≥ target — so a *newer*-than-pinned local
+/// build (common with distro packages) never nags "update available".
+pub fn is_outdated(installed: &str, target: &str) -> bool {
+    match (parse_version(installed), parse_version(target)) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
+}
+
+fn parse_version(s: &str) -> Option<Vec<u32>> {
+    let parts: Option<Vec<u32>> = s.split('.').map(|p| p.parse().ok()).collect();
+    parts.filter(|v| !v.is_empty())
+}
+
 /// Run a shell command, streaming output lines through `on_line` (used for the
 /// non-interactive `gw clean`). Returns whether it exited successfully.
 pub fn run_streamed<F: FnMut(&str)>(shell_cmd: &str, mut on_line: F) -> std::io::Result<bool> {
@@ -865,5 +940,47 @@ mod tests {
             resolve(Source::Vice, HP, Some(PkgMgr::Aur("paru")), false),
             InstallPlan::Run("paru -S --needed vice".to_string())
         );
+    }
+
+    #[test]
+    fn parses_version_from_each_tools_real_output() {
+        // Sampled real output lines (see the version-probe table in the spec).
+        assert_eq!(extract_version("mdir (GNU mtools) 4.0.49", "mtools").as_deref(), Some("4.0.49"));
+        assert_eq!(
+            extract_version("AppleCommander command line options [13.1]:", "options [").as_deref(),
+            Some("13.1")
+        );
+        assert_eq!(
+            extract_version("HxC Floppy Emulator : Floppy image file converter v2.16.13.1", "converter v").as_deref(),
+            Some("2.16.13.1")
+        );
+        assert_eq!(extract_version("Host Tools: 1.23", "Host Tools:").as_deref(), Some("1.23"));
+        // Marker not present → nothing.
+        assert_eq!(extract_version("no version here", "converter v"), None);
+        // A lone integer (e.g. a copyright year) is not a version.
+        assert_eq!(first_version_token("Copyright 2026 someone"), None);
+    }
+
+    #[test]
+    fn outdated_only_when_strictly_older() {
+        assert!(is_outdated("4.0.43", "4.0.49"));
+        assert!(is_outdated("1.22", "1.23"));
+        assert!(!is_outdated("4.0.49", "4.0.49")); // equal
+        assert!(!is_outdated("4.0.50", "4.0.49")); // newer local build → no nag
+        assert!(!is_outdated("weird", "4.0.49")); // unparseable → no badge
+    }
+
+    #[test]
+    fn every_tool_with_a_probe_pins_a_target_version() {
+        for t in TOOLS {
+            // If we can read a version, we should have a target to compare against
+            // (and vice-versa) so the badge logic is meaningful.
+            assert_eq!(
+                t.probe.is_some(),
+                t.version.is_some(),
+                "tool {} mismatches probe/version",
+                t.cmd
+            );
+        }
     }
 }
