@@ -139,8 +139,15 @@ fn windows_drives() -> Vec<UsbDrive> {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    // ConvertTo-Json yields an object for one volume, an array for several.
-    let items: Vec<&serde_json::Value> = match &json {
+    parse_windows_volumes(&json)
+}
+
+/// Turn the `Get-Volume | … | ConvertTo-Json` payload into removable FAT drives.
+/// `ConvertTo-Json` yields a single object for one volume and an array for several.
+/// Pure (no process spawning) so it can be unit-tested against real payload shapes.
+#[cfg(windows)]
+fn parse_windows_volumes(json: &serde_json::Value) -> Vec<UsbDrive> {
+    let items: Vec<&serde_json::Value> = match json {
         serde_json::Value::Array(a) => a.iter().collect(),
         v => vec![v],
     };
@@ -209,6 +216,43 @@ mod tests {
         for bad in ["ext4", "ntfs", "btrfs", ""] {
             assert!(!is_fat(bad), "{bad} should not be FAT");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parses_getvolume_json_single_object() {
+        // One removable FAT stick → ConvertTo-Json emits a single object. On this VM
+        // PowerShell serialises DriveLetter as a string.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"DriveLetter":"E","FileSystemLabel":"GOTEK","FileSystem":"FAT32","Size":4000000000}"#,
+        )
+        .unwrap();
+        let drives = parse_windows_volumes(&json);
+        assert_eq!(drives.len(), 1);
+        assert_eq!(drives[0].mount, PathBuf::from("E:\\"));
+        assert_eq!(drives[0].label, "GOTEK");
+        assert_eq!(drives[0].fs, "FAT32");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parses_getvolume_json_array_and_filters_non_fat() {
+        // Several volumes → an array. DriveLetter may arrive as a numeric char code
+        // (older PowerShell). Only removable-FAT rows survive; a letterless or
+        // non-FAT row is dropped.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"DriveLetter":70,"FileSystemLabel":"","FileSystem":"exFAT","Size":8000000000},
+                {"DriveLetter":"G","FileSystemLabel":"DATA","FileSystem":"NTFS","Size":16000000000},
+                {"DriveLetter":null,"FileSystemLabel":"","FileSystem":"FAT32","Size":2000000000}
+            ]"#,
+        )
+        .unwrap();
+        let drives = parse_windows_volumes(&json);
+        // 'F' (char 70) exFAT kept; NTFS dropped; letterless dropped.
+        assert_eq!(drives.len(), 1);
+        assert_eq!(drives[0].mount, PathBuf::from("F:\\"));
+        assert_eq!(drives[0].fs, "exFAT");
     }
 
     #[cfg(not(windows))]
