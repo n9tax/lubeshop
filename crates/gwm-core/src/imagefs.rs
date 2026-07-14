@@ -307,12 +307,10 @@ pub fn mtools_available() -> bool {
 }
 
 fn have(cmd: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {cmd} >/dev/null 2>&1"))
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // Cross-platform PATH probe (`where` on Windows, `command -v` elsewhere) — the
+    // old `sh -c` form silently failed on Windows, where `sh` isn't on PATH, so FAT
+    // and CBM browsing showed as unavailable even with the tools installed.
+    crate::tools::installed(cmd)
 }
 
 /// A FAT filesystem (MS-DOS / Atari ST / MSX-DOS) accessed through mtools.
