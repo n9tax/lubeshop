@@ -1215,7 +1215,7 @@ impl App {
                 // Wrong driver/format? Let the user re-pick instead of bailing.
                 self.open_driver_picker(PickMode::Browse, Some(self.browse_driver));
                 self.notice = Some(format!(
-                    "Could not read as {}: {err} — pick a format",
+                    "Could not read as {}: {err} — or try a different filesystem",
                     self.browse_driver.label()
                 ));
             }

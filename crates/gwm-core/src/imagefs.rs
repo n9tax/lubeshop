@@ -877,6 +877,22 @@ fn run_amiga(cmd: Command) -> Result<String> {
         cmd,
         &["error", "not found", "traceback", "cannot ", "no such", "invalid"],
     )
+    .map_err(|e| {
+        // A bad root/boot block means there's no AmigaDOS filesystem — almost always
+        // a custom-format or bootable disk (a game trackloader), not a damaged image.
+        // Say so plainly instead of surfacing xdftool's "Invalid Root Block".
+        let low = e.to_string().to_lowercase();
+        if low.contains("root block") || low.contains("boot block") {
+            CoreError::Tool(
+                "no AmigaDOS filesystem to browse — this looks like a custom-format \
+                 or bootable disk (e.g. a game trackloader). The image is still valid \
+                 for an emulator; it just has no files to list."
+                    .to_string(),
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// Parse `xdftool list` output. It's an indented **tree**: the volume line is
