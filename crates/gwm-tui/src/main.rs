@@ -6,6 +6,7 @@ mod app;
 mod count_job;
 mod download_job;
 mod file_browser;
+mod gotek_job;
 mod install_job;
 mod net_job;
 mod read_job;

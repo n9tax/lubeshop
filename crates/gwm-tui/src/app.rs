@@ -18,7 +18,10 @@ use gwm_core::models::{MediaItem, MediaKind, NewMediaItem, Source};
 use gwm_core::Core;
 
 use crate::count_job::{CountJob, CountState};
+use crate::gotek_job::GotekJob;
 use crate::version_job::{VersionJob, VersionState};
+use gwm_core::convert::GotekFormat;
+use gwm_core::usb::UsbDrive;
 use crate::download_job::{DlOutcome, DownloadJob};
 use crate::file_browser::FileBrowser;
 use crate::install_job::InstallJob;
@@ -109,6 +112,10 @@ pub enum Screen {
     ArchiveResults,
     ArchiveFiles,
     ArchiveDownloading,
+    GotekFormat,
+    GotekDrive,
+    GotekSending,
+    GotekDone,
 }
 
 /// Whether the shared driver/option pickers are serving a browse or a create.
@@ -310,6 +317,22 @@ pub struct App {
     /// Armed after a first Esc with unsaved changes (second Esc discards).
     text_confirm_discard: bool,
 
+    // --- Send to Gotek ---
+    /// The image being sent (catalog id, path, display name) and its gw format.
+    gotek_id: i64,
+    gotek_source: PathBuf,
+    pub gotek_name: String,
+    gotek_disk_format: Option<String>,
+    /// The chosen output format and the format-picker cursor.
+    pub gotek_format: GotekFormat,
+    pub gotek_format_index: usize,
+    /// Detected removable drives and the drive-picker cursor.
+    pub gotek_drives: Vec<UsbDrive>,
+    pub gotek_drive_index: usize,
+    gotek_job: Option<GotekJob>,
+    /// Result of the last send (`Ok(dest)` / `Err(msg)`), shown on the done screen.
+    pub gotek_outcome: Option<Result<String, String>>,
+
     pub tools_index: usize,
     pub tool_status: Vec<bool>,
     /// Per-tool installed version / update state (parallel to `TOOLS`), filled in
@@ -443,6 +466,17 @@ impl App {
             text_entry: None,
             text_temp: PathBuf::new(),
             text_confirm_discard: false,
+            gotek_id: 0,
+            gotek_source: PathBuf::new(),
+            gotek_name: String::new(),
+            gotek_disk_format: None,
+            gotek_format: GotekFormat::Hfe,
+            gotek_format_index: 0,
+            gotek_drives: Vec::new(),
+            gotek_drive_index: 0,
+            gotek_job: None,
+            gotek_outcome: None,
+
             tools_index: 0,
             tool_status: Vec::new(),
             tool_versions: Vec::new(),
@@ -514,6 +548,20 @@ impl App {
                 job.pump(&mut self.tool_versions);
                 if !job.is_done() {
                     self.version_job = Some(job);
+                }
+            }
+
+            // A running "Send to Gotek" convert+copy.
+            if let Some(mut job) = self.gotek_job.take() {
+                if job.pump() {
+                    self.gotek_outcome = Some(match &job.outcome {
+                        Some(Ok(())) => Ok(job.dest.display().to_string()),
+                        Some(Err(e)) => Err(e.clone()),
+                        None => Err("no result".to_string()),
+                    });
+                    self.screen = Screen::GotekDone;
+                } else {
+                    self.gotek_job = Some(job);
                 }
             }
 
@@ -689,6 +737,14 @@ impl App {
             Screen::FileBrowse => self.on_file_browse_key(code, mods),
             Screen::HexView => self.on_hex_key(code, mods),
             Screen::TextEdit => self.on_text_key(code, mods),
+            Screen::GotekFormat => self.on_gotek_format_key(code),
+            Screen::GotekDrive => self.on_gotek_drive_key(code),
+            Screen::GotekSending => {}
+            Screen::GotekDone => {
+                if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                    self.screen = Screen::Library;
+                }
+            }
             Screen::NewImageName => self.on_new_image_key(code, mods),
             Screen::Tools => self.on_tools_key(code),
             Screen::Installing => self.on_installing_key(code),
@@ -701,6 +757,90 @@ impl App {
     }
 
     // --- image browsing (cpmtools) --------------------------------------
+
+    // --- Send to Gotek --------------------------------------------------
+
+    fn start_gotek(&mut self) {
+        let Some(it) = self.selected_file() else {
+            return;
+        };
+        self.gotek_id = it.id;
+        self.gotek_source = PathBuf::from(&it.path);
+        self.gotek_name = item_file_name(&it);
+        self.gotek_disk_format = it.format.clone();
+        self.gotek_format_index = 0;
+        self.gotek_format = GOTEK_FORMATS[0];
+        self.screen = Screen::GotekFormat;
+    }
+
+    fn on_gotek_format_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Library,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.gotek_format_index = self
+                    .gotek_format_index
+                    .checked_sub(1)
+                    .unwrap_or(GOTEK_FORMATS.len() - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.gotek_format_index = (self.gotek_format_index + 1) % GOTEK_FORMATS.len();
+            }
+            KeyCode::Enter => {
+                self.gotek_format = GOTEK_FORMATS[self.gotek_format_index];
+                self.refresh_gotek_drives();
+                self.gotek_drive_index = 0;
+                self.screen = Screen::GotekDrive;
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_gotek_drives(&mut self) {
+        self.gotek_drives = gwm_core::usb::removable_drives();
+        if self.gotek_drive_index >= self.gotek_drives.len() {
+            self.gotek_drive_index = self.gotek_drives.len().saturating_sub(1);
+        }
+    }
+
+    fn on_gotek_drive_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::GotekFormat,
+            KeyCode::Char('r') => self.refresh_gotek_drives(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                move_list_index(&mut self.gotek_drive_index, self.gotek_drives.len(), -1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                move_list_index(&mut self.gotek_drive_index, self.gotek_drives.len(), 1)
+            }
+            KeyCode::Enter => {
+                if !self.gotek_drives.is_empty() {
+                    self.start_gotek_send();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn start_gotek_send(&mut self) {
+        let Some(drive) = self.gotek_drives.get(self.gotek_drive_index).cloned() else {
+            return;
+        };
+        let format = self.gotek_format;
+        let out_name = gotek_out_name(&self.gotek_name, format);
+        let dest = drive.mount.join(&out_name);
+        let temp_dir = self.clip_dir();
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let temp = temp_dir.join(format!("gotek-{}", safe_host_name(&out_name)));
+        self.gotek_outcome = None;
+        self.gotek_job = Some(GotekJob::start(
+            self.gotek_source.clone(),
+            temp,
+            dest,
+            format,
+            self.gotek_disk_format.clone(),
+        ));
+        self.screen = Screen::GotekSending;
+    }
 
     fn start_browse(&mut self) {
         let Some(it) = self.selected_file() else {
@@ -2230,6 +2370,7 @@ impl App {
             }
             KeyCode::Char('v') => self.verify_selected(),
             KeyCode::Char('b') => self.start_browse(),
+            KeyCode::Char('g') => self.start_gotek(),
             KeyCode::Char('f') => self.reformat_selected(),
             KeyCode::Char('d') => {
                 if self.selected_file().is_some() {
@@ -3328,6 +3469,37 @@ fn move_list(state: &mut ListState, len: usize, delta: isize) {
     let current = state.selected().unwrap_or(0) as isize;
     let next = (current + delta).rem_euclid(len as isize) as usize;
     state.select(Some(next));
+}
+
+/// Wrap a plain `usize` cursor within `[0, len)`.
+fn move_list_index(idx: &mut usize, len: usize, delta: isize) {
+    if len == 0 {
+        *idx = 0;
+        return;
+    }
+    *idx = ((*idx as isize + delta).rem_euclid(len as isize)) as usize;
+}
+
+/// Formats offered by "Send to Gotek", in menu order. HFE first (the safe default).
+pub const GOTEK_FORMATS: [GotekFormat; 3] = [
+    GotekFormat::Hfe,
+    GotekFormat::HfeV3,
+    GotekFormat::CopyNative,
+];
+
+/// The output filename on the Gotek drive: keep the name for copy-as-is, else swap
+/// the extension for `.hfe`.
+pub fn gotek_out_name(source_name: &str, format: GotekFormat) -> String {
+    match format.extension() {
+        Some(ext) => {
+            let stem = Path::new(source_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(source_name);
+            format!("{stem}.{ext}")
+        }
+        None => source_name.to_string(),
+    }
 }
 
 fn file_name(path: &PathBuf) -> String {

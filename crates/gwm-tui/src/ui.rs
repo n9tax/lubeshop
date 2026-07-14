@@ -122,6 +122,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::ArchiveResults => render_archive_results(app, frame, chunks[1]),
         Screen::ArchiveFiles => render_archive_files(app, frame, chunks[1]),
         Screen::ArchiveDownloading => render_archive_downloading(app, frame, chunks[1]),
+        Screen::GotekFormat => render_gotek_format(app, frame, chunks[1]),
+        Screen::GotekDrive => render_gotek_drive(app, frame, chunks[1]),
+        Screen::GotekSending => render_gotek_sending(app, frame, chunks[1]),
+        Screen::GotekDone => render_gotek_done(app, frame, chunks[1]),
     }
     render_status(app, frame, chunks[2]);
 }
@@ -1506,6 +1510,115 @@ fn render_tools(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para(lines).block(bordered("Tools")), area);
 }
 
+fn render_gotek_format(app: &App, frame: &mut Frame, area: Rect) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("  Send  {}  to a Gotek USB drive.", app.gotek_name),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("  Choose a format:", dim())),
+        Line::from(""),
+    ];
+    for (i, fmt) in crate::app::GOTEK_FORMATS.iter().enumerate() {
+        let selected = i == app.gotek_format_index;
+        let (marker, style) = if selected {
+            ("▸ ", accented())
+        } else {
+            ("  ", base())
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{}", fmt.label()),
+            style,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  HFE works on any Gotek firmware. HFE v3 is required for hard-sectored",
+        dim(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  disks (NorthStar/Micropolis) — most faithful straight from a flux capture.",
+        dim(),
+    )));
+    frame.render_widget(para(lines).block(bordered("Send to Gotek")), area);
+}
+
+fn render_gotek_drive(app: &App, frame: &mut Frame, area: Rect) {
+    let out_name = crate::app::gotek_out_name(&app.gotek_name, app.gotek_format);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("  Will write:  {out_name}   ({})", app.gotek_format.label()),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if app.gotek_drives.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No removable FAT drives found.",
+            Style::default().fg(theme().warning),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Insert your Gotek USB stick (must be FAT-formatted) and press r to rescan.",
+            dim(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled("  Choose a drive:", dim())));
+        lines.push(Line::from(""));
+        for (i, d) in app.gotek_drives.iter().enumerate() {
+            let selected = i == app.gotek_drive_index;
+            let (marker, style) = if selected {
+                ("▸ ", accented())
+            } else {
+                ("  ", base())
+            };
+            lines.push(Line::from(Span::styled(format!("{marker}{}", d.describe()), style)));
+        }
+    }
+    frame.render_widget(para(lines).block(bordered("Send to Gotek — pick drive")), area);
+}
+
+fn render_gotek_sending(app: &App, frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Converting and copying {} to the drive…", app.gotek_name),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("  This can take a moment for a full disk.", dim())),
+    ];
+    frame.render_widget(para(lines).block(bordered("Send to Gotek")), area);
+}
+
+fn render_gotek_done(app: &App, frame: &mut Frame, area: Rect) {
+    let lines = match &app.gotek_outcome {
+        Some(Ok(dest)) => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  ✓ Sent to the Gotek drive.",
+                Style::default().fg(theme().success).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(format!("  {dest}"), dim())),
+            Line::from(""),
+            Line::from(Span::styled("  Eject the drive safely before removing it.", dim())),
+        ],
+        Some(Err(err)) => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  ✗ Could not send to the drive.",
+                Style::default().fg(theme().danger).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(format!("  {err}"), dim())),
+        ],
+        None => vec![Line::from("")],
+    };
+    frame.render_widget(para(lines).block(bordered("Send to Gotek")), area);
+}
+
 fn render_installing(app: &App, frame: &mut Frame, area: Rect) {
     let Some(job) = app.install_job.as_ref() else {
         return;
@@ -1719,7 +1832,17 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         let text = match app.screen {
             Screen::Menu => "  ↑/↓ move · Enter select · q quit",
-            Screen::Library => "  ↑/↓ · Enter open · m mkdir · b browse · f format · h hex · n notes · r rename · d del",
+            Screen::Library => "  ↑/↓ · Enter open · b browse · g →Gotek · f format · h hex · n notes · r rename · d del",
+            Screen::GotekFormat => "  ↑/↓ choose format · Enter continue · Esc cancel",
+            Screen::GotekDrive => {
+                if app.gotek_drives.is_empty() {
+                    "  r rescan · Esc back"
+                } else {
+                    "  ↑/↓ pick drive · Enter send · r rescan · Esc back"
+                }
+            }
+            Screen::GotekSending => "  working… please wait",
+            Screen::GotekDone => "  Enter to return",
             Screen::NewFolder => "  type name · Enter create · Esc cancel",
             Screen::TextEdit => {
                 "  arrows move · type to edit · Enter/Backspace/Del · Ctrl-S save · Esc leave"
