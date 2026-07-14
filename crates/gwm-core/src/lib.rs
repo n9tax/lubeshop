@@ -21,6 +21,7 @@ pub mod settings;
 pub mod textedit;
 pub mod tools;
 pub mod trs_disk;
+pub mod usb;
 pub mod util;
 pub mod write;
 
