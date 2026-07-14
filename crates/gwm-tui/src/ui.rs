@@ -386,15 +386,35 @@ fn render_delete_confirm(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para(lines).block(bordered("Delete from library")), area);
 }
 
-/// Substitute a visible glyph for control/C1 characters so they don't garble the
-/// terminal. Display-only — the editor buffer keeps the real character, and one
-/// glyph == one char so the cursor column still lines up.
+/// Tab stop width for display (assembler source relies on this to align columns).
+const TAB_WIDTH: usize = 8;
+
+/// A single display glyph for a non-tab character: a visible marker for control/C1
+/// bytes so they don't garble the terminal, otherwise the character itself. Tabs
+/// are handled by [`expand_char`] (they become spaces to the next tab stop), not
+/// here. Display-only — the editor buffer always keeps the real bytes.
 fn display_char(c: char) -> char {
     let u = c as u32;
-    match c {
-        '\t' => '→',
-        _ if u < 0x20 || (0x7f..=0x9f).contains(&u) => '·',
-        _ => c,
+    if u < 0x20 || (0x7f..=0x9f).contains(&u) {
+        '·'
+    } else {
+        c
+    }
+}
+
+/// Append the on-screen form of `c` to `out`, advancing the display column `col`.
+/// A tab expands to spaces up to the next multiple of [`TAB_WIDTH`] so columns line
+/// up like a real editor; everything else is one cell.
+fn expand_char(out: &mut String, col: &mut usize, c: char) {
+    if c == '\t' {
+        let stop = (*col / TAB_WIDTH + 1) * TAB_WIDTH;
+        for _ in *col..stop {
+            out.push(' ');
+        }
+        *col = stop;
+    } else {
+        out.push(display_char(c));
+        *col += 1;
     }
 }
 
@@ -426,19 +446,35 @@ fn render_text(app: &mut App, frame: &mut Frame, area: Rect) {
         let chars = &app.text_lines[r];
         if r == app.text_row {
             let col = app.text_col.min(chars.len());
-            let before: String = chars[..col].iter().map(|&c| display_char(c)).collect();
+            let mut dcol = 0usize;
+            // Text left of the cursor, tab-expanded (tracking the display column).
+            let mut before = String::new();
+            for &c in &chars[..col] {
+                expand_char(&mut before, &mut dcol, c);
+            }
             let mut spans = vec![Span::styled(before, base_style)];
             if col < chars.len() {
-                spans.push(Span::styled(display_char(chars[col]).to_string(), cursor_style));
-                let after: String = chars[col + 1..].iter().map(|&c| display_char(c)).collect();
+                // Cursor on a character: highlight its expanded cell(s) — a tab
+                // highlights the whole run of spaces to the next tab stop.
+                let mut cell = String::new();
+                expand_char(&mut cell, &mut dcol, chars[col]);
+                spans.push(Span::styled(cell, cursor_style));
+                let mut after = String::new();
+                for &c in &chars[col + 1..] {
+                    expand_char(&mut after, &mut dcol, c);
+                }
                 spans.push(Span::styled(after, base_style));
             } else {
-                // Cursor sits past the last character: highlight a trailing space.
+                // Cursor past the last character: a trailing highlighted space.
                 spans.push(Span::styled(" ", cursor_style));
             }
             lines.push(Line::from(spans));
         } else {
-            let s: String = chars.iter().map(|&c| display_char(c)).collect();
+            let mut s = String::new();
+            let mut dcol = 0usize;
+            for &c in chars {
+                expand_char(&mut s, &mut dcol, c);
+            }
             lines.push(Line::from(Span::styled(s, base_style)));
         }
     }
