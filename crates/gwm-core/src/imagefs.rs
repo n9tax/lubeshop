@@ -879,15 +879,21 @@ fn run_amiga(cmd: Command) -> Result<String> {
     )
 }
 
-/// Parse `xdftool list` output. The volume line is un-indented; file lines are
-/// indented and end with `<size> <8-char protection> <date> <time>`; trailing
-/// `sum:`/`data:`/`fs:` lines summarise. We locate the protection column
-/// (`[-hsparwed]{8}`) so filenames with spaces survive, and take the integer
-/// before it as the size (the volume line has `VOLUME` there, so it's skipped).
+/// Parse `xdftool list` output. It's an indented **tree**: the volume line is
+/// un-indented, each nesting level adds two spaces, and directory lines show `DIR`
+/// where files show a byte size; trailing `sum:`/`data:`/`fs:` lines summarise.
+/// We locate the protection column (`[-hsparwed]{8}`) so filenames with spaces
+/// survive, take the token before it as the size, and — crucially — reconstruct
+/// each file's **full path** (`PacMan/DATA`) from the indentation, because that's
+/// the node path `xdftool read/write/delete` expects. Leaf names alone fail with
+/// "Node not found" (or collide with a same-named directory). Directories aren't
+/// emitted as entries; they only build the path prefix for their children.
 fn parse_xdftool_list(text: &str) -> Vec<FileEntry> {
     let mut out = Vec::new();
+    let mut dirs: Vec<String> = Vec::new(); // parent directory names, by depth
     for line in text.lines() {
-        if !line.starts_with(' ') {
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 {
             continue; // volume line or summary label (sum:/data:/fs:)
         }
         let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -897,14 +903,25 @@ fn parse_xdftool_list(text: &str) -> Vec<FileEntry> {
         if pi < 2 {
             continue;
         }
-        let Ok(size) = tokens[pi - 1].parse::<u64>() else {
-            continue; // directories show a non-numeric size column
-        };
-        let name = tokens[..pi - 1].join(" ");
-        if name.is_empty() {
+        let leaf = tokens[..pi - 1].join(" ");
+        if leaf.is_empty() {
             continue;
         }
-        out.push(FileEntry { name, size, user: 0 });
+        // Two spaces per level; root-level entries are depth 1. Drop any deeper
+        // directories left over from a previous branch.
+        let depth = (indent / 2).max(1);
+        dirs.truncate(depth - 1);
+        let name = if dirs.is_empty() {
+            leaf.clone()
+        } else {
+            format!("{}/{}", dirs.join("/"), leaf)
+        };
+        match tokens[pi - 1].parse::<u64>() {
+            Ok(size) => out.push(FileEntry { name, size, user: 0 }),
+            // A directory (`DIR` in the size column): becomes the prefix for its
+            // children, but isn't itself a browsable/editable file.
+            Err(_) => dirs.push(leaf),
+        }
     }
     out
 }
@@ -1592,15 +1609,23 @@ mod tests {
 
     #[test]
     fn parses_xdftool_list_and_usage() {
+        // Indented tree: a subdir with two nested files, then a root file.
         let text = "MyDisk                          VOLUME  --------  12.07.2026 15:07:18.00  DOS0:ofs #512\n\
                     \x20 hello.txt                        12  ----rwed  12.07.2026 15:07:18.00  \n\
                     \x20 read me now                      99  ----rwed  12.07.2026 15:07:18.00  \n\
-                    \x20 subdir                          DIR  ----rwed  12.07.2026 15:07:18.00  \n\
+                    \x20 PacMan                          DIR  ----rwed  12.07.2026 15:07:18.00  \n\
+                    \x20\x20\x20 DATA                      11  ----rwed  12.07.2026 15:07:18.00  \n\
+                    \x20\x20\x20 PacMan                    10  ----rwed  12.07.2026 15:07:18.00  \n\
+                    \x20 readme                           12  ----rwed  12.07.2026 15:07:18.00  \n\
                     sum:             3  1.5Ki          1536\n";
         let files = parse_xdftool_list(text);
-        assert_eq!(files.len(), 2); // volume + DIR excluded
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        // DIR excluded; nested files carry their full path; a nested file sharing
+        // the directory's name is disambiguated by the path.
+        assert_eq!(names, ["hello.txt", "read me now", "PacMan/DATA", "PacMan/PacMan", "readme"]);
         assert_eq!(files[0], FileEntry { name: "hello.txt".into(), size: 12, user: 0 });
         assert_eq!(files[1].name, "read me now"); // spaces in name preserved
+        assert_eq!(files[2], FileEntry { name: "PacMan/DATA".into(), size: 11, user: 0 });
         let info = "total:        1760  880Ki        901120\n\
                     used:            6  3.0Ki          3072   0.34%\n\
                     free:         1754  877Ki        898048  99.66%\n";
