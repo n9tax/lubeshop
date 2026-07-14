@@ -38,6 +38,18 @@ jpackage --type app-image --name applecommander-ac \
   --input input --main-jar ac.jar --runtime-image minjre --dest appdir
 
 echo ">> packaging"
+# GPL-2.0 (AppleCommander) + GPLv2+Classpath (bundled Temurin runtime): include the
+# licenses + a source note in the app-image folder.
+curl -fsSL -o appdir/applecommander-ac/LICENSE-AppleCommander.txt "https://www.gnu.org/licenses/gpl-2.0.txt" || true
+cat > appdir/applecommander-ac/SOURCE.txt <<EOF
+This bundle contains:
+  AppleCommander ${AC_VER} (GPL-2.0) — ${AC_URL}
+    Source: https://github.com/AppleCommander/AppleCommander (tag ${AC_VER})
+  A minimal Java runtime (jlink'd from Eclipse Temurin), GPL-2.0 with the
+    Classpath Exception — https://adoptium.net/  (see the runtime's own
+    'legal' folder for its full license texts).
+Licenses: LICENSE-AppleCommander.txt (and the runtime 'legal' folder).
+EOF
 ( cd appdir && python -m zipfile -c "$OUT/applecommander-win64.zip" applecommander-ac )
 echo ">> wrote $OUT/applecommander-win64.zip"
 ls -la "$OUT/applecommander-win64.zip"

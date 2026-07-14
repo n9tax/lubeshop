@@ -60,8 +60,9 @@ jobs:
           mkdir "$dist"
           cp "target/${{ matrix.target }}/release/lubeshop" "$dist/"
           cp README.md "$dist/"
-          [ -f LICENSE ] && cp LICENSE "$dist/" || true
           [ -f COPYING ] && cp COPYING "$dist/" || true
+          [ -f THIRD-PARTY-NOTICES.md ] && cp THIRD-PARTY-NOTICES.md "$dist/" || true
+          [ -f THIRD-PARTY-LICENSES.html ] && cp THIRD-PARTY-LICENSES.html "$dist/" || true
           tar czf "$dist.tar.gz" "$dist"
           sha256sum "$dist.tar.gz" > "$dist.tar.gz.sha256"
 

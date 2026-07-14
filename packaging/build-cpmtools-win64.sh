@@ -76,6 +76,16 @@ command -v "$STRIP" >/dev/null 2>&1 && "$STRIP" cpmls.exe cpmcp.exe cpmrm.exe mk
 STAGE="$WORK/cpmtools"
 mkdir -p "$STAGE"
 cp cpmls.exe cpmcp.exe cpmrm.exe mkfs.cpm.exe diskdefs "$STAGE/"
+# GPL redistribution: ship the upstream licenses + a source note in the zip.
+cp COPYING "$STAGE/LICENSE-cpmtools.txt" 2>/dev/null || true
+cp "$WORK/libdsk-${LIBDSK_VER}/COPYING" "$STAGE/LICENSE-libdsk.txt" 2>/dev/null || true
+cat > "$STAGE/SOURCE.txt" <<EOF
+These binaries were built from unmodified upstream source:
+  cpmtools ${CPMTOOLS_VER} (GPL) — ${CPMTOOLS_URL}
+  libdsk   ${LIBDSK_VER} (GPL) — ${LIBDSK_URL}
+The corresponding source is available at the URLs above.
+Licenses are in LICENSE-cpmtools.txt and LICENSE-libdsk.txt.
+EOF
 # Zip the *contents* flat (no top folder) so WinSource::Bundle extracts the exes
 # and diskdefs directly into %LOCALAPPDATA%\lubeshop\bin — where cpm_command()
 # looks for ./diskdefs and where the bin dir itself is on PATH.

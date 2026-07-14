@@ -13,6 +13,10 @@
 //! `Trsdos` decoders, validated byte-for-byte against its output on real Model
 //! I (TRSDOS 2.1, single density), Model III (TRSDOS 1.3) and Model 4
 //! (TRSDOS 6.2 / LDOS) disks.
+//!
+//! Derived from trs80-base (<https://github.com/lkesteloot/trs80>),
+//! Copyright (c) 2021 Lawrence Kesteloot, MIT License. The full MIT notice is in
+//! `THIRD-PARTY-NOTICES.md` at the repository root.
 
 use std::path::Path;
 

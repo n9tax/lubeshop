@@ -31,6 +31,9 @@ Apple II disks."""
 assets = [
     ["target/release/lubeshop", "usr/bin/", "755"],
     ["../../README.md", "usr/share/doc/lubeshop/README.md", "644"],
+    ["../../COPYING", "usr/share/doc/lubeshop/copyright", "644"],
+    ["../../THIRD-PARTY-NOTICES.md", "usr/share/doc/lubeshop/THIRD-PARTY-NOTICES.md", "644"],
+    ["../../THIRD-PARTY-LICENSES.html", "usr/share/doc/lubeshop/THIRD-PARTY-LICENSES.html", "644"],
 ]
 
 [dependencies]

@@ -87,6 +87,10 @@ pub enum WinSource {
     /// `bin\<dir>`, which [`ensure_user_path`] also puts on PATH so the exe (with
     /// its siblings) is found. `url` is the upstream release asset (version-pinned).
     BundleFolder { url: &'static str, dir: &'static str },
+    /// Install from the author's own site (we don't redistribute it — e.g. HxC,
+    /// whose binary carries no license granting redistribution). Points the user at
+    /// the given download page.
+    FromAuthor(&'static str),
     /// Not ported to Windows yet — shown honestly as "coming", with the homepage.
     Todo,
 }
@@ -221,7 +225,7 @@ pub const TOOLS: &[Tool] = &[
     Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/amitools-win64.zip", dir: "xdftool" }, homepage: "https://github.com/cnvogelg/amitools" , version: None, probe: None },
     Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Build(APPLECOMMANDER), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/applecommander-win64.zip", dir: "applecommander-ac" }, homepage: "https://applecommander.github.io/" , version: Some("13.1"), probe: Some(VersionProbe { args: &[], marker: "options [" }) },
     Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), win: WinSource::Todo, homepage: "https://github.com/jhallen/atari-tools" , version: None, probe: None },
-    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/hxc-win64.zip", dir: "hxc" }, homepage: "https://github.com/jfdelnero/HxCFloppyEmulator" , version: Some("2.16.13.1"), probe: Some(VersionProbe { args: &[], marker: "converter v" }) },
+    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), win: WinSource::FromAuthor("https://hxc2001.com/download/floppy_drive_emulator/"), homepage: "https://hxc2001.com/floppy_drive_emulator/" , version: Some("2.16.13.1"), probe: Some(VersionProbe { args: &[], marker: "converter v" }) },
 ];
 
 /// A system package manager we know how to drive.
@@ -409,6 +413,11 @@ fn win_resolve(win: WinSource, homepage: &'static str) -> InstallPlan {
             );
             InstallPlan::Run(powershell_encoded(&script))
         }
+        WinSource::FromAuthor(url) => InstallPlan::Manual {
+            note: "Download it from the author's site, then put its folder on your PATH:"
+                .to_string(),
+            site: url,
+        },
         WinSource::Todo => InstallPlan::Manual {
             note: "Windows support for this tool is coming — for now, get it from:".to_string(),
             site: homepage,

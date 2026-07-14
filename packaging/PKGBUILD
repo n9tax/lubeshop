@@ -60,4 +60,7 @@ package() {
   cd "$_srcdir"
   install -Dm755 "target/release/lubeshop" "$pkgdir/usr/bin/lubeshop"
   install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+  install -Dm644 "THIRD-PARTY-NOTICES.md" "$pkgdir/usr/share/doc/$pkgname/THIRD-PARTY-NOTICES.md"
+  install -Dm644 "THIRD-PARTY-LICENSES.html" "$pkgdir/usr/share/doc/$pkgname/THIRD-PARTY-LICENSES.html"
 }

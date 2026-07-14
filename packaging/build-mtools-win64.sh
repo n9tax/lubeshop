@@ -49,6 +49,14 @@ command -v "$STRIP" >/dev/null 2>&1 && "$STRIP" mtools.exe || true
 STAGE="$WORK/mtools"
 mkdir -p "$STAGE"
 for c in $COMMANDS; do cp mtools.exe "$STAGE/$c.exe"; done
+# GPL redistribution: ship the upstream license + a source note in the zip.
+cp COPYING "$STAGE/LICENSE-mtools.txt" 2>/dev/null || true
+cat > "$STAGE/SOURCE.txt" <<EOF
+These binaries were built from unmodified upstream source:
+  mtools ${MTOOLS_VER} (GPL) — ${MTOOLS_URL}
+The corresponding source is available at the URL above.
+License is in LICENSE-mtools.txt.
+EOF
 # Zip the *contents* flat (no top folder) so WinSource::Bundle extracts the
 # per-command exes directly into %LOCALAPPDATA%\lubeshop\bin (which is on PATH).
 ( cd "$STAGE" && zip -qr "$OUT/mtools-win64.zip" . )
