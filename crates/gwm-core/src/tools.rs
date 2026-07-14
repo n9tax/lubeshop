@@ -206,7 +206,7 @@ pub const TOOLS: &[Tool] = &[
     Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/amitools-win64.zip", dir: "xdftool" }, homepage: "https://github.com/cnvogelg/amitools" },
     Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Build(APPLECOMMANDER), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/applecommander-win64.zip", dir: "applecommander-ac" }, homepage: "https://applecommander.github.io/" },
     Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), win: WinSource::Todo, homepage: "https://github.com/jhallen/atari-tools" },
-    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), win: WinSource::Todo, homepage: "https://github.com/jfdelnero/HxCFloppyEmulator" },
+    Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/hxc-win64.zip", dir: "hxc" }, homepage: "https://github.com/jfdelnero/HxCFloppyEmulator" },
 ];
 
 /// A system package manager we know how to drive.
