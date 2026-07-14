@@ -78,9 +78,15 @@ pub enum WinSource {
     /// A winget package id, e.g. `VICE-Team.VICE.GTK3`.
     Winget(&'static str),
     /// Prebuilt binaries we build+host ourselves (the Unix tools with no Windows
-    /// package): download a zip from the given URL and extract it into the
+    /// package): download a zip from the given URL and extract it *flat* into the
     /// per-user bin dir ([`windows_bin_dir`]), which is on this process's PATH.
     Bundle(&'static str),
+    /// A self-contained application folder — an upstream Windows build that ships
+    /// an exe alongside its own DLLs/runtime (e.g. greaseweazle's PyInstaller
+    /// bundle). Download the zip, hoist its single top-level folder into
+    /// `bin\<dir>`, which [`ensure_user_path`] also puts on PATH so the exe (with
+    /// its siblings) is found. `url` is the upstream release asset (version-pinned).
+    BundleFolder { url: &'static str, dir: &'static str },
     /// Not ported to Windows yet — shown honestly as "coming", with the homepage.
     Todo,
 }
@@ -193,7 +199,7 @@ echo "Built and installed c1541 to ~/.local/bin"
 
 /// The tools the app can drive, in menu order.
 pub const TOOLS: &[Tool] = &[
-    Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), win: WinSource::Todo, homepage: "https://github.com/keirf/greaseweazle" },
+    Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), win: WinSource::BundleFolder { url: "https://github.com/keirf/greaseweazle/releases/download/v1.23/greaseweazle-1.23-win64.zip", dir: "gw" }, homepage: "https://github.com/keirf/greaseweazle" },
     Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/cpmtools-win64.zip"), homepage: "http://www.moria.de/~michael/cpmtools/" },
     Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), win: WinSource::Todo, homepage: "https://www.gnu.org/software/mtools/" },
     Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::Vice, win: WinSource::Winget("VICE-Team.VICE.GTK3"), homepage: "https://vice-emu.sourceforge.io/" },
@@ -362,6 +368,32 @@ fn win_resolve(win: WinSource, homepage: &'static str) -> InstallPlan {
             );
             InstallPlan::Run(powershell_encoded(&script))
         }
+        // Download an upstream folder-style bundle and hoist its single top-level
+        // folder into bin\<dir> (the version-named folder becomes a stable name).
+        // ensure_user_path() puts bin's subdirs on PATH, and app.rs re-runs it after
+        // the install so bin\<dir> is picked up without a restart.
+        WinSource::BundleFolder { url, dir } => {
+            let script = format!(
+                "$ErrorActionPreference='Stop'; \
+                 $bin = Join-Path $env:LOCALAPPDATA 'lubeshop\\bin'; \
+                 $dest = Join-Path $bin '{dir}'; \
+                 New-Item -ItemType Directory -Force $bin | Out-Null; \
+                 $zip = Join-Path $env:TEMP 'lubeshop-tool.zip'; \
+                 $tmp = Join-Path $env:TEMP 'lubeshop-tool-x'; \
+                 Write-Host 'Downloading...'; \
+                 Invoke-WebRequest -UseBasicParsing -Uri '{url}' -OutFile $zip; \
+                 Write-Host 'Extracting...'; \
+                 if (Test-Path $tmp) {{ Remove-Item -Recurse -Force $tmp }}; \
+                 Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force; \
+                 if (Test-Path $dest) {{ Remove-Item -Recurse -Force $dest }}; \
+                 $top = Get-ChildItem $tmp -Directory | Select-Object -First 1; \
+                 if ($top) {{ Move-Item $top.FullName $dest }} else {{ Move-Item $tmp $dest }}; \
+                 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue; \
+                 Remove-Item $zip; \
+                 Write-Host 'Installed to' $dest"
+            );
+            InstallPlan::Run(powershell_encoded(&script))
+        }
         WinSource::Todo => InstallPlan::Manual {
             note: "Windows support for this tool is coming — for now, get it from:".to_string(),
             site: homepage,
@@ -491,15 +523,29 @@ pub fn ensure_user_path() {
         return;
     };
     let _ = std::fs::create_dir_all(&bin);
+    // `bin` itself (flat Bundle tools like cpmtools) plus each immediate subdir
+    // (folder-style BundleFolder tools like gw, which live in `bin\gw`). Scanning
+    // subdirs means a folder-tool installed mid-session is on PATH as soon as this
+    // is re-run (app.rs calls it again after an install) — no restart, no per-tool
+    // wiring here.
+    let mut wanted = vec![bin.clone()];
+    if let Ok(entries) = std::fs::read_dir(&bin) {
+        wanted.extend(entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+    }
     let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    if paths.iter().any(|p| p == &bin) {
-        return;
+    let mut changed = false;
+    for dir in wanted {
+        if !paths.iter().any(|p| p == &dir) {
+            paths.insert(0, dir);
+            changed = true;
+        }
     }
-    paths.insert(0, bin);
-    if let Ok(joined) = std::env::join_paths(paths) {
-        std::env::set_var("PATH", joined);
+    if changed {
+        if let Ok(joined) = std::env::join_paths(paths) {
+            std::env::set_var("PATH", joined);
+        }
     }
 }
 
@@ -683,6 +729,27 @@ mod tests {
         assert!(cmd.starts_with("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand "));
         assert!(script.contains(url), "script should embed the URL: {script}");
         assert!(script.contains("Expand-Archive"));
+    }
+
+    // A folder-style bundle (gw) resolves to a script that downloads the URL and
+    // hoists the extracted top folder into bin\<dir>.
+    #[cfg(windows)]
+    #[test]
+    fn bundle_folder_encodes_a_hoist_script() {
+        let url = "https://example.test/greaseweazle-9.9-win64.zip";
+        let InstallPlan::Run(cmd) =
+            win_resolve(WinSource::BundleFolder { url, dir: "gw" }, HP)
+        else {
+            panic!("BundleFolder should resolve to a Run command");
+        };
+        let b64 = cmd.rsplit(' ').next().unwrap();
+        let bytes = decode_base64(b64);
+        let utf16: Vec<u16> = bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let script = String::from_utf16(&utf16).unwrap();
+        assert!(script.contains(url));
+        assert!(script.contains("lubeshop\\bin"));
+        assert!(script.contains("'gw'"), "destination subdir should be gw: {script}");
+        assert!(script.contains("Move-Item"), "should hoist the extracted folder");
     }
 
     #[cfg(windows)]

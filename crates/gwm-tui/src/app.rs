@@ -494,6 +494,9 @@ impl App {
         // (winget does this for VICE) without updating this running process —
         // pull those entries in so the check below actually finds the new tool.
         gwm_core::tools::refresh_path_from_registry();
+        // A folder-style bundle (e.g. gw) just created a new subdir under our bin
+        // dir; re-scan so it's on this process's PATH before the check below.
+        gwm_core::tools::ensure_user_path();
         self.refresh_tool_status();
         self.screen = Screen::Tools;
 
