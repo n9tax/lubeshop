@@ -116,6 +116,20 @@ enum PickMode {
     Create,
 }
 
+/// The Tools-menu index of the external tool a driver needs, so an uninstalled
+/// driver can jump straight to it. `None` for TRS-80 (decoded in-crate, no tool).
+fn tool_index_for_driver(driver: FsKind) -> Option<usize> {
+    let cmd = match driver {
+        FsKind::Cpm => "cpmls",
+        FsKind::Fat => "mdir",
+        FsKind::Cbm => "c1541",
+        FsKind::Amiga => "xdftool",
+        FsKind::Apple => "applecommander-ac",
+        FsKind::Trs => return None,
+    };
+    gwm_core::tools::TOOLS.iter().position(|t| t.cmd == cmd)
+}
+
 /// What the host file browser is picking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileBrowseMode {
@@ -212,6 +226,9 @@ pub struct App {
     pub write_outcome: Option<Result<String, String>>,
 
     pub driver_items: Vec<FsKind>,
+    /// Whether each `driver_items` entry's tool is installed — cached when the
+    /// picker opens so rendering doesn't re-probe PATH every frame.
+    pub driver_available: Vec<bool>,
     pub driver_index: usize,
     pick_mode: PickMode,
     pub option_items: Vec<CreateOption>,
@@ -341,6 +358,7 @@ impl App {
             write_job: None,
             write_outcome: None,
             driver_items: Vec::new(),
+            driver_available: Vec::new(),
             driver_index: 0,
             pick_mode: PickMode::Browse,
             option_items: Vec::new(),
@@ -857,17 +875,17 @@ impl App {
     }
 
     fn open_driver_picker(&mut self, mode: PickMode, preselect: Option<FsKind>) {
+        // Show every applicable driver — including ones whose tool isn't installed
+        // yet — so a user with, say, a FAT image always sees "FAT" and can be sent
+        // to install mtools, instead of the option silently vanishing. Availability
+        // is cached here (it probes PATH) so rendering stays cheap.
         self.driver_items = FsKind::ALL
             .iter()
             .copied()
-            .filter(|k| k.available())
             // Read-only drivers (TRS-80) can't create blank images.
             .filter(|k| !matches!(mode, PickMode::Create) || k.can_create())
             .collect();
-        if self.driver_items.is_empty() {
-            self.notice = Some("No image tools are installed — see Tools.".to_string());
-            return;
-        }
+        self.driver_available = self.driver_items.iter().map(|k| k.available()).collect();
         self.pick_mode = mode;
         self.driver_index = preselect
             .and_then(|p| self.driver_items.iter().position(|k| *k == p))
@@ -899,6 +917,19 @@ impl App {
                 let Some(driver) = self.driver_items.get(self.driver_index).copied() else {
                     return;
                 };
+                // Tool not installed: send the user to the Tools menu (with that
+                // tool preselected) rather than proceeding to a guaranteed failure.
+                if !self.driver_available.get(self.driver_index).copied().unwrap_or(true) {
+                    self.notice = Some(format!(
+                        "{} needs its tool installed — press Enter in Tools to get it.",
+                        driver.short_label()
+                    ));
+                    self.enter_tools();
+                    if let Some(i) = tool_index_for_driver(driver) {
+                        self.tools_index = i;
+                    }
+                    return;
+                }
                 match self.pick_mode {
                     PickMode::Browse => {
                         self.browse_driver = driver;

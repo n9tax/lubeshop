@@ -76,6 +76,9 @@ command -v "$STRIP" >/dev/null 2>&1 && "$STRIP" cpmls.exe cpmcp.exe cpmrm.exe mk
 STAGE="$WORK/cpmtools"
 mkdir -p "$STAGE"
 cp cpmls.exe cpmcp.exe cpmrm.exe mkfs.cpm.exe diskdefs "$STAGE/"
-( cd "$WORK" && zip -qr "$OUT/cpmtools-win64.zip" cpmtools )
+# Zip the *contents* flat (no top folder) so WinSource::Bundle extracts the exes
+# and diskdefs directly into %LOCALAPPDATA%\lubeshop\bin — where cpm_command()
+# looks for ./diskdefs and where the bin dir itself is on PATH.
+( cd "$STAGE" && zip -qr "$OUT/cpmtools-win64.zip" . )
 echo ">> wrote $OUT/cpmtools-win64.zip"
 ls -la "$OUT/cpmtools-win64.zip"

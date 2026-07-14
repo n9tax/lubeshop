@@ -999,13 +999,20 @@ fn render_driver_picker(app: &App, frame: &mut Frame, area: Rect) {
     let mut lines = vec![Line::from("")];
     for (i, kind) in app.driver_items.iter().enumerate() {
         let selected = i == app.driver_index;
+        let available = app.driver_available.get(i).copied().unwrap_or(true);
         let marker = if selected { "▸ " } else { "  " };
-        let style = if selected {
+        let style = if !available {
+            dim()
+        } else if selected {
             hl()
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        lines.push(Line::from(Span::styled(format!("{marker}{}", kind.label()), style)));
+        let mut spans = vec![Span::styled(format!("{marker}{}", kind.label()), style)];
+        if !available {
+            spans.push(Span::styled("  — not installed (Enter to get it)", dim()));
+        }
+        lines.push(Line::from(spans));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(

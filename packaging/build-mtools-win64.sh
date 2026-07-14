@@ -49,6 +49,8 @@ command -v "$STRIP" >/dev/null 2>&1 && "$STRIP" mtools.exe || true
 STAGE="$WORK/mtools"
 mkdir -p "$STAGE"
 for c in $COMMANDS; do cp mtools.exe "$STAGE/$c.exe"; done
-( cd "$WORK" && zip -qr "$OUT/mtools-win64.zip" mtools )
+# Zip the *contents* flat (no top folder) so WinSource::Bundle extracts the
+# per-command exes directly into %LOCALAPPDATA%\lubeshop\bin (which is on PATH).
+( cd "$STAGE" && zip -qr "$OUT/mtools-win64.zip" . )
 echo ">> wrote $OUT/mtools-win64.zip"
 ls -la "$OUT/mtools-win64.zip"
