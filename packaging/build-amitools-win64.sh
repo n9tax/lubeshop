@@ -44,6 +44,13 @@ python -m PyInstaller --name xdftool \
   --console --noconfirm --clean xdftool_main.py
 
 echo ">> packaging"
+# GPL-2.0: include the upstream license + a source note in the bundle.
+curl -fsSL -o dist/xdftool/LICENSE-amitools.txt "https://www.gnu.org/licenses/gpl-2.0.txt" || true
+cat > dist/xdftool/SOURCE.txt <<EOF
+This bundle contains amitools ${AMITOOLS_VER} (GPL-2.0), frozen with PyInstaller.
+Source: https://github.com/cnvogelg/amitools  (pip: amitools==${AMITOOLS_VER})
+License: LICENSE-amitools.txt
+EOF
 ( cd dist && python -m zipfile -c "$OUT/amitools-win64.zip" xdftool )
 echo ">> wrote $OUT/amitools-win64.zip"
 ls -la "$OUT/amitools-win64.zip"

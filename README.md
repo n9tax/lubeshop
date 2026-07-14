@@ -145,4 +145,11 @@ Releasing and packaging notes live in [`packaging/RELEASING.md`](packaging/RELEA
 
 ## License
 
-GPL-3.0-or-later.
+GPL-3.0-or-later — full text in [`COPYING`](COPYING).
+
+The app links Rust crates (MIT/Apache-2.0/etc. — see
+[`THIRD-PARTY-LICENSES.html`](THIRD-PARTY-LICENSES.html)) and includes/redistributes
+some third-party tools; those notices are in
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md). It also *drives* external tools
+(Greaseweazle, cpmtools, mtools, VICE, HxC, …) that you install separately — those
+remain under their own licenses.
