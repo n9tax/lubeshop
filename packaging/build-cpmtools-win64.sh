@@ -78,7 +78,9 @@ mkdir -p "$STAGE"
 cp cpmls.exe cpmcp.exe cpmrm.exe mkfs.cpm.exe diskdefs "$STAGE/"
 # GPL redistribution: ship the upstream licenses + a source note in the zip.
 cp COPYING "$STAGE/LICENSE-cpmtools.txt" 2>/dev/null || true
-cp "$WORK/libdsk-${LIBDSK_VER}/COPYING" "$STAGE/LICENSE-libdsk.txt" 2>/dev/null || true
+# libdsk's tarball license filename varies; fetch its license (GPL-2) to be sure.
+cp "$WORK/libdsk-${LIBDSK_VER}/COPYING" "$STAGE/LICENSE-libdsk.txt" 2>/dev/null \
+  || curl -fsSL -o "$STAGE/LICENSE-libdsk.txt" "https://www.gnu.org/licenses/gpl-2.0.txt" || true
 cat > "$STAGE/SOURCE.txt" <<EOF
 These binaries were built from unmodified upstream source:
   cpmtools ${CPMTOOLS_VER} (GPL) — ${CPMTOOLS_URL}
