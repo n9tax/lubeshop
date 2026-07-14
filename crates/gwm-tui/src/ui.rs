@@ -124,6 +124,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::ArchiveDownloading => render_archive_downloading(app, frame, chunks[1]),
         Screen::GotekFormat => render_gotek_format(app, frame, chunks[1]),
         Screen::GotekDrive => render_gotek_drive(app, frame, chunks[1]),
+        Screen::GotekName => render_gotek_name(app, frame, chunks[1]),
         Screen::GotekSending => render_gotek_sending(app, frame, chunks[1]),
         Screen::GotekDone => render_gotek_done(app, frame, chunks[1]),
     }
@@ -1579,6 +1580,31 @@ fn render_gotek_drive(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para(lines).block(bordered("Send to Gotek — pick drive")), area);
 }
 
+fn render_gotek_name(app: &App, frame: &mut Frame, area: Rect) {
+    let drive = app
+        .gotek_drives
+        .get(app.gotek_drive_index)
+        .map(|d| d.describe())
+        .unwrap_or_default();
+    let mut field = vec![Span::styled("  Filename: ", dim())];
+    field.extend(input_spans(&app.gotek_name_input));
+    let lines = vec![
+        Line::from(Span::styled(format!("  Sending to  {drive}"), dim())),
+        Line::from(""),
+        Line::from(field),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  ←/→ move · Backspace/Del edit · Enter to send · Esc back",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "  (the correct extension is added automatically for HFE)",
+            dim(),
+        )),
+    ];
+    frame.render_widget(para(lines).block(bordered("Send to Gotek — name the file")), area);
+}
+
 fn render_gotek_sending(app: &App, frame: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(""),
@@ -1838,9 +1864,10 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
                 if app.gotek_drives.is_empty() {
                     "  r rescan · Esc back"
                 } else {
-                    "  ↑/↓ pick drive · Enter send · r rescan · Esc back"
+                    "  ↑/↓ pick drive · Enter continue · r rescan · Esc back"
                 }
             }
+            Screen::GotekName => "  type a filename · Enter send · Esc back",
             Screen::GotekSending => "  working… please wait",
             Screen::GotekDone => "  Enter to return",
             Screen::NewFolder => "  type name · Enter create · Esc cancel",

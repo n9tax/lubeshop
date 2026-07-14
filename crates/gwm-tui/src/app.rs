@@ -114,6 +114,7 @@ pub enum Screen {
     ArchiveDownloading,
     GotekFormat,
     GotekDrive,
+    GotekName,
     GotekSending,
     GotekDone,
 }
@@ -329,6 +330,8 @@ pub struct App {
     /// Detected removable drives and the drive-picker cursor.
     pub gotek_drives: Vec<UsbDrive>,
     pub gotek_drive_index: usize,
+    /// Editable output filename for the file written to the Gotek drive.
+    pub gotek_name_input: TextInput,
     gotek_job: Option<GotekJob>,
     /// Result of the last send (`Ok(dest)` / `Err(msg)`), shown on the done screen.
     pub gotek_outcome: Option<Result<String, String>>,
@@ -474,6 +477,7 @@ impl App {
             gotek_format_index: 0,
             gotek_drives: Vec::new(),
             gotek_drive_index: 0,
+            gotek_name_input: TextInput::new(),
             gotek_job: None,
             gotek_outcome: None,
 
@@ -739,6 +743,7 @@ impl App {
             Screen::TextEdit => self.on_text_key(code, mods),
             Screen::GotekFormat => self.on_gotek_format_key(code),
             Screen::GotekDrive => self.on_gotek_drive_key(code),
+            Screen::GotekName => self.on_gotek_name_key(code, mods),
             Screen::GotekSending => {}
             Screen::GotekDone => {
                 if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
@@ -814,23 +819,51 @@ impl App {
             }
             KeyCode::Enter => {
                 if !self.gotek_drives.is_empty() {
-                    self.start_gotek_send();
+                    // Let the user name the file before it's written.
+                    self.gotek_name_input
+                        .set(gotek_out_name(&self.gotek_name, self.gotek_format));
+                    self.screen = Screen::GotekName;
                 }
             }
             _ => {}
         }
     }
 
-    fn start_gotek_send(&mut self) {
+    fn on_gotek_name_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        match code {
+            KeyCode::Esc => self.screen = Screen::GotekDrive,
+            KeyCode::Enter => {
+                let name = self.gotek_name_input.text().trim().replace(['/', '\\'], "_");
+                if name.is_empty() {
+                    self.notice = Some("Enter a filename.".to_string());
+                    return;
+                }
+                self.start_gotek_send(&self.gotek_final_name(&name));
+            }
+            _ => edit_input(&mut self.gotek_name_input, code, mods),
+        }
+    }
+
+    /// Ensure the chosen name carries the right extension for the format (HFE modes
+    /// need `.hfe` so the Gotek recognises it; copy-as-is is left exactly as typed).
+    fn gotek_final_name(&self, typed: &str) -> String {
+        match self.gotek_format.extension() {
+            Some(ext) if !typed.to_ascii_lowercase().ends_with(&format!(".{ext}")) => {
+                format!("{typed}.{ext}")
+            }
+            _ => typed.to_string(),
+        }
+    }
+
+    fn start_gotek_send(&mut self, out_name: &str) {
         let Some(drive) = self.gotek_drives.get(self.gotek_drive_index).cloned() else {
             return;
         };
         let format = self.gotek_format;
-        let out_name = gotek_out_name(&self.gotek_name, format);
-        let dest = drive.mount.join(&out_name);
+        let dest = drive.mount.join(out_name);
         let temp_dir = self.clip_dir();
         let _ = std::fs::create_dir_all(&temp_dir);
-        let temp = temp_dir.join(format!("gotek-{}", safe_host_name(&out_name)));
+        let temp = temp_dir.join(format!("gotek-{}", safe_host_name(out_name)));
         self.gotek_outcome = None;
         self.gotek_job = Some(GotekJob::start(
             self.gotek_source.clone(),
