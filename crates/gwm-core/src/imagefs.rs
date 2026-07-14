@@ -313,6 +313,28 @@ fn have(cmd: &str) -> bool {
     crate::tools::installed(cmd)
 }
 
+/// Add a host-filesystem path to an mtools command as a bare filename, running
+/// the command from the path's parent directory. mtools parses an operand that
+/// begins `X:` as a *drive* letter, so an absolute Windows path like
+/// `C:\Users\…\tmp` is rejected ("Drive 'C:' not supported"); a plain filename in
+/// the working directory sidesteps that. Harmless elsewhere — on Unix it's the
+/// same file. (Only mtools' host operands need this; the `-i IMAGE` value and the
+/// `::` drive operands don't parse as drive letters.)
+fn push_host_operand(cmd: &mut Command, path: &Path) {
+    match (
+        path.parent().filter(|p| !p.as_os_str().is_empty()),
+        path.file_name(),
+    ) {
+        (Some(parent), Some(file)) => {
+            cmd.current_dir(parent);
+            cmd.arg(file);
+        }
+        _ => {
+            cmd.arg(path);
+        }
+    }
+}
+
 /// A FAT filesystem (MS-DOS / Atari ST / MSX-DOS) accessed through mtools.
 pub struct FatFs;
 
@@ -337,17 +359,16 @@ impl ImageFs for FatFs {
 
     fn extract(&self, image: &Path, entry: &FileEntry, dest: &Path) -> Result<()> {
         let mut cmd = Command::new("mcopy");
-        cmd.arg("-n")
-            .arg("-i")
-            .arg(image)
-            .arg(format!("::{}", entry.name))
-            .arg(dest);
+        cmd.arg("-n").arg("-i").arg(image).arg(format!("::{}", entry.name));
+        push_host_operand(&mut cmd, dest);
         run(cmd).map(|_| ())
     }
 
     fn insert(&self, image: &Path, src: &Path, name: &str, _user: u8) -> Result<()> {
         let mut cmd = Command::new("mcopy");
-        cmd.arg("-n").arg("-i").arg(image).arg(src).arg(format!("::{name}"));
+        cmd.arg("-n").arg("-i").arg(image);
+        push_host_operand(&mut cmd, src);
+        cmd.arg(format!("::{name}"));
         run(cmd).map(|_| ())
     }
 
