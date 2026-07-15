@@ -97,6 +97,11 @@ pub fn flux_to_dmk(input: &Path, output: &Path) -> Result<()> {
 /// Run `hxcfe -finput:IN -conv:MODULE -foutput:OUT`. hxcfe auto-detects the input
 /// container and its exit code is reliable (0 = ok), but confirm a non-empty output
 /// too. `module` is an hxcfe converter id (`TRS80_DMK`, `HXC_HFE`, `HXC_HFEV3`, …).
+///
+/// hxcfe prints its diagnostics — including `No loader support the file` — to
+/// **stdout**, not stderr, and some failure modes (unreadable input) still exit 0
+/// with no output file. So we sniff both streams for the informative last line
+/// and also treat "success with no output" as a failure.
 fn hxcfe_convert(input: &Path, output: &Path, module: &str) -> Result<()> {
     let _ = std::fs::remove_file(output);
     let out = Command::new("hxcfe")
@@ -106,23 +111,34 @@ fn hxcfe_convert(input: &Path, output: &Path, module: &str) -> Result<()> {
         .output()
         .map_err(|e| CoreError::Tool(format!("hxcfe could not run: {e}")))?;
 
-    if !out.status.success() {
-        let text = String::from_utf8_lossy(&out.stderr);
-        let last = text
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("hxcfe failed")
-            .trim()
-            .to_string();
-        return Err(CoreError::Tool(format!("hxcfe conversion failed: {last}")));
+    let wrote_output = std::fs::metadata(output)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    if out.status.success() && wrote_output {
+        return Ok(());
     }
-    match std::fs::metadata(output) {
-        Ok(m) if m.len() > 0 => Ok(()),
-        _ => Err(CoreError::Tool(
-            "hxcfe reported success but wrote no output".to_string(),
-        )),
-    }
+    // Combine stdout + stderr (hxcfe prints its errors on stdout) and pick the
+    // last informative line for the user.
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    let last = text
+        .lines()
+        .rev()
+        .find(|l| {
+            let t = l.trim();
+            !t.is_empty()
+                && !t.starts_with("HxC Floppy Emulator")
+                && !t.starts_with("Copyright")
+                && !t.starts_with("This program")
+                && !t.starts_with("This is free")
+                && !t.starts_with("under certain")
+                && !t.starts_with("libhxcfe version")
+        })
+        .unwrap_or("hxcfe failed")
+        .trim()
+        .to_string();
+    Err(CoreError::Tool(format!("hxcfe conversion failed: {last}")))
 }
 
 /// A disk-image format to hand a Gotek floppy emulator.
@@ -155,53 +171,109 @@ impl GotekFormat {
     }
 }
 
-/// Whether `hxcfe` can read this source container (it has no Amiga ADF / Atari ST /
-/// Commodore loaders — those go through `gw convert` with a disk format instead).
-fn hxcfe_can_read(source: &Path) -> bool {
+/// Whether `hxcfe` is likely to auto-detect this source. Split into three tiers so
+/// the caller can route correctly:
+///
+/// - **Native** containers (bitstream/flux/DMK/HFE): hxcfe is authoritative and
+///   `gw` often can't read them without more parameters.
+/// - **Ambiguous** sector images (`.img`, `.ima`): hxcfe *might* auto-detect a
+///   common geometry, but for unusual formats (hard-sector NorthStar/Micropolis,
+///   custom sector layouts) it just says `No loader support the file`. When the
+///   catalog tells us the disk format, `gw convert --format=…` is the reliable
+///   path — it wrote the sector image and can encode it back losslessly.
+/// - **Unsupported**: hxcfe won't touch it; go through gw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HxcfeTier {
+    /// Bitstream/flux/DMK/HFE — hxcfe is the right tool.
+    Native,
+    /// A raw sector image — hxcfe might auto-detect it, but gw is preferred when
+    /// the disk format is known.
+    Ambiguous,
+    /// Nothing hxcfe can read.
+    Unsupported,
+}
+
+fn hxcfe_tier(source: &Path) -> HxcfeTier {
     let ext = source
         .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
-    matches!(
-        ext.as_str(),
-        "dmk" | "img" | "ima" | "imd" | "mfm" | "hfe" | "raw" | "imz" | "flp" | "pri" | "ana"
-    )
+    match ext.as_str() {
+        "dmk" | "imd" | "mfm" | "hfe" | "raw" | "imz" | "flp" | "pri" | "ana" => HxcfeTier::Native,
+        "img" | "ima" => HxcfeTier::Ambiguous,
+        _ => HxcfeTier::Unsupported,
+    }
 }
 
 /// Convert `source` into a Gotek-ready file at `dest`.
 ///
 /// - `CopyNative` just copies the bytes.
-/// - `HfeV3` always uses `hxcfe` (the only tool that writes HFE v3).
-/// - `Hfe` prefers `hxcfe` (covers TRS-80 DMK, flux, raw images); for sector images
-///   `hxcfe` can't read (Amiga ADF, Atari ST, …) it falls back to `gw convert`,
-///   which needs `disk_format` (the catalogued `gw` format string).
+/// - `Hfe`: gw is authoritative for sector images when we know the disk format
+///   (it wrote them); hxcfe handles bitstream/flux/DMK/HFE containers it reads
+///   natively.
+/// - `HfeV3`: only hxcfe writes HFE v3. For sources hxcfe can't auto-detect
+///   (e.g. a raw hard-sector NorthStar `.img`), route through gw first: sector
+///   image → intermediate HFE v1 via `gw convert`, then hxcfe converts v1 → v3.
 pub fn to_gotek(
     source: &Path,
     dest: &Path,
     format: GotekFormat,
     disk_format: Option<&str>,
 ) -> Result<()> {
+    let fmt = disk_format.filter(|f| !f.trim().is_empty());
     match format {
         GotekFormat::CopyNative => {
             std::fs::copy(source, dest)
                 .map(|_| ())
                 .map_err(|e| CoreError::Tool(format!("could not copy to the drive: {e}")))
         }
-        GotekFormat::HfeV3 => hxcfe_convert(source, dest, "HXC_HFEV3"),
-        GotekFormat::Hfe => {
-            if hxcfe_can_read(source) {
-                hxcfe_convert(source, dest, "HXC_HFE")
-            } else if let Some(fmt) = disk_format.filter(|f| !f.trim().is_empty()) {
-                // gw writes HFE v1 for a sector image given its disk format.
-                convert(source, dest, fmt)
-            } else {
-                Err(CoreError::Tool(
-                    "can't convert this image to HFE without knowing its disk format".to_string(),
-                ))
+        GotekFormat::HfeV3 => match (hxcfe_tier(source), fmt) {
+            // Bitstream/flux/DMK/HFE — hxcfe reads it directly, one step.
+            (HxcfeTier::Native, _) => hxcfe_convert(source, dest, "HXC_HFEV3"),
+            // Sector image with a known format: `gw convert` encodes it back to
+            // an intermediate HFE v1, then hxcfe converts v1 → v3. Two steps,
+            // but this is the only way to reach HFE v3 for hard-sector layouts
+            // (NorthStar/Micropolis) whose raw `.img` hxcfe can't auto-detect.
+            (HxcfeTier::Ambiguous, Some(f)) | (HxcfeTier::Unsupported, Some(f)) => {
+                two_step_hfev3(source, dest, f)
             }
-        }
+            // No catalogued format — let hxcfe try; its diagnostic reaches the
+            // user via the improved error capture.
+            (HxcfeTier::Ambiguous, None) => hxcfe_convert(source, dest, "HXC_HFEV3"),
+            (HxcfeTier::Unsupported, None) => Err(CoreError::Tool(
+                "can't convert this image to HFE v3 without knowing its disk format".to_string(),
+            )),
+        },
+        GotekFormat::Hfe => match (hxcfe_tier(source), fmt) {
+            // gw wrote this sector image and knows its format — encode it back
+            // to HFE v1 losslessly. Handles the layouts hxcfe can't auto-detect.
+            (HxcfeTier::Ambiguous, Some(f)) | (HxcfeTier::Unsupported, Some(f)) => {
+                convert(source, dest, f)
+            }
+            // Bitstream/flux/DMK/HFE containers — hxcfe is authoritative.
+            (HxcfeTier::Native, _) => hxcfe_convert(source, dest, "HXC_HFE"),
+            // No format catalogued for an ambiguous sector image → try hxcfe's
+            // auto-detect; the error surfaces the real reason if it can't.
+            (HxcfeTier::Ambiguous, None) => hxcfe_convert(source, dest, "HXC_HFE"),
+            (HxcfeTier::Unsupported, None) => Err(CoreError::Tool(
+                "can't convert this image to HFE without knowing its disk format".to_string(),
+            )),
+        },
     }
+}
+
+/// Sector image → HFE v3 via an intermediate HFE v1. `gw convert` writes the
+/// sector image to an on-disk HFE v1 next to `dest`; then `hxcfe HXC_HFEV3`
+/// upgrades it. Cleans up the intermediate whether or not the second step
+/// succeeds so a failed run doesn't leave debris on the USB stick.
+fn two_step_hfev3(source: &Path, dest: &Path, disk_format: &str) -> Result<()> {
+    let mid = dest.with_extension("v1.hfe");
+    let _ = std::fs::remove_file(&mid);
+    convert(source, &mid, disk_format)?;
+    let result = hxcfe_convert(&mid, dest, "HXC_HFEV3");
+    let _ = std::fs::remove_file(&mid);
+    result
 }
 
 #[cfg(test)]
