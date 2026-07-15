@@ -49,15 +49,21 @@ system, then follow the steps for your OS below. Everything after that is a
 self-contained binary — nothing to un-install if you change your mind, just
 delete the file.
 
+> Archive names include the version, e.g. `lubeshop-v1.0.0-…`. Match the part
+> **after** the version to your system; the copy-paste commands below use a `*`
+> wildcard so they keep working whichever version you grabbed.
+
 #### Linux (x86_64)
 
-Grab **`lubeshop-x86_64-unknown-linux-musl.tar.gz`** — the musl build runs on
-any distribution.
+Grab **`lubeshop-*-x86_64-unknown-linux-musl.tar.gz`** — the musl build runs on
+any distribution (Arch, Fedora, openSUSE, older glibc systems, …). There's also
+a `-gnu` build if you prefer, and an `-aarch64-unknown-linux-gnu` one for 64-bit
+ARM (Raspberry Pi 4/5).
 
 1. Extract the archive:
    ```sh
-   tar xzf lubeshop-x86_64-unknown-linux-musl.tar.gz
-   cd lubeshop-x86_64-unknown-linux-musl
+   tar xzf lubeshop-*-x86_64-unknown-linux-musl.tar.gz
+   cd lubeshop-*-x86_64-unknown-linux-musl
    ```
 2. Run it in place to confirm it launches:
    ```sh
@@ -73,13 +79,13 @@ any distribution.
 
 #### macOS (Intel or Apple Silicon)
 
-Grab **`lubeshop-macos-x86_64.tar.gz`** for Intel Macs or
-**`lubeshop-macos-aarch64.tar.gz`** for Apple Silicon.
+Grab **`lubeshop-*-macos-x86_64.tar.gz`** for Intel Macs or
+**`lubeshop-*-macos-aarch64.tar.gz`** for Apple Silicon.
 
 1. Extract the archive (Finder does this on double-click, or from a Terminal):
    ```sh
-   tar xzf lubeshop-macos-x86_64.tar.gz
-   cd lubeshop-macos-x86_64
+   tar xzf lubeshop-*-macos-x86_64.tar.gz
+   cd lubeshop-*-macos-x86_64
    ```
 2. Remove the Gatekeeper quarantine flag — release builds aren't
    Apple-notarized, and without this step the OS refuses to launch the binary
@@ -105,7 +111,7 @@ Grab **`lubeshop-macos-x86_64.tar.gz`** for Intel Macs or
 
 #### Windows 10/11 (x86_64)
 
-Grab **`lubeshop-x86_64-pc-windows-msvc.zip`**.
+Grab **`lubeshop-*-x86_64-pc-windows-msvc.zip`**.
 
 1. Right-click the downloaded `.zip` in Explorer → **Extract All…** → pick a
    folder you'll keep (e.g. `C:\Tools\lubeshop\`). Don't run from inside the
@@ -125,10 +131,36 @@ Grab **`lubeshop-x86_64-pc-windows-msvc.zip`**.
    *App Installer* from the Microsoft Store. Everything else the app pulls
    from bundled downloads at first use — nothing to install by hand.
 
-### Arch Linux (AUR)
+### Debian / Ubuntu / Mint (.deb)
+
+Prefer a real system package that puts `lubeshop` on your `PATH` and pulls in the
+apt-packaged helpers automatically? Download **`lubeshop_*_amd64.deb`** from
+[Releases](../../releases) and install it with `apt` (which resolves the
+dependencies — plain `dpkg -i` won't):
 
 ```sh
-paru -S lubeshop      # or: yay -S lubeshop
+sudo apt install ./lubeshop_1.0.0_amd64.deb
+```
+
+This installs the `lubeshop` command system-wide and recommends the helpers that
+Debian/Ubuntu package (**cpmtools**, **mtools**, and **VICE** where available).
+Anything not in your distro's repos — Greaseweazle (`gw`), amitools, HxC,
+AppleCommander — installs on demand from the in-app **Tools** menu. Works on
+Debian 12+, Ubuntu 22.04+, and their derivatives (Mint, Pop!_OS, …).
+
+To remove it later: `sudo apt remove lubeshop`.
+
+### Arch Linux
+
+The universal **musl** binary above runs on Arch as-is — that's the simplest
+route. If you'd rather build a proper package (so `pacman` tracks it and wires
+the helper tools as optional dependencies), a `PKGBUILD` ships in
+[`packaging/PKGBUILD`](packaging/PKGBUILD):
+
+```sh
+git clone https://github.com/n9tax/lubeshop.git
+cd lubeshop/packaging
+makepkg -si          # builds and installs via pacman
 ```
 
 ### From source (any OS)

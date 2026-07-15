@@ -1,9 +1,13 @@
 name: release
 
-# Build prebuilt Linux binaries and attach them to a GitHub Release whenever a
-# version tag (v0.1.0, v0.2.0, …) is pushed. Phase 0 of the porting plan: get the
-# app into testers' hands without them needing a Rust toolchain. Windows/macOS
-# targets get added to the matrix in later phases.
+# Build prebuilt binaries for every supported OS and attach them to a GitHub
+# Release whenever a version tag (v1.0.0, v1.1.0, …) is pushed. Testers get a
+# ready-to-run binary with no Rust toolchain. Artifact names match the filenames
+# the README's install steps tell users to download — keep them in sync.
+#   Linux:   lubeshop-<tag>-x86_64-unknown-linux-{gnu,musl}.tar.gz, -aarch64-…-gnu
+#   macOS:   lubeshop-<tag>-macos-{x86_64,aarch64}.tar.gz
+#   Windows: lubeshop-<tag>-x86_64-pc-windows-msvc.zip
+#   Debian:  lubeshop_<version>_amd64.deb
 
 on:
   push:
@@ -73,6 +77,74 @@ jobs:
             *.tar.gz
             *.tar.gz.sha256
 
+  macos:
+    name: build macos-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13   # Intel
+            arch: x86_64
+          - runner: macos-14   # Apple Silicon
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup update stable --no-self-update
+      # The Xcode Command Line Tools on the runners provide clang for rusqlite's
+      # bundled SQLite — no extra setup needed.
+      - name: Build lubeshop
+        run: cargo build --release --locked -p gwm-tui
+      - name: Package tarball
+        run: |
+          dist="lubeshop-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}"
+          mkdir "$dist"
+          cp target/release/lubeshop "$dist/"
+          cp README.md "$dist/"
+          [ -f COPYING ] && cp COPYING "$dist/" || true
+          [ -f THIRD-PARTY-NOTICES.md ] && cp THIRD-PARTY-NOTICES.md "$dist/" || true
+          [ -f THIRD-PARTY-LICENSES.html ] && cp THIRD-PARTY-LICENSES.html "$dist/" || true
+          tar czf "$dist.tar.gz" "$dist"
+          shasum -a 256 "$dist.tar.gz" > "$dist.tar.gz.sha256"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+
+  windows:
+    name: build windows-x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup update stable --no-self-update
+      # windows-latest ships the MSVC toolchain, so rusqlite's bundled SQLite
+      # compiles with no extra setup.
+      - name: Build lubeshop
+        run: cargo build --release --locked -p gwm-tui
+      - name: Package zip
+        shell: bash
+        run: |
+          dist="lubeshop-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc"
+          mkdir "$dist"
+          cp target/release/lubeshop.exe "$dist/"
+          cp README.md "$dist/"
+          [ -f COPYING ] && cp COPYING "$dist/" || true
+          [ -f THIRD-PARTY-NOTICES.md ] && cp THIRD-PARTY-NOTICES.md "$dist/" || true
+          [ -f THIRD-PARTY-LICENSES.html ] && cp THIRD-PARTY-LICENSES.html "$dist/" || true
+          # PowerShell's Compress-Archive makes a Windows-friendly zip.
+          powershell -Command "Compress-Archive -Path '$dist' -DestinationPath '$dist.zip'"
+          sha256sum "$dist.zip" > "$dist.zip.sha256"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows-x86_64
+          path: |
+            *.zip
+            *.zip.sha256
+
   deb:
     name: build .deb (amd64)
     runs-on: ubuntu-latest
@@ -93,7 +165,7 @@ jobs:
 
   release:
     name: publish release
-    needs: [build, deb]
+    needs: [build, macos, windows, deb]
     runs-on: ubuntu-latest
     # Only publish on real version tags; a manual dispatch just builds artifacts.
     if: startsWith(github.ref, 'refs/tags/v')

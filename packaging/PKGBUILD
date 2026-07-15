@@ -1,18 +1,19 @@
-# Maintainer: <your name> <your email>
+# Maintainer: Joe <joe@n9tax.com>
 #
-# AUR package for "The Lube Shop" — the lubeshop TUI front-end for Greaseweazle.
+# PKGBUILD for "The Lube Shop" — the lubeshop TUI front-end for Greaseweazle.
+# Builds the tagged release from source. Users run `makepkg -si` from this
+# directory (makepkg downloads the v$pkgver source tarball itself).
 #
-# Before publishing to the AUR:
-#   1. Replace GITHUB_USER below with the real GitHub owner (and the Maintainer line).
-#   2. Push a matching `v$pkgver` git tag so the source tarball URL resolves.
-#   3. Regenerate .SRCINFO:  makepkg --printsrcinfo > .SRCINFO
-#   4. Fill in the real sha256 (or keep 'SKIP'):  updpkgsums
+# To publish to the AUR later:
+#   1. Regenerate .SRCINFO:  makepkg --printsrcinfo > .SRCINFO
+#   2. Push pkgname/PKGBUILD/.SRCINFO to the AUR git remote.
+# (sha256sums are SKIP because GitHub's auto-generated tarballs aren't byte-stable.)
 pkgname=lubeshop
-pkgver=0.1.0
+pkgver=1.0.0
 pkgrel=1
 pkgdesc="TUI front-end for the Greaseweazle floppy flux reader/writer + a manager for flux captures and decoded disk images"
 arch=('x86_64' 'aarch64')
-url="https://github.com/GITHUB_USER/GW_TUI"
+url="https://github.com/n9tax/lubeshop"
 license=('GPL-3.0-or-later')
 depends=('gcc-libs')
 makedepends=('cargo')
@@ -33,7 +34,8 @@ options=('!lto')  # the workspace release profile already sets lto=true
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
-_srcdir="GW_TUI-$pkgver"
+# GitHub names the tag tarball's top dir "<repo>-<version>".
+_srcdir="lubeshop-$pkgver"
 
 prepare() {
   cd "$_srcdir"
