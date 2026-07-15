@@ -18,23 +18,27 @@ on:
 jobs:
   build:
     name: build ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
+    # Both arches build on Apple Silicon (macos-14) — Intel macos-13 runners
+    # queue for a long time. An arm64 Mac cross-compiles x86_64 natively.
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          - target: x86_64-apple-darwin
             arch: x86_64
-          - runner: macos-14
+          - target: aarch64-apple-darwin
             arch: aarch64
     steps:
       - uses: actions/checkout@v5
-      - name: Install Rust
-        run: rustup update stable --no-self-update
-      # rusqlite is bundled (compiled from C); the macOS runners ship the Xcode
-      # Command Line Tools (clang), so no extra setup is needed.
+      - name: Install Rust + target
+        run: |
+          rustup update stable --no-self-update
+          rustup target add ${{ matrix.target }}
+      # rusqlite is bundled (compiled from C); the runner's Xcode Command Line
+      # Tools ship clang (targets x86_64 via -arch), so no extra setup is needed.
       - name: Build
-        run: cargo build --release --locked -p gwm-tui
+        run: cargo build --release --locked --target ${{ matrix.target }} -p gwm-tui
       - name: Test
         run: cargo test --release --locked -p gwm-core
       - name: Stage
@@ -42,7 +46,7 @@ jobs:
         run: |
           d="lubeshop-macos-${{ matrix.arch }}"
           mkdir "$d"
-          cp target/release/lubeshop "$d/"
+          cp "target/${{ matrix.target }}/release/lubeshop" "$d/"
           cp README.md "$d/"
           [ -f COPYING ] && cp COPYING "$d/" || true
           [ -f THIRD-PARTY-NOTICES.md ] && cp THIRD-PARTY-NOTICES.md "$d/" || true
