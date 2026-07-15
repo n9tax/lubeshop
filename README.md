@@ -139,7 +139,7 @@ apt-packaged helpers automatically? Download **`lubeshop_*_amd64.deb`** from
 dependencies — plain `dpkg -i` won't):
 
 ```sh
-sudo apt install ./lubeshop_1.0.0_amd64.deb
+sudo apt install ./lubeshop_1.0.0-1_amd64.deb
 ```
 
 This installs the `lubeshop` command system-wide and recommends the helpers that
