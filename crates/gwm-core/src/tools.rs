@@ -149,15 +149,22 @@ echo "Installed atr to ~/.local/bin"
 "#,
 };
 
-/// HxC (hxcfe): build just the command-line converter (not the Qt GUI).
+/// HxC (hxcfe): build just the command-line converter (not the Qt GUI). On macOS
+/// the binary is linked with `-rpath,@executable_path/../lib`, so the two dylibs
+/// it depends on (`libhxcfe`, `libusbhxcfe`) have to sit in `~/.local/lib/` for
+/// it to run — copy them there when the build produces them (Linux emits `.so`s
+/// staying in the tree, and the glob just no-ops).
 const HXC: Recipe = Recipe {
     prereqs: &[Prereq::Git, Prereq::Build, Prereq::Libusb],
     steps: r#"
 d=$(mktemp -d)
 git clone --depth 1 https://github.com/jfdelnero/HxCFloppyEmulator "$d/src"
 make -C "$d/src/build" HxCFloppyEmulator_cmdline
-mkdir -p "$HOME/.local/bin"
+mkdir -p "$HOME/.local/bin" "$HOME/.local/lib"
 cp "$d/src/HxCFloppyEmulator_cmdline/build/hxcfe" "$HOME/.local/bin/"
+for lib in "$d/src/build/"*.dylib; do
+  [ -e "$lib" ] && cp "$lib" "$HOME/.local/lib/"
+done
 rm -rf "$d"
 echo "Installed hxcfe to ~/.local/bin"
 "#,
@@ -169,20 +176,24 @@ echo "Installed hxcfe to ~/.local/bin"
 const APPLECOMMANDER: Recipe = Recipe {
     prereqs: &[Prereq::Curl],
     steps: r#"
-arch=$(uname -m); case "$arch" in x86_64) j=x64;; aarch64) j=aarch64;; *) j=x64;; esac
+case "$(uname -m)" in x86_64|amd64) a=x64;; arm64|aarch64) a=aarch64;; *) a=x64;; esac
+case "$(uname -s)" in Darwin) os=mac;; *) os=linux;; esac
 share="$HOME/.local/share/lubeshop"
-mkdir -p "$share/jre" "$share/tools" "$HOME/.local/bin"
+rm -rf "$share/jre"; mkdir -p "$share/jre" "$share/tools" "$HOME/.local/bin"
 echo "Downloading a Java 21 runtime (Temurin)..."
-curl -fsSL "https://api.adoptium.net/v3/binary/latest/21/ga/linux/$j/jre/hotspot/normal/eclipse" -o "$share/jre.tar.gz"
+curl -fsSL "https://api.adoptium.net/v3/binary/latest/21/ga/$os/$a/jre/hotspot/normal/eclipse" -o "$share/jre.tar.gz"
 tar xzf "$share/jre.tar.gz" -C "$share/jre" --strip-components=1
 rm -f "$share/jre.tar.gz"
 echo "Downloading AppleCommander..."
 url=$(curl -fsSL https://api.github.com/repos/AppleCommander/AppleCommander/releases/latest | grep -oE 'https://[^"]*AppleCommander-ac-[0-9.]*\.jar' | head -1)
 [ -n "$url" ] || url=https://github.com/AppleCommander/AppleCommander/releases/download/13.1/AppleCommander-ac-13.1.jar
 curl -fsSL -o "$share/tools/AppleCommander-ac.jar" "$url"
+# The Linux JRE puts java at jre/bin/java; the macOS one at jre/Contents/Home/bin/java.
+# The launcher finds it either way.
 cat > "$HOME/.local/bin/applecommander-ac" <<'WRAP'
 #!/bin/sh
-exec "$HOME/.local/share/lubeshop/jre/bin/java" -jar "$HOME/.local/share/lubeshop/tools/AppleCommander-ac.jar" "$@"
+JAVA=$(find "$HOME/.local/share/lubeshop/jre" -type f -name java 2>/dev/null | head -1)
+exec "$JAVA" -jar "$HOME/.local/share/lubeshop/tools/AppleCommander-ac.jar" "$@"
 WRAP
 chmod +x "$HOME/.local/bin/applecommander-ac"
 echo "Installed applecommander-ac to ~/.local/bin (bundled Java 21)"
@@ -237,6 +248,10 @@ pub enum PkgMgr {
     Apt,
     Dnf,
     Zypper,
+    /// Homebrew (macOS). No `sudo`; the base toolchain (clang/make/git) comes with
+    /// the Xcode Command Line Tools that Homebrew itself requires, so those
+    /// prerequisites need no formula.
+    Brew,
 }
 
 #[cfg(not(windows))]
@@ -248,6 +263,7 @@ impl PkgMgr {
             PkgMgr::Apt => format!("sudo apt-get install -y {pkgs}"),
             PkgMgr::Dnf => format!("sudo dnf install -y {pkgs}"),
             PkgMgr::Zypper => format!("sudo zypper install -y {pkgs}"),
+            PkgMgr::Brew => format!("brew install {pkgs}"),
         }
     }
 
@@ -256,6 +272,10 @@ impl PkgMgr {
         use PkgMgr::*;
         use Prereq::*;
         match (self, p) {
+            // Homebrew: git/curl/clang/make + Python headers all come with the
+            // Xcode Command Line Tools; only libusb needs a formula.
+            (Brew, Git) | (Brew, Curl) | (Brew, Build) | (Brew, PythonDev) => "",
+            (Brew, Libusb) => "libusb",
             (_, Git) => "git",
             (_, Curl) => "curl",
             (Apt, Build) => "build-essential",
@@ -281,6 +301,7 @@ impl PkgMgr {
             PkgMgr::Apt => "apt",
             PkgMgr::Dnf => "dnf",
             PkgMgr::Zypper => "zypper",
+            PkgMgr::Brew => "brew",
         }
     }
 }
@@ -302,6 +323,11 @@ pub fn detect_pkg_mgr() -> Option<PkgMgr> {
     }
     if installed("zypper") {
         return Some(PkgMgr::Zypper);
+    }
+    // Homebrew last, so a native Linux distro manager always wins on Linux; on
+    // macOS the others are absent, so this is what's found.
+    if installed("brew") {
+        return Some(PkgMgr::Brew);
     }
     None
 }
@@ -429,8 +455,20 @@ fn win_resolve(win: WinSource, homepage: &'static str) -> InstallPlan {
 /// the (distro-agnostic) steps under `set -e`.
 #[cfg(not(windows))]
 fn build_script(recipe: Recipe, pm: PkgMgr) -> String {
-    let pkgs: Vec<&str> = recipe.prereqs.iter().map(|p| pm.pkg_for(*p)).collect();
-    format!("set -e\n{}\n{}", pm.install(&pkgs.join(" ")), recipe.steps)
+    // Some prerequisites need no package on some managers (e.g. Homebrew's toolchain
+    // comes with the Xcode CLT) — drop those so the install line isn't empty.
+    let pkgs: Vec<&str> = recipe
+        .prereqs
+        .iter()
+        .map(|p| pm.pkg_for(*p))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let install = if pkgs.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", pm.install(&pkgs.join(" ")))
+    };
+    format!("set -e\n{install}{}", recipe.steps)
 }
 
 /// Pure resolver (no process spawning) so it can be unit-tested.
@@ -464,16 +502,22 @@ fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx:
             } else {
                 // pipx clones the git+ URL and may build a C extension (greaseweazle
                 // has one), so ensure git, a compiler, and Python headers first
-                // (all idempotent if already present).
+                // (all idempotent if already present). Drop empty package names so
+                // Homebrew (where the toolchain comes from the Xcode CLT, not a
+                // formula) doesn't get `brew install    && …` — which errors out
+                // and short-circuits pipx.
                 let prep = match pm {
                     Some(pm) => {
-                        let pkgs = [
-                            pm.pkg_for(Prereq::Git),
-                            pm.pkg_for(Prereq::Build),
-                            pm.pkg_for(Prereq::PythonDev),
-                        ]
-                        .join(" ");
-                        format!("{} && ", pm.install(&pkgs))
+                        let pkgs: Vec<&str> = [Prereq::Git, Prereq::Build, Prereq::PythonDev]
+                            .iter()
+                            .map(|p| pm.pkg_for(*p))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if pkgs.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{} && ", pm.install(&pkgs.join(" ")))
+                        }
                     }
                     None => String::new(),
                 };
@@ -935,6 +979,38 @@ mod tests {
             resolve(Source::Build(ATARI_TOOLS), HP, None, false),
             InstallPlan::Manual { .. }
         ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn homebrew_installs_formulae_and_needs_no_toolchain_packages() {
+        // System packages and VICE are just `brew install NAME` (no sudo).
+        assert_eq!(
+            resolve(Source::System("cpmtools"), HP, Some(PkgMgr::Brew), false),
+            InstallPlan::Run("brew install cpmtools".to_string())
+        );
+        assert_eq!(
+            resolve(Source::Vice, HP, Some(PkgMgr::Brew), false),
+            InstallPlan::Run("brew install vice".to_string())
+        );
+        // A source build on macOS: only libusb needs a formula (clang/make/git come
+        // with the Xcode CLT), and there's no `sudo`.
+        let hxc = resolve(Source::Build(HXC), HP, Some(PkgMgr::Brew), false);
+        assert!(matches!(hxc, InstallPlan::Run(ref s)
+            if s.contains("brew install libusb") && s.contains("git clone") && !s.contains("sudo")));
+        // atari-tools needs nothing but the CLT, so there's no brew-install line.
+        let atr = resolve(Source::Build(ATARI_TOOLS), HP, Some(PkgMgr::Brew), false);
+        assert!(matches!(atr, InstallPlan::Run(ref s)
+            if !s.contains("brew install") && s.contains("git clone")));
+        // PipGit (gw): git/build/python-dev all come with the Xcode CLT, so there
+        // must be no `brew install` prep line — otherwise `brew install    && …`
+        // errors out and short-circuits pipx before greaseweazle installs.
+        let url = "git+https://github.com/keirf/greaseweazle@latest";
+        let gw = resolve(Source::PipGit(url), HP, Some(PkgMgr::Brew), true);
+        assert_eq!(
+            gw,
+            InstallPlan::Run(format!("pipx install {url} && pipx ensurepath"))
+        );
     }
 
     #[cfg(not(windows))]

@@ -40,22 +40,90 @@ folder** you can copy to another machine and pick right back up.
 
 ## Install
 
-### Prebuilt binary (easiest)
+Runs on **Linux**, **macOS** (Intel & Apple Silicon), and **Windows 10/11**.
 
-1. Go to the **[Releases](../../releases)** page and download the build for your
-   system.
-   - Not sure which one? Grab the **`x86_64-unknown-linux-musl`** build — it runs on
-     any Linux distribution.
-2. Extract it and run the program:
+### Prebuilt binary (recommended)
 
+Go to the **[Releases](../../releases)** page and download the archive for your
+system, then follow the steps for your OS below. Everything after that is a
+self-contained binary — nothing to un-install if you change your mind, just
+delete the file.
+
+#### Linux (x86_64)
+
+Grab **`lubeshop-x86_64-unknown-linux-musl.tar.gz`** — the musl build runs on
+any distribution.
+
+1. Extract the archive:
    ```sh
-   tar xzf lubeshop-*.tar.gz
-   cd lubeshop-*
+   tar xzf lubeshop-x86_64-unknown-linux-musl.tar.gz
+   cd lubeshop-x86_64-unknown-linux-musl
+   ```
+2. Run it in place to confirm it launches:
+   ```sh
    ./lubeshop
    ```
+3. (Optional) Put it on your `PATH` so you can just type `lubeshop`:
+   ```sh
+   mkdir -p ~/.local/bin
+   install -m 755 lubeshop ~/.local/bin/lubeshop
+   ```
+   Most shells already include `~/.local/bin` in `PATH`; if yours doesn't, add
+   `export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` / `~/.zshrc`.
 
-You can move `lubeshop` anywhere on your `PATH` (e.g. `~/.local/bin/`) so you can
-just type `lubeshop` from anywhere.
+#### macOS (Intel or Apple Silicon)
+
+Grab **`lubeshop-macos-x86_64.tar.gz`** for Intel Macs or
+**`lubeshop-macos-aarch64.tar.gz`** for Apple Silicon.
+
+1. Extract the archive (Finder does this on double-click, or from a Terminal):
+   ```sh
+   tar xzf lubeshop-macos-x86_64.tar.gz
+   cd lubeshop-macos-x86_64
+   ```
+2. Remove the Gatekeeper quarantine flag — release builds aren't
+   Apple-notarized, and without this step the OS refuses to launch the binary
+   with a *"cannot be opened"* dialog:
+   ```sh
+   xattr -d com.apple.quarantine lubeshop
+   ```
+3. Run it to confirm it launches:
+   ```sh
+   ./lubeshop
+   ```
+4. (Optional) Put it on your `PATH`:
+   ```sh
+   sudo install -m 755 lubeshop /usr/local/bin/lubeshop
+   ```
+5. **Before you use the Tools menu** to install helpers (VICE, cpmtools, gw,
+   HxC, …) you need **[Homebrew](https://brew.sh)** and the **Xcode Command
+   Line Tools** — Homebrew's own installer prompts for the CLT if they're
+   missing, so installing Homebrew first covers both:
+   ```sh
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   ```
+
+#### Windows 10/11 (x86_64)
+
+Grab **`lubeshop-x86_64-pc-windows-msvc.zip`**.
+
+1. Right-click the downloaded `.zip` in Explorer → **Extract All…** → pick a
+   folder you'll keep (e.g. `C:\Tools\lubeshop\`). Don't run from inside the
+   `.zip`; Windows will silently sandbox it and the app can't write its store.
+2. Open a Terminal (Windows Terminal or PowerShell) in that folder — Shift-
+   right-click the folder → **Open in Terminal** — and run:
+   ```powershell
+   .\lubeshop.exe
+   ```
+3. (Optional) Add the folder to your `PATH` so you can just type `lubeshop`
+   from anywhere: Start → *"Edit environment variables for your account"* →
+   **Path** → **Edit** → **New** → paste the folder path (e.g.
+   `C:\Tools\lubeshop`) → OK.
+4. The Tools menu uses **[winget](https://learn.microsoft.com/windows/package-manager/winget/)**
+   for tools that ship as Windows packages (VICE, Python, Java, Git). winget
+   is built into Windows 10 21H2+ and Windows 11; if it's missing, install
+   *App Installer* from the Microsoft Store. Everything else the app pulls
+   from bundled downloads at first use — nothing to install by hand.
 
 ### Arch Linux (AUR)
 
@@ -63,17 +131,23 @@ just type `lubeshop` from anywhere.
 paru -S lubeshop      # or: yay -S lubeshop
 ```
 
-### From source
+### From source (any OS)
 
-Needs a [Rust toolchain](https://rustup.rs) and a C compiler.
+Needs a [Rust toolchain](https://rustup.rs) (installer offers to grab `rustup`
+for you if it's missing) and a C compiler — `build-essential` / Xcode Command
+Line Tools / MSVC Build Tools.
 
 ```sh
 git clone https://github.com/n9tax/lubeshop.git
 cd lubeshop
-./install.sh          # builds and installs the `lubeshop` command
+./install.sh          # builds and installs the `lubeshop` command to ~/.cargo/bin
 ```
 
-> **Platforms:** Linux today. Native Windows is in progress; macOS may follow.
+On Windows the equivalent is `cargo install --path crates/gwm-tui --locked`
+from a *Developer Command Prompt for VS*. Either way the binary lands in
+`~/.cargo/bin/lubeshop` (or `%USERPROFILE%\.cargo\bin\lubeshop.exe`), which
+`rustup` normally adds to your shell PATH — open a new terminal after the
+install finishes so the updated PATH takes effect.
 
 ---
 

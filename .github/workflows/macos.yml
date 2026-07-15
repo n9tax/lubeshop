@@ -1,0 +1,52 @@
+name: macos-build
+
+# Native macOS build (work in progress). Produces a downloadable `lubeshop`
+# artifact on every push so it can be smoke-tested on real Macs while the macOS
+# tool-installer (Homebrew) and USB (diskutil) work is finished. Not attached to
+# public releases yet — folds into release.yml for the 1.0 cut.
+#
+# Two runners cover both architectures the user can't build locally:
+#   macos-13 — Intel (x86_64)      → the hardware the user actually has
+#   macos-14 — Apple Silicon (arm64) → free coverage for the M-series testers
+# (Can't cross-compile macOS from Linux — no SDK — so both come from CI.)
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            arch: x86_64
+          - runner: macos-14
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup update stable --no-self-update
+      # rusqlite is bundled (compiled from C); the macOS runners ship the Xcode
+      # Command Line Tools (clang), so no extra setup is needed.
+      - name: Build
+        run: cargo build --release --locked -p gwm-tui
+      - name: Test
+        run: cargo test --release --locked -p gwm-core
+      - name: Stage
+        shell: bash
+        run: |
+          d="lubeshop-macos-${{ matrix.arch }}"
+          mkdir "$d"
+          cp target/release/lubeshop "$d/"
+          cp README.md "$d/"
+          [ -f COPYING ] && cp COPYING "$d/" || true
+          [ -f THIRD-PARTY-NOTICES.md ] && cp THIRD-PARTY-NOTICES.md "$d/" || true
+      - uses: actions/upload-artifact@v5
+        with:
+          name: lubeshop-macos-${{ matrix.arch }}
+          path: lubeshop-macos-${{ matrix.arch }}/
