@@ -1,0 +1,73 @@
+===============================================================================
+ The Lube Shop — Greaseweazle Drive Tower : BILL OF MATERIALS
+===============================================================================
+
+ For the enclosure printed from weazleEnclosure.scad + greaseweasleShelf.scad.
+ Quantities below are for the reference build: 2x 5.25" + 1x 3.5" drive.
+ Fastener counts marked "per drive" scale if you change the `bays` stack.
+
+ Fastener sizes/lengths are derived from the model and are a STARTING POINT —
+ confirm against your actual drives, PSU, and inlet before ordering.
+
+
+-------------------------------------------------------------------------------
+ 1. 3D-PRINTED PARTS                                          qty
+-------------------------------------------------------------------------------
+ Drive tower body        weazleEnclosure.scad -> STL          1
+ Greaseweazle board shelf greaseweasleShelf.scad -> STL       1
+
+ Material: any (PLA/PET/ABS). Walls are 5 mm. No supports needed for the
+ tower if printed nose-up (open ends vertical); the shelf prints flat.
+
+
+-------------------------------------------------------------------------------
+ 2. ELECTRONICS  (purchased)                                  qty   link
+-------------------------------------------------------------------------------
+ Mean Well RD-50A-VP open-frame PSU (+5V/+12V)                1     https://a.co/d/091MpEGP
+   The pocket, side- and top-mount holes are sized to this exact unit.
+
+ Panel-mount IEC C13 AC inlet with switch (fused)             1     https://a.co/d/0dBkvaSE
+   Flange aperture + captive-nut pockets are sized to this inlet.
+
+
+-------------------------------------------------------------------------------
+ 3. BUILDER-SUPPLIED  (not in the print)                      qty
+-------------------------------------------------------------------------------
+ Greaseweazle v4.1 board                                      1
+   Mounts on the shelf's four stand-off ring posts.
+ 5.25" floppy drive(s)                                        as per `bays`
+ 3.5"  floppy drive(s)                                        as per `bays`
+ Mains cord + appropriate fuse for the IEC inlet              1
+ Drive power/data cabling to suit your setup                  -
+
+
+-------------------------------------------------------------------------------
+ 4. FASTENERS  (M-metric; see note above)                     qty
+-------------------------------------------------------------------------------
+ Drive mounting screws        M3 x 8-10          4 per drive
+   (2 per side; drives have tapped side holes. Ø4.2 clearance in the print.)
+
+ PSU mounting screws          M3 x 6-8           4
+   (2 side + 2 top, into the RD-50A-VP's tapped holes.)
+
+ IEC inlet screws             M3 x 16-20         2
+ IEC inlet hex nuts           M3 (5.5 mm A/F)    2
+   (Nuts drop into the hex pockets behind the flange; screw from the front.)
+
+ Board mount screws           M2.5 x 6-8         4
+   (Into the shelf ring posts. Board mount holes are Ø2.6.)
+
+ Shelf-to-tower screws        M3 or M4 x 12      2
+   (Top-rear of the tower; Ø4.2 clearance holes.)
+
+
+-------------------------------------------------------------------------------
+ NOTES
+-------------------------------------------------------------------------------
+ * The tower keeps a 5.25" footprint width whatever drives you fit; 3.5" drives
+   sit within that width with their screw counterbores reaching the outer wall.
+ * If you change the drive stack (the `bays = [...]` line in the .scad), only
+   the drives and their mounting screws change — the electronics BOM is fixed.
+ * MAINS WIRING IS DANGEROUS. Wire the IEC inlet, switch, fuse, and PSU to code;
+   verify earth/ground continuity to any exposed metal before powering on.
+===============================================================================
