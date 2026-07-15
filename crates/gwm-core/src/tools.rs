@@ -149,15 +149,22 @@ echo "Installed atr to ~/.local/bin"
 "#,
 };
 
-/// HxC (hxcfe): build just the command-line converter (not the Qt GUI).
+/// HxC (hxcfe): build just the command-line converter (not the Qt GUI). On macOS
+/// the binary is linked with `-rpath,@executable_path/../lib`, so the two dylibs
+/// it depends on (`libhxcfe`, `libusbhxcfe`) have to sit in `~/.local/lib/` for
+/// it to run — copy them there when the build produces them (Linux emits `.so`s
+/// staying in the tree, and the glob just no-ops).
 const HXC: Recipe = Recipe {
     prereqs: &[Prereq::Git, Prereq::Build, Prereq::Libusb],
     steps: r#"
 d=$(mktemp -d)
 git clone --depth 1 https://github.com/jfdelnero/HxCFloppyEmulator "$d/src"
 make -C "$d/src/build" HxCFloppyEmulator_cmdline
-mkdir -p "$HOME/.local/bin"
+mkdir -p "$HOME/.local/bin" "$HOME/.local/lib"
 cp "$d/src/HxCFloppyEmulator_cmdline/build/hxcfe" "$HOME/.local/bin/"
+for lib in "$d/src/build/"*.dylib; do
+  [ -e "$lib" ] && cp "$lib" "$HOME/.local/lib/"
+done
 rm -rf "$d"
 echo "Installed hxcfe to ~/.local/bin"
 "#,
@@ -495,16 +502,22 @@ fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx:
             } else {
                 // pipx clones the git+ URL and may build a C extension (greaseweazle
                 // has one), so ensure git, a compiler, and Python headers first
-                // (all idempotent if already present).
+                // (all idempotent if already present). Drop empty package names so
+                // Homebrew (where the toolchain comes from the Xcode CLT, not a
+                // formula) doesn't get `brew install    && …` — which errors out
+                // and short-circuits pipx.
                 let prep = match pm {
                     Some(pm) => {
-                        let pkgs = [
-                            pm.pkg_for(Prereq::Git),
-                            pm.pkg_for(Prereq::Build),
-                            pm.pkg_for(Prereq::PythonDev),
-                        ]
-                        .join(" ");
-                        format!("{} && ", pm.install(&pkgs))
+                        let pkgs: Vec<&str> = [Prereq::Git, Prereq::Build, Prereq::PythonDev]
+                            .iter()
+                            .map(|p| pm.pkg_for(*p))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if pkgs.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{} && ", pm.install(&pkgs.join(" ")))
+                        }
                     }
                     None => String::new(),
                 };
@@ -989,6 +1002,15 @@ mod tests {
         let atr = resolve(Source::Build(ATARI_TOOLS), HP, Some(PkgMgr::Brew), false);
         assert!(matches!(atr, InstallPlan::Run(ref s)
             if !s.contains("brew install") && s.contains("git clone")));
+        // PipGit (gw): git/build/python-dev all come with the Xcode CLT, so there
+        // must be no `brew install` prep line — otherwise `brew install    && …`
+        // errors out and short-circuits pipx before greaseweazle installs.
+        let url = "git+https://github.com/keirf/greaseweazle@latest";
+        let gw = resolve(Source::PipGit(url), HP, Some(PkgMgr::Brew), true);
+        assert_eq!(
+            gw,
+            InstallPlan::Run(format!("pipx install {url} && pipx ensurepath"))
+        );
     }
 
     #[cfg(not(windows))]
