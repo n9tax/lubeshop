@@ -49,13 +49,89 @@ pub fn removable_drives() -> Vec<UsbDrive> {
     {
         windows_drives()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_drives()
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         linux_drives()
     }
 }
 
-#[cfg(not(windows))]
+// ---- macOS: parse `diskutil info -all` ------------------------------------
+
+/// External/removable FAT volumes via `diskutil info -all` (one call dumps every
+/// disk, blocks separated by a `**********` line).
+#[cfg(target_os = "macos")]
+fn macos_drives() -> Vec<UsbDrive> {
+    let out = match Command::new("diskutil").args(["info", "-all"]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .split("**********")
+        .filter_map(parse_diskutil_block)
+        .collect()
+}
+
+/// Parse one `diskutil info` block into a drive, keeping only *mounted, removable,
+/// FAT* volumes. Not cfg-gated to macOS so it can be unit-tested anywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_diskutil_block(block: &str) -> Option<UsbDrive> {
+    let mut fields = std::collections::HashMap::new();
+    for line in block.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            fields.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    let get = |k: &str| fields.get(k).map(String::as_str).unwrap_or("");
+
+    let mount = get("Mount Point");
+    if mount.is_empty() || mount.starts_with("Not applicable") {
+        return None;
+    }
+    // FAT filesystem? (bundle type `msdos`/`exfat`, or the friendly personality.)
+    let bundle = get("Type (Bundle)");
+    let personality = get("File System Personality").to_ascii_lowercase();
+    if !(is_fat(bundle) || personality.contains("fat") || personality.contains("ms-dos")) {
+        return None;
+    }
+    // Removable/external? Several signals across macOS versions.
+    let removable = get("Removable Media").eq_ignore_ascii_case("Removable")
+        || get("Ejectable").eq_ignore_ascii_case("Yes")
+        || get("Protocol").eq_ignore_ascii_case("USB")
+        || get("Device Location").eq_ignore_ascii_case("External")
+        || get("Internal").eq_ignore_ascii_case("No");
+    if !removable {
+        return None;
+    }
+    // Size like "3.9 GB (3901579264 Bytes)…" → "3.9 GB".
+    let size_field = [
+        "Volume Total Space",
+        "Container Total Space",
+        "Disk Size",
+        "Total Size",
+    ]
+    .iter()
+    .map(|k| get(k))
+    .find(|v| !v.is_empty())
+    .unwrap_or("");
+    let size = size_field.split('(').next().unwrap_or("").trim().to_string();
+
+    Some(UsbDrive {
+        mount: PathBuf::from(mount),
+        label: get("Volume Name").to_string(),
+        size,
+        fs: if bundle.is_empty() {
+            get("File System Personality").to_string()
+        } else {
+            bundle.to_string()
+        },
+    })
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn linux_drives() -> Vec<UsbDrive> {
     let out = match Command::new("lsblk")
         .args(["-J", "-o", "NAME,RM,HOTPLUG,TRAN,FSTYPE,MOUNTPOINT,LABEL,SIZE"])
@@ -80,7 +156,7 @@ fn linux_drives() -> Vec<UsbDrive> {
 /// Whether an lsblk node is on removable/USB media. `rm`/`hotplug` may be reported
 /// as a bool or a "0"/"1" string depending on the lsblk version; `tran == "usb"` is
 /// also a strong signal.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn node_is_removable(node: &serde_json::Value) -> bool {
     let flag = |k: &str| match node.get(k) {
         Some(serde_json::Value::Bool(b)) => *b,
@@ -94,7 +170,7 @@ fn node_is_removable(node: &serde_json::Value) -> bool {
 
 /// Add any mounted FAT partition under `node` (a disk and its children); `removable`
 /// is inherited from the parent disk.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn collect_linux(node: &serde_json::Value, removable: bool, out: &mut Vec<UsbDrive>) {
     let removable = removable || node_is_removable(node);
     let fs = node.get("fstype").and_then(|v| v.as_str()).unwrap_or("");
@@ -255,7 +331,7 @@ mod tests {
         assert_eq!(drives[0].fs, "exFAT");
     }
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     #[test]
     fn parses_lsblk_json_for_removable_fat_mounts() {
         // A USB stick (rm=true, one FAT partition mounted) next to an internal
@@ -277,5 +353,59 @@ mod tests {
         assert_eq!(drives[0].mount, PathBuf::from("/run/media/joe/GOTEK"));
         assert_eq!(drives[0].label, "GOTEK");
         assert_eq!(drives[0].fs, "vfat");
+    }
+
+    // `parse_diskutil_block` isn't macOS-gated, so it unit-tests on any host. The
+    // sample below mirrors a real `diskutil info` block for a USB FAT32 stick;
+    // the field set/spelling still wants a spot-check on a real Mac (see
+    // docs/MACOS-PORT.md) since diskutil's labels drift between macOS versions.
+    #[test]
+    fn parses_diskutil_block_for_removable_fat_volume() {
+        // A USB FAT32 stick mounted at /Volumes/GOTEK.
+        let stick = "\
+   Device Identifier:         disk4s1
+   Device Node:               /dev/disk4s1
+   Volume Name:               GOTEK
+   Mounted:                   Yes
+   Mount Point:               /Volumes/GOTEK
+   File System Personality:   MS-DOS FAT32
+   Type (Bundle):             msdos
+   Protocol:                  USB
+   Removable Media:           Removable
+   Internal:                  No
+   Device Location:           External
+   Volume Total Space:        3.9 GB (3901579264 Bytes) (exactly 7620272 512-Byte-Units)
+";
+        let d = parse_diskutil_block(stick).expect("removable FAT stick");
+        assert_eq!(d.mount, PathBuf::from("/Volumes/GOTEK"));
+        assert_eq!(d.label, "GOTEK");
+        assert_eq!(d.size, "3.9 GB");
+        assert_eq!(d.fs, "msdos");
+
+        // Internal APFS system volume: mounted but not removable and not FAT.
+        let internal = "\
+   Device Identifier:         disk1s1
+   Volume Name:               Macintosh HD
+   Mount Point:               /
+   File System Personality:   APFS
+   Type (Bundle):             apfs
+   Protocol:                  Apple Fabric
+   Removable Media:           Fixed
+   Internal:                  Yes
+   Device Location:           Internal
+   Volume Total Space:        494.4 GB (494384795648 Bytes)
+";
+        assert!(parse_diskutil_block(internal).is_none());
+
+        // An unmounted FAT partition (Mount Point "Not applicable") is skipped.
+        let unmounted = "\
+   Device Identifier:         disk4s1
+   Volume Name:               GOTEK
+   Mount Point:               Not applicable (no file system)
+   Type (Bundle):             msdos
+   Removable Media:           Removable
+   Protocol:                  USB
+";
+        assert!(parse_diskutil_block(unmounted).is_none());
     }
 }
