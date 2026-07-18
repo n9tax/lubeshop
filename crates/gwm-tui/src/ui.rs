@@ -106,6 +106,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::Writing | Screen::WriteDone => render_writing(app, frame, chunks[1]),
         Screen::Settings => render_settings(app, frame, chunks[1]),
         Screen::DriveTuning => render_drive_tuning(app, frame, chunks[1]),
+        Screen::TuningSaveName => render_tuning_save(app, frame, chunks[1]),
+        Screen::TuningProfiles => render_tuning_profiles(app, frame, chunks[1]),
         Screen::DriverPicker => render_driver_picker(app, frame, chunks[1]),
         Screen::OptionPicker => render_option_picker(app, frame, chunks[1]),
         Screen::Browse => render_browse(app, frame, chunks[1]),
@@ -1090,12 +1092,66 @@ fn render_drive_tuning(app: &App, frame: &mut Frame, area: Rect) {
         "  it reads inner tracks. Applied live and re-applied before every read.",
         dim(),
     )));
+    // Show saved profiles, if any, so the user knows what `l` will offer.
+    let profiles = &app.core.settings.tuning_profiles;
+    if !profiles.is_empty() {
+        let names: Vec<&str> = profiles.keys().map(String::as_str).collect();
+        lines.push(Line::from(Span::styled(
+            format!("  Saved profiles: {}", names.join(", ")),
+            dim(),
+        )));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  ↑/↓ select · ←/→ adjust · r reset all to defaults · Esc back",
+        "  ↑/↓ select · ←/→ adjust · s save profile · l load · r reset · Esc back",
         dim(),
     )));
     frame.render_widget(para(lines).block(bordered("Drive tuning — gw delays")), area);
+}
+
+fn render_tuning_save(app: &App, frame: &mut Frame, area: Rect) {
+    let mut field = vec![Span::styled("  Profile name: ", dim())];
+    field.extend(input_spans(&app.tuning_name_input));
+    let lines = vec![
+        Line::from(Span::styled(
+            "  Save the current drive timings so you can recall them later.",
+            dim(),
+        )),
+        Line::from(""),
+        Line::from(field),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter to save · Esc cancel  (reusing a name overwrites it)",
+            dim(),
+        )),
+    ];
+    frame.render_widget(para(lines).block(bordered("Save timing profile")), area);
+}
+
+fn render_tuning_profiles(app: &App, frame: &mut Frame, area: Rect) {
+    let mut items: Vec<ListItem> = Vec::new();
+    // Row 0 is always the built-in factory reset.
+    let sel0 = app.tuning_profile_index == 0;
+    let (m0, s0) = if sel0 { ("▸ ", hl()) } else { ("  ", base()) };
+    items.push(ListItem::new(Line::from(Span::styled(
+        format!("{m0}Default (factory reset)"),
+        s0,
+    ))));
+    for (i, name) in app.core.settings.tuning_profiles.keys().enumerate() {
+        let selected = app.tuning_profile_index == i + 1;
+        let (marker, style) = if selected { ("▸ ", hl()) } else { ("  ", base()) };
+        items.push(ListItem::new(Line::from(Span::styled(format!("{marker}{name}"), style))));
+    }
+    let hint = ListItem::new(Line::from(Span::styled(
+        "  Enter recall · d delete · Esc back",
+        dim(),
+    )));
+    items.push(ListItem::new(Line::from("")));
+    items.push(hint);
+    frame.render_widget(
+        List::new(items).style(base()).block(bordered("Recall timing profile")),
+        area,
+    );
 }
 
 fn render_driver_picker(app: &App, frame: &mut Frame, area: Rect) {
@@ -1953,7 +2009,9 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
             Screen::Writing => "  writing… please wait",
             Screen::WriteDone => "  Enter return to menu",
             Screen::Settings => "  ↑/↓ row · ←/→ change · Enter edit/open · Esc back",
-            Screen::DriveTuning => "  ↑/↓ select · ←/→ adjust · r reset defaults · Esc back",
+            Screen::DriveTuning => "  ↑/↓ select · ←/→ adjust · s save · l load · r reset · Esc back",
+            Screen::TuningSaveName => "  type a name · Enter save · Esc cancel",
+            Screen::TuningProfiles => "  ↑/↓ move · Enter recall · d delete · Esc back",
             Screen::DriverPicker => "  ↑/↓ move · Enter choose · Esc back",
             Screen::OptionPicker => {
                 "  type to filter · ↑/↓ · Enter pick · Ctrl+E edit label · Esc back"

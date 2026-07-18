@@ -108,6 +108,8 @@ pub enum Screen {
     DriverPicker,
     OptionPicker,
     DriveTuning,
+    TuningSaveName,
+    TuningProfiles,
     ArchiveSearch,
     ArchiveFetching,
     ArchiveResults,
@@ -197,6 +199,10 @@ pub struct App {
     pub storage_input: TextInput,
     pub tune_index: usize,
     pub tune_values: Vec<u32>,
+    /// Name being typed when saving the current timings as a profile.
+    pub tuning_name_input: TextInput,
+    /// Selected row in the recall-profile picker (0 = "Default (factory)").
+    pub tuning_profile_index: usize,
 
     pub menu_index: usize,
 
@@ -387,6 +393,8 @@ impl App {
             storage_input: TextInput::new(),
             tune_index: 0,
             tune_values: Vec::new(),
+            tuning_name_input: TextInput::new(),
+            tuning_profile_index: 0,
             menu_index: 0,
             library: Vec::new(),
             lib_state: ListState::default(),
@@ -740,6 +748,8 @@ impl App {
             Screen::DriverPicker => self.on_driver_key(code),
             Screen::OptionPicker => self.on_option_key(code, mods),
             Screen::DriveTuning => self.on_drive_tuning_key(code),
+            Screen::TuningSaveName => self.on_tuning_save_key(code, mods),
+            Screen::TuningProfiles => self.on_tuning_profiles_key(code),
             Screen::Browse => self.on_browse_key(code),
             Screen::BrowseInput => self.on_browse_input_key(code, mods),
             Screen::BrowseConfirmDelete => self.on_browse_delete_key(code),
@@ -962,28 +972,34 @@ impl App {
             self.notice = Some("gw is required to decode this flux capture.".to_string());
             return;
         }
-        let fmt = self
+        if self.formats.is_empty() {
+            self.formats = formats::list_formats();
+        }
+        if self.formats.is_empty() {
+            self.notice = Some("Could not read the format list from gw.".to_string());
+            return;
+        }
+        // Always ask which format to decode a flux master with: the right choice
+        // (single- vs double-sided, hard-sectored, …) can't be derived from the
+        // file, and a wrong pick used to be saved with no way to change it. The
+        // last-used format is pre-selected, so confirming it is a single keystroke
+        // while a different disk type is still one filter away.
+        let remembered = self
             .master_item()
             .and_then(|m| m.format)
             .filter(|f| !f.trim().is_empty());
-        match fmt {
-            Some(fmt) => self.decode_and_open(&fmt),
-            None => {
-                if self.formats.is_empty() {
-                    self.formats = formats::list_formats();
-                }
-                if self.formats.is_empty() {
-                    self.notice = Some("Could not read the format list from gw.".to_string());
-                    return;
-                }
-                self.flow = Flow::Decode;
-                self.format_filter.clear();
-                self.format_state.select(Some(0));
-                self.notice =
-                    Some("Pick the disk format to decode this flux capture.".to_string());
-                self.screen = Screen::FormatPicker;
-            }
-        }
+        self.flow = Flow::Decode;
+        self.format_filter.clear();
+        let idx = {
+            let ff = self.filtered_formats();
+            remembered
+                .as_deref()
+                .and_then(|w| ff.iter().position(|f| *f == w))
+                .unwrap_or(0)
+        };
+        self.format_state.select(Some(idx));
+        self.notice = Some("Pick the disk format to decode this flux capture.".to_string());
+        self.screen = Screen::FormatPicker;
     }
 
     /// The catalog row for the flux master currently being browsed.
@@ -1438,6 +1454,7 @@ impl App {
                 self.browse_state
                     .select((!self.browse_entries.is_empty()).then_some(0));
                 self.browse_usage = fs.usage(&self.browse_image).ok();
+                self.write_browse_listing();
                 self.load_originals();
                 self.browse_focus = Focus::Files;
                 if self.clip_state.selected().is_none() && !self.clipboard.is_empty() {
@@ -1454,6 +1471,20 @@ impl App {
                 ));
             }
         }
+    }
+
+    /// Write a `<image>.txt` sidecar listing the disk's contents next to the
+    /// real library file (the flux master for a decoded master, else the image
+    /// itself — never the temporary decode). Best-effort and silent; refreshed
+    /// on every browse, so it also picks up inserts/deletes.
+    fn write_browse_listing(&self) {
+        let target = self.browse_master.as_ref().unwrap_or(&self.browse_image);
+        let desc = if self.browse_format.is_empty() {
+            self.browse_driver.label().to_string()
+        } else {
+            format!("{} — {}", self.browse_driver.label(), self.browse_format)
+        };
+        let _ = gwm_core::imagefs::write_file_listing(target, &desc, &self.browse_entries);
     }
 
     fn selected_entry(&self) -> Option<FileEntry> {
@@ -1919,8 +1950,101 @@ impl App {
             KeyCode::Left => self.adjust_tune(-1),
             KeyCode::Right => self.adjust_tune(1),
             KeyCode::Char('r') => self.reset_tuning(),
+            KeyCode::Char('s') => self.enter_tuning_save(),
+            KeyCode::Char('l') => self.enter_tuning_profiles(),
             _ => {}
         }
+    }
+
+    /// Prompt for a name to save the current timings under as a profile.
+    fn enter_tuning_save(&mut self) {
+        self.tuning_name_input = TextInput::new();
+        self.screen = Screen::TuningSaveName;
+    }
+
+    fn on_tuning_save_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        match code {
+            KeyCode::Esc => self.screen = Screen::DriveTuning,
+            KeyCode::Enter => {
+                let name = self.tuning_name_input.text().trim().to_string();
+                if name.is_empty() {
+                    self.notice = Some("Enter a name for the profile.".to_string());
+                    return;
+                }
+                // Snapshot every parameter's current value (not just overrides),
+                // so recalling the profile reproduces the whole timing set.
+                let profile: std::collections::HashMap<String, u32> = TUNE_PARAMS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (p.name.to_string(), self.tune_values.get(i).copied().unwrap_or(p.default)))
+                    .collect();
+                let existed = self.core.settings.tuning_profiles.contains_key(&name);
+                self.core.settings.tuning_profiles.insert(name.clone(), profile);
+                let _ = self.core.save_settings();
+                self.notice = Some(format!(
+                    "{} timing profile \"{name}\".",
+                    if existed { "Updated" } else { "Saved" }
+                ));
+                self.screen = Screen::DriveTuning;
+            }
+            _ => edit_input(&mut self.tuning_name_input, code, mods),
+        }
+    }
+
+    /// Open the recall picker: "Default (factory)" plus every saved profile.
+    fn enter_tuning_profiles(&mut self) {
+        self.tuning_profile_index = 0;
+        self.screen = Screen::TuningProfiles;
+    }
+
+    fn on_tuning_profiles_key(&mut self, code: KeyCode) {
+        let names: Vec<String> = self.core.settings.tuning_profiles.keys().cloned().collect();
+        let count = names.len() + 1; // row 0 is the built-in "Default (factory)"
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::DriveTuning,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.tuning_profile_index = self.tuning_profile_index.checked_sub(1).unwrap_or(count - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.tuning_profile_index = (self.tuning_profile_index + 1) % count;
+            }
+            KeyCode::Enter => {
+                if self.tuning_profile_index == 0 {
+                    self.reset_tuning(); // Default → factory gw delays
+                } else if let Some(name) = names.get(self.tuning_profile_index - 1) {
+                    self.load_tuning_profile(&name.clone());
+                }
+                self.screen = Screen::DriveTuning;
+            }
+            KeyCode::Char('d') | KeyCode::Char('x') => {
+                // Delete the selected saved profile (row 0, Default, can't be deleted).
+                if self.tuning_profile_index >= 1 {
+                    if let Some(name) = names.get(self.tuning_profile_index - 1).cloned() {
+                        self.core.settings.tuning_profiles.remove(&name);
+                        let _ = self.core.save_settings();
+                        self.notice = Some(format!("Deleted profile \"{name}\"."));
+                        let new_count = names.len(); // one fewer profile, plus Default
+                        self.tuning_profile_index = self.tuning_profile_index.min(new_count - 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Load a saved profile into the live `tuning`, apply it, and refresh the row values.
+    fn load_tuning_profile(&mut self, name: &str) {
+        let Some(profile) = self.core.settings.tuning_profiles.get(name).cloned() else {
+            return;
+        };
+        self.core.settings.tuning = profile.clone();
+        let _ = self.core.save_settings();
+        let _ = gwm_core::device::apply_delays(&profile);
+        self.tune_values = TUNE_PARAMS
+            .iter()
+            .map(|p| profile.get(p.name).copied().unwrap_or(p.default))
+            .collect();
+        self.notice = Some(format!("Loaded timing profile \"{name}\"."));
     }
 
     fn reset_tuning(&mut self) {

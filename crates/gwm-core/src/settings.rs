@@ -20,6 +20,12 @@ pub struct Settings {
     /// …). Applied to the device before reads. Empty = leave gw defaults.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tuning: HashMap<String, u32>,
+    /// Named drive-timing profiles the user has saved from the tuning screen.
+    /// Each maps a profile name to a full set of delay overrides (same shape as
+    /// [`tuning`](Self::tuning)); recall one to load it back into `tuning`. The
+    /// built-in "Default" (factory) reset is not stored here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tuning_profiles: BTreeMap<String, HashMap<String, u32>>,
     /// Recently-chosen read/write formats, most-recent first (for the picker).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_formats: Vec<String>,
@@ -44,6 +50,7 @@ impl Default for Settings {
             theme: "dark".to_string(),
             default_drive: "a".to_string(),
             tuning: HashMap::new(),
+            tuning_profiles: BTreeMap::new(),
             recent_formats: Vec::new(),
             recent_fs_formats: Vec::new(),
             format_labels: BTreeMap::new(),
@@ -85,6 +92,10 @@ mod tests {
             theme: "c64".to_string(),
             default_drive: "b".to_string(),
             tuning: std::collections::HashMap::from([("step".to_string(), 16000)]),
+            tuning_profiles: std::collections::BTreeMap::from([(
+                "Shugart SA400".to_string(),
+                std::collections::HashMap::from([("step".to_string(), 24000), ("settle".to_string(), 40)]),
+            )]),
             recent_formats: vec!["ibm.1440".to_string()],
             recent_fs_formats: Vec::new(),
             format_labels: std::collections::BTreeMap::from([(
@@ -102,6 +113,10 @@ mod tests {
         assert_eq!(loaded.theme, "c64");
         assert_eq!(loaded.default_drive, "b");
         assert_eq!(loaded.tuning.get("step"), Some(&16000));
+        assert_eq!(
+            loaded.tuning_profiles.get("Shugart SA400").and_then(|p| p.get("step")),
+            Some(&24000)
+        );
         assert_eq!(loaded.format_labels.get("ibm.1440"), Some(&"My PC disk".to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
