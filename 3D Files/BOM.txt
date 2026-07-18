@@ -15,9 +15,14 @@
 -------------------------------------------------------------------------------
  Drive tower body        weazleEnclosure.scad -> STL          1
  Greaseweazle board shelf greaseweasleShelf.scad -> STL       1
+ Carry handle (OPTIONAL, only if splitting)                   1
+   Print only if the whole tower is too tall for your printer. In the .scad
+   set part="tower" (STL #1, ~47 mm shorter, keeps short bolt-on stubs) and
+   part="handle" (this part, prints flat). Otherwise part="all" fuses them.
 
  Material: any (PLA/PET/ABS). Walls are 5 mm. No supports needed for the
- tower if printed nose-up (open ends vertical); the shelf prints flat.
+ tower if printed nose-up (open ends vertical); the shelf and the split
+ handle both print flat.
 
 
 -------------------------------------------------------------------------------
@@ -59,6 +64,11 @@
 
  Shelf-to-tower screws        M3 or M4 x 12      2
    (Top-rear of the tower; Ø4.2 clearance holes.)
+
+ Handle mounting bolts        M5 x 30            2   (ONLY if handle is split)
+   (One per post, down the access channel into the stub pilot. Self-taps into
+   the plastic — needs a long hex key to reach the recessed head. For extra
+   hold, widen handleBoltPilot in the .scad and use M5 heat-set inserts.)
 
 
 -------------------------------------------------------------------------------

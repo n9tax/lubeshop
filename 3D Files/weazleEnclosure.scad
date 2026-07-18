@@ -41,6 +41,20 @@ current_color = "ALL";
 //current_color = "white";
 //current_color = "gray";
 
+// -----------------------------------------------------------------------------
+//  WHICH PART TO RENDER.  Use the split parts when the whole tower (handle and
+//  all) is too tall for your printer — the handle prints separately and bolts on.
+//    "all"     one-piece tower with the carry handle fused on top (original).
+//    "tower"   tower with short handle STUBS to bolt a separate handle onto —
+//              prints ~47 mm shorter than "all".
+//    "handle"  just the bolt-on handle, laid flat for printing.
+//    "preview" tower + handle shown assembled together (do NOT print this).
+// -----------------------------------------------------------------------------
+//part = "all";
+part = "tower";
+//part = "handle";
+//part = "preview";
+
 // =============================================================================
 //  COMPONENT DIMENSIONS  (spec sheets — mm)
 //
@@ -82,6 +96,17 @@ plugin = [28, 47.5, 50, 49, 60, 3.3, 40, 5.5, 2.5];
 // Carry handle.
 handle = [25, 40]; // 0 rod diameter, 1 stand-off height
 
+// Removable-handle joint (only used when `part` is "tower"/"handle"/"preview").
+// The tower keeps a short stub of each post; the separate handle cups over it
+// and a bolt runs down the post centre into a self-tap pilot in the stub+wall.
+handleStubH      = 5;    // stub height left on the tower top
+handleStubDia    = 19;   // stub diameter (plugs into the hollow post socket)
+handleBoltDia    = 5;    // M5 bolt
+handleBoltLen    = 30;   // your bolt length (mm) — sets how deep the head seats
+handleBoltEngage = 8;    // thread depth into the stub + top wall (< stubH+wall)
+handleBoltPilot  = 4.3;  // M5 self-tap pilot in PLA (~4.2-4.5); widen for inserts
+handleBoltHead   = 9.5;  // bolt-head + hex-key access-channel diameter
+
 // Wall / floor / divider thickness used everywhere.
 wallThickness = 5;
 
@@ -103,7 +128,7 @@ function d35()   = ["35",  H_35];
 // =============================================================================
 //  THE DRIVE STACK  — edit this line (see the header for the vocabulary).
 // =============================================================================
-bays = [ d525h(), d525h(), d35() ];   // ORIGINAL (featured) — two half-height 5.25" + one 3.5"
+bays = [ d525h(), d525h(), d525h(), d35() ];   // ORIGINAL (featured) — two half-height 5.25" + one 3.5"
 //bays = [ d525f(), d35() ];          // one full-height 5.25" + one 3.5"
 //bays = [ d525h(), d35() ];          // one half-height 5.25" + one 3.5"
 
@@ -171,6 +196,62 @@ module handle(len, dia, height) {
     linear_extrude(height = len) circle(d = dia);
     translate([0, 0, len - dia * 1.7]) rotate([0, 90, 0]) linear_extrude(height) circle(d = dia);
     translate([0, 0, dia * 1.7])       rotate([0, 90, 0]) linear_extrude(height) circle(d = dia);
+}
+
+// -----------------------------------------------------------------------------
+//  REMOVABLE-HANDLE PIECES  — the stubs on the tower and the bolt-on handle.
+//  All three land on the same two centre-line points where the fused handle's
+//  posts meet the top, so the bolt-on handle drops straight onto the stubs.
+// -----------------------------------------------------------------------------
+
+// The two mounting points on the top face (centre line: one front, one back).
+function footXY() = [ [outerW / 2, handle[0] * 1.7],
+                      [outerW / 2, driveBody[2] - handle[0] * 1.7] ];
+
+// Local Z (post base = 0) where the bolt head seats, so a `handleBoltLen` bolt
+// reaches `handleBoltEngage` mm into the stub+wall.
+handleHeadZ = handleStubH - handleBoltEngage + handleBoltLen;
+
+/* Short stubs left on the tower top; the handle bolts down onto these. */
+module handleStubs() {
+    for (p = footXY())
+        translate([p[0], p[1], totalZ]) cylinder(h = handleStubH, d = handleStubDia);
+}
+
+/* Self-tap pilot down each stub and a little into the top wall (negative). */
+module handleStubPilots() {
+    for (p = footXY())
+        translate([p[0], p[1], totalZ + handleStubH - handleBoltEngage])
+            cylinder(h = handleBoltEngage + 0.05, d = handleBoltPilot);
+}
+
+/* The bolt-on handle as a standalone part, base at z=0 (= the tower top face).
+ * Each post cups its stub, with a bolt-shank clearance up the centre and a
+ * head + hex-key access channel reachable from the top of the grip. */
+module handlePart() {
+    dia = handle[0];
+    H   = handle[1];
+    L   = driveBody[2];
+    multicolor("gray")
+    difference() {
+        union() {
+            // Grip rod across the top, along Y.
+            translate([0, 0, H]) rotate([-90, 0, 0]) cylinder(h = L, d = dia);
+            // Two support posts down to the base.
+            for (p = footXY()) translate([0, p[1], 0]) cylinder(h = H, d = dia);
+        }
+        for (p = footXY()) {
+            // Socket that cups the stub (with a little clearance).
+            translate([0, p[1], -0.1])
+                cylinder(h = handleStubH + 0.6, d = handleStubDia + 0.6);
+            // Bolt-shank clearance up to the head seat.
+            translate([0, p[1], 0])
+                cylinder(h = handleHeadZ + 0.1, d = handleBoltDia + 0.8);
+            // Head + hex-key access channel up through the grip.
+            translate([0, p[1], handleHeadZ])
+                cylinder(h = H + dia, d = handleBoltHead);
+        }
+    }
 }
 
 // =============================================================================
@@ -293,9 +374,13 @@ module positive() {
             linear_extrude(plugin[4] + wallThickness)
                 square([outerW, wallThickness * 2]);
 
-        // Carry handle across the top.
-        translate([outerW / 2, 0, totalZ + handle[1]]) rotate([0, 90, 90])
-            handle(driveBody[2], handle[0], handle[1]);
+        // Carry handle across the top: fused for a one-piece print, or short
+        // bolt-on stubs for the split print.
+        if (part == "all")
+            translate([outerW / 2, 0, totalZ + handle[1]]) rotate([0, 90, 90])
+                handle(driveBody[2], handle[0], handle[1]);
+        else
+            handleStubs();
     }
 }
 
@@ -308,6 +393,9 @@ module negative() {
         psu(zPSU);
         inlet();
         weazleMount();
+
+        // Bolt pilots down through the handle stubs (split print only).
+        if (part != "all") handleStubPilots();
     }
 }
 
@@ -315,7 +403,15 @@ module negative() {
 //  BUILD
 // =============================================================================
 
-difference() {
-    positive();
-    negative();
+if (part == "handle") {
+    // Laid on its side so the whole U prints flat, no supports.
+    rotate([0, -90, 0]) handlePart();
+} else {
+    difference() {
+        positive();
+        negative();
+    }
+    // Show the handle bolted on (visual check only — never printed as one).
+    if (part == "preview")
+        translate([outerW / 2, 0, totalZ]) handlePart();
 }
