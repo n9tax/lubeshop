@@ -1471,10 +1471,17 @@ impl App {
             Ok(()) => {
                 let size = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
                 let needs_format = self.create_driver.needs_format();
+                // Record the physical gw disk format for CP/M diskdefs that map to
+                // one (hard-sectored NorthStar/Micropolis), so Send-to-Gotek can
+                // encode the disk through gw rather than failing hxcfe.
+                let gw_format = needs_format
+                    .then(|| formats::gw_format_for_cpm_diskdef(&self.create_option))
+                    .flatten()
+                    .map(str::to_string);
                 let item = NewMediaItem {
                     kind: MediaKind::Image,
                     path: path.to_string_lossy().into_owned(),
-                    format: None,
+                    format: gw_format,
                     system: Some(self.create_driver.label().to_string()),
                     size_bytes: size,
                     sha256: gwm_core::util::sha256_file(&path).ok(),

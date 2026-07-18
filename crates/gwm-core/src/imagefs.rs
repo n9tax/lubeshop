@@ -287,8 +287,27 @@ fn cpm_command(prog: &str) -> Command {
     cmd
 }
 
+/// Full raw-disk size in bytes for a cpmtools diskdef (tracks × sectrk × seclen),
+/// or `None` when the geometry isn't known.
+pub fn diskdef_bytes(name: &str) -> Option<u64> {
+    diskdef_table().get(name).and_then(|g| {
+        (g.tracks > 0 && g.sectrk > 0 && g.seclen > 0)
+            .then(|| g.tracks as u64 * g.sectrk as u64 * g.seclen as u64)
+    })
+}
+
 /// Create a new, blank CP/M image formatted for the given diskdef.
+///
+/// `mkfs.cpm` writes only the boot + directory area, leaving a short file (~15 KB
+/// for a 175 KB disk) — fine for cpmtools, but useless as a real disk (nothing to
+/// convert to a Gotek image, wrong free-space map). So pre-create the full disk
+/// surface filled with CP/M's empty byte (`0xE5`); `mkfs.cpm` preserves the size
+/// and just lays the directory into it.
 pub fn cpm_mkfs(format: &str, image: &Path) -> Result<()> {
+    if let Some(bytes) = diskdef_bytes(format) {
+        std::fs::write(image, vec![0xE5u8; bytes as usize])
+            .map_err(|e| CoreError::Tool(format!("could not pre-size the CP/M image: {e}")))?;
+    }
     let mut cmd = cpm_command("mkfs.cpm");
     cmd.args(["-f", format]).arg(image);
     run(cmd).map(|_| ())
@@ -1382,9 +1401,14 @@ impl FsKind {
 
     /// Default file extension for a newly created image of this kind. For
     /// Commodore the extension is the disk type itself (d64/d71/d81).
+    ///
+    /// CP/M images use `.img`, not `.cpm`: both `gw convert` and `hxcfe` pick
+    /// their reader from the file suffix and reject an unknown one ("Unrecognised
+    /// file suffix"), which broke Send-to-Gotek. cpmtools reads by content +
+    /// diskdef, so the generic suffix costs it nothing.
     pub fn default_extension(self, option: &str) -> &'static str {
         match self {
-            FsKind::Cpm => "cpm",
+            FsKind::Cpm => "img",
             FsKind::Fat => "img",
             FsKind::Cbm => match option {
                 "d71" => "d71",

@@ -299,6 +299,19 @@ pub fn default_extension(format: &str) -> &'static str {
     }
 }
 
+/// The gw disk format that physically matches a cpmtools diskdef, for the
+/// hard-sectored CP/M disks hxcfe can't build from a raw sector image. Stored on
+/// a newly created CP/M image so "Send to Gotek" can route it through
+/// `gw convert` (the only reliable path for NorthStar/Micropolis geometries).
+/// `None` for the many soft-sectored diskdefs hxcfe handles directly.
+pub fn gw_format_for_cpm_diskdef(diskdef: &str) -> Option<&'static str> {
+    match diskdef {
+        "mdsad175" => Some("northstar.mfm.ss"), // NorthStar MDS-A-D, single-sided
+        "mdsad350" => Some("northstar.mfm.ds"), // NorthStar MDS-A-D, double-sided
+        _ => None,
+    }
+}
+
 /// Practical track (cylinder) count for a standard disk of `format`, used to seed
 /// the read-options track range (`0 .. count-1`). Values follow greaseweazle's
 /// diskdefs, **except `commodore.1541`**: its diskdef spans 40 cylinders but a
@@ -409,6 +422,13 @@ pub fn decoded_container_ext(fmt: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpm_diskdef_maps_to_northstar_gw_format() {
+        assert_eq!(gw_format_for_cpm_diskdef("mdsad175"), Some("northstar.mfm.ss"));
+        assert_eq!(gw_format_for_cpm_diskdef("mdsad350"), Some("northstar.mfm.ds"));
+        assert_eq!(gw_format_for_cpm_diskdef("osborne"), None); // soft-sectored → hxcfe
+    }
 
     #[test]
     fn cylinder_counts_use_practical_1541_value() {
