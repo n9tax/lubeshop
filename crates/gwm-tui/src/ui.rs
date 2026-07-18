@@ -147,19 +147,23 @@ fn para(lines: Vec<Line<'static>>) -> Paragraph<'static> {
     Paragraph::new(lines).style(base())
 }
 
-/// The `gw` status badge — green with the version when usable, red otherwise.
-fn gw_badge(app: &App) -> Span<'static> {
-    if app.core.gw.available {
-        Span::styled(
-            format!(" gw: {} ", app.core.gw.version.as_deref().unwrap_or("ok")),
-            Style::default().fg(Color::Black).bg(theme().success),
-        )
-    } else {
-        Span::styled(
+/// The upper-right badges: the running Lube Shop version, plus a red warning
+/// when `gw` is unavailable (the working version isn't shown — the user only
+/// needs to know when it's *missing*, since the app degrades gracefully).
+fn header_badges(app: &App) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if !app.core.gw.available {
+        spans.push(Span::styled(
             " gw: unavailable ",
             Style::default().fg(Color::White).bg(theme().danger),
-        )
+        ));
+        spans.push(Span::raw(" "));
     }
+    spans.push(Span::styled(
+        format!(" Lube Shop {} ", env!("CARGO_PKG_VERSION")),
+        Style::default().fg(Color::Black).bg(theme().success),
+    ));
+    spans
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -170,8 +174,8 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Title centred; the `gw` status badge lives at the right of the same line,
-    // freeing the whole footer for command hints.
+    // Title centred; the version / status badges live at the right of the same
+    // line, freeing the whole footer for command hints.
     let title = Paragraph::new(Line::from(vec![
         Span::styled("The Lube Shop", accented()),
         Span::styled("  ·  Greaseweazle disk imaging", dim()),
@@ -180,7 +184,7 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     .alignment(Alignment::Center);
     frame.render_widget(title, inner);
 
-    let badge = Paragraph::new(Line::from(gw_badge(app)))
+    let badge = Paragraph::new(Line::from(header_badges(app)))
         .style(base())
         .alignment(Alignment::Right);
     frame.render_widget(badge, inner);
@@ -2002,7 +2006,13 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
             Screen::DrivePicker => "  ↑/↓ move · Enter select · Esc back",
             Screen::NameInput => "  type a name · Enter start · Esc back",
             Screen::ReadOptions => "  Space/h toggle hard-sectors · Enter continue · Esc back",
-            Screen::Reading => "  reading… please wait",
+            Screen::Reading => {
+                if app.read_job.as_ref().is_some_and(|j| j.cancelled) {
+                    "  stopping… waiting for gw to exit"
+                } else {
+                    "  reading… · Esc or c to cancel"
+                }
+            }
             Screen::ReadDone => "  Enter return to menu",
             Screen::WriteSource => "  ↑/↓ move · Enter select · Esc back",
             Screen::WriteConfirm => "  y write · e toggle erase · Esc cancel",

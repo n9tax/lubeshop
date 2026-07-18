@@ -742,7 +742,8 @@ impl App {
             Screen::ReadOptions => self.on_read_options_key(code),
             Screen::WriteSource => self.on_write_source_key(code),
             Screen::WriteConfirm => self.on_write_confirm_key(code),
-            Screen::Reading | Screen::Writing => {} // run to completion; Ctrl+C quits
+            Screen::Reading => self.on_reading_key(code),
+            Screen::Writing => {} // destructive — runs to completion; Ctrl+C quits
             Screen::ReadDone | Screen::WriteDone => self.on_done_key(code),
             Screen::Settings => self.on_settings_key(code, mods),
             Screen::DriverPicker => self.on_driver_key(code),
@@ -3435,13 +3436,29 @@ impl App {
         self.screen = Screen::Reading;
     }
 
+    /// Reading screen: reads are non-destructive, so Esc (or `c`) aborts safely.
+    fn on_reading_key(&mut self, code: KeyCode) {
+        if matches!(code, KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C')) {
+            if let Some(job) = self.read_job.as_mut() {
+                if !job.cancelled {
+                    job.request_cancel();
+                    self.notice = Some("Cancelling read…".to_string());
+                }
+            }
+        }
+    }
+
     fn finalize_read(&mut self) {
         let outcome = {
             let job = match self.read_job.as_ref() {
                 Some(job) => job,
                 None => return,
             };
-            if job.succeeded() {
+            if job.cancelled {
+                // Drop the partial capture; a cancelled read isn't a device error.
+                let _ = std::fs::remove_file(&job.out_path);
+                Err("Read cancelled.".to_string())
+            } else if job.succeeded() {
                 let size = std::fs::metadata(&job.out_path)
                     .map(|m| m.len() as i64)
                     .unwrap_or(0);

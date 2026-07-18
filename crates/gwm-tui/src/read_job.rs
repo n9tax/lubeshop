@@ -5,11 +5,13 @@
 //! [`ReadJob::pump`] each frame so the render loop never blocks on the device.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::thread;
 
 use gwm_core::device::{build_read_args, recalibrate};
-use gwm_core::read::{run_read, ReadEvent};
+use gwm_core::read::{run_read_cancellable, ReadEvent};
 
 enum ReadMsg {
     Event(ReadEvent),
@@ -31,16 +33,23 @@ pub struct ReadJob {
     pub summary: Option<(u32, u32, u32)>,
     pub failed: Option<String>,
     pub finished: bool,
+    /// Set when the user asks to stop the read; the worker's `gw` is killed and
+    /// no retry is attempted. Kept so the outcome can be reported as cancelled
+    /// rather than a device failure.
+    pub cancelled: bool,
+    cancel: Arc<AtomicBool>,
 }
 
 impl ReadJob {
     /// Spawn the worker and return the initial job state.
     pub fn start(format: String, drive: String, hard_sectors: bool, out_path: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
 
         let worker_format = format.clone();
         let worker_drive = drive.clone();
         let worker_out = out_path.to_string_lossy().into_owned();
+        let worker_cancel = Arc::clone(&cancel);
         thread::spawn(move || {
             let args =
                 build_read_args(&worker_format, &worker_drive, None, hard_sectors, &worker_out);
@@ -49,7 +58,7 @@ impl ReadJob {
             // can recalibrate and retry once (see the test-rig notes).
             let mut saw_track = false;
             let mut track0_fail = false;
-            let first = run_read(&args, |event| {
+            let first = run_read_cancellable(&args, Arc::clone(&worker_cancel), |event| {
                 match &event {
                     ReadEvent::Track { .. } => saw_track = true,
                     ReadEvent::Failed(msg) if msg.contains("Track 0") => track0_fail = true,
@@ -58,12 +67,14 @@ impl ReadJob {
                 let _ = tx.send(ReadMsg::Event(event));
             });
 
-            if track0_fail && !saw_track {
+            // Don't retry a read the user cancelled — the "Track 0 not found"
+            // that killing gw can produce is not a real idle-drive miss.
+            if track0_fail && !saw_track && !worker_cancel.load(Ordering::Relaxed) {
                 let _ = tx.send(ReadMsg::Note(
                     "Track 0 not found — recalibrating and retrying…".to_string(),
                 ));
                 let _ = recalibrate(&worker_drive);
-                let retry = run_read(&args, |event| {
+                let retry = run_read_cancellable(&args, Arc::clone(&worker_cancel), |event| {
                     let _ = tx.send(ReadMsg::Event(event));
                 });
                 let _ = tx.send(ReadMsg::Finished(retry.map(|_| ()).map_err(|e| e.to_string())));
@@ -85,7 +96,16 @@ impl ReadJob {
             summary: None,
             failed: None,
             finished: false,
+            cancelled: false,
+            cancel,
         }
+    }
+
+    /// Ask the worker to stop: kills the running `gw` and prevents a retry. The
+    /// job still finishes through [`pump`](Self::pump) once the child exits.
+    pub fn request_cancel(&mut self) {
+        self.cancelled = true;
+        self.cancel.store(true, Ordering::Relaxed);
     }
 
     /// Drain all pending messages. Returns `true` on the frame the job finishes.

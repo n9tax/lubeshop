@@ -97,8 +97,21 @@ pub fn parse_read_line(raw: &str) -> Option<ReadEvent> {
 /// [`ReadEvent`]. Blocking: intended to run on a worker thread that forwards
 /// events to the UI over a channel. Returns the process exit code (unreliable
 /// for success — inspect the events instead).
-pub fn run_read<F: FnMut(ReadEvent)>(args: &[String], mut on_event: F) -> std::io::Result<Option<i32>> {
-    crate::proc::run_streaming(args, |line| {
+pub fn run_read<F: FnMut(ReadEvent)>(args: &[String], on_event: F) -> std::io::Result<Option<i32>> {
+    run_read_cancellable(
+        args,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        on_event,
+    )
+}
+
+/// Like [`run_read`], but abortable: flip `cancel` to stop the read mid-track.
+pub fn run_read_cancellable<F: FnMut(ReadEvent)>(
+    args: &[String],
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut on_event: F,
+) -> std::io::Result<Option<i32>> {
+    crate::proc::run_streaming_cancellable(args, cancel, |line| {
         if let Some(event) = parse_read_line(line) {
             on_event(event);
         }
