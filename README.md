@@ -1,5 +1,7 @@
 # The Lube Shop
 
+Check us out on youtube! https://youtu.be/Va4r2dRQHZY
+
 A friendly terminal app for the [Greaseweazle](https://github.com/keirf/greaseweazle)
 floppy reader/writer — and a manager for your growing pile of disk images.
 
