@@ -18,3 +18,7 @@ Cargo.lock.orig
 /VIDEO_SCRIPT.md
 # Internal port/handoff working docs — kept locally, not shipped
 /docs/
+
+# Local disk-image test artifacts — not part of the repo
+*.d64
+*.dsk
