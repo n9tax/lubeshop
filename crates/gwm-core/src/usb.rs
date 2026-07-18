@@ -357,8 +357,8 @@ mod tests {
 
     // `parse_diskutil_block` isn't macOS-gated, so it unit-tests on any host. The
     // sample below mirrors a real `diskutil info` block for a USB FAT32 stick;
-    // the field set/spelling still wants a spot-check on a real Mac (see
-    // docs/MACOS-PORT.md) since diskutil's labels drift between macOS versions.
+    // the field set/spelling still wants a spot-check on a real Mac since
+    // diskutil's labels drift between macOS versions.
     #[test]
     fn parses_diskutil_block_for_removable_fat_volume() {
         // A USB FAT32 stick mounted at /Volumes/GOTEK.

@@ -16,3 +16,5 @@ Cargo.lock.orig
 /GW-TUI_Notes
 /CLAUDE.md
 /VIDEO_SCRIPT.md
+# Internal port/handoff working docs — kept locally, not shipped
+/docs/
