@@ -41,8 +41,16 @@ pub struct ReadJob {
 }
 
 impl ReadJob {
-    /// Spawn the worker and return the initial job state.
-    pub fn start(format: String, drive: String, hard_sectors: bool, out_path: PathBuf) -> Self {
+    /// Spawn the worker and return the initial job state. `tracks` is the
+    /// `--tracks` spec (from `device::read_tracks_arg`), or `None` for the
+    /// format default.
+    pub fn start(
+        format: String,
+        drive: String,
+        hard_sectors: bool,
+        tracks: Option<String>,
+        out_path: PathBuf,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -51,8 +59,14 @@ impl ReadJob {
         let worker_out = out_path.to_string_lossy().into_owned();
         let worker_cancel = Arc::clone(&cancel);
         thread::spawn(move || {
-            let args =
-                build_read_args(&worker_format, &worker_drive, None, hard_sectors, &worker_out);
+            let args = build_read_args(
+                &worker_format,
+                &worker_drive,
+                None,
+                hard_sectors,
+                tracks.as_deref(),
+                &worker_out,
+            );
 
             // First attempt. Watch for the idle-drive "Track 0 not found" so we
             // can recalibrate and retry once (see the test-rig notes).

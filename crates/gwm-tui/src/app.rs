@@ -27,13 +27,17 @@ use crate::file_browser::FileBrowser;
 use crate::install_job::InstallJob;
 use crate::net_job::{NetJob, NetRequest, NetResult};
 use crate::read_job::ReadJob;
+use crate::rpm_job::RpmJob;
 use crate::text_input::TextInput;
 use crate::theme::{self, Theme};
 use crate::write_job::WriteJob;
 
-pub const MENU_ITEMS: [&str; 8] = [
+pub const MENU_ITEMS: [&str; 11] = [
     "Read a disk",
     "Write a disk",
+    "Reset the device",
+    "Test drive RPM",
+    "Clean drive",
     "Library",
     "New image",
     "Import from archive.org",
@@ -43,7 +47,7 @@ pub const MENU_ITEMS: [&str; 8] = [
 ];
 
 /// Rows on the settings screen.
-pub const SETTINGS_ROWS: usize = 5;
+pub const SETTINGS_ROWS: usize = 4;
 
 /// A tunable Greaseweazle drive-delay parameter, matching a `gw delays --<name>`.
 pub struct TuneParam {
@@ -82,6 +86,7 @@ pub enum Screen {
     Library,
     LibraryConfirmDelete,
     LibraryRename,
+    LibraryMove,
     EditNotes,
     NewFolder,
     FormatPicker,
@@ -212,6 +217,11 @@ pub struct App {
     pub lib_filtering: bool,
     pub lib_subpath: PathBuf,
     pub rename_input: TextInput,
+    /// Folder-move picker state: candidate destination folders, the (scrolling)
+    /// cursor, and the (id, old path, file name) of the item being moved.
+    pub move_targets: Vec<PathBuf>,
+    pub move_state: ListState,
+    move_item: Option<(i64, String, String)>,
     pub notes_input: TextInput,
     notes_id: i64,
     pub folder_input: TextInput,
@@ -228,11 +238,21 @@ pub struct App {
     pub drive_index: usize,
     pub name_input: TextInput,
     pub read_hard_sectors: bool,
+    /// Read-options screen: selected row, start/end cylinder overrides (`None` =
+    /// format default), and double-step for a 48 TPI disk in a 96 TPI drive.
+    pub read_opt_row: usize,
+    pub read_track_start: Option<u32>,
+    pub read_track_end: Option<u32>,
+    pub read_double_step: bool,
 
     pub chosen_format: String,
     pub chosen_drive: String,
 
     pub read_job: Option<ReadJob>,
+    /// Background `gw rpm` measurement, and the last reading shown next to the
+    /// "Test drive RPM" menu item (kept after the job clears).
+    pub rpm_job: Option<RpmJob>,
+    pub rpm_result: Option<String>,
     pub read_outcome: Option<Result<String, String>>,
 
     pub write_state: ListState,
@@ -318,6 +338,9 @@ pub struct App {
     pub text_scroll: usize,
     pub text_rows: usize,
     pub text_dirty: bool,
+    /// True for a derived, non-editable view (e.g. a detokenised BASIC listing):
+    /// navigation only, no edits or save.
+    pub text_readonly: bool,
     /// The file-in-image being edited (write-back target).
     text_entry: Option<FileEntry>,
     /// The extracted temp file the edited bytes are written back through.
@@ -402,6 +425,9 @@ impl App {
             lib_filtering: false,
             lib_subpath: PathBuf::new(),
             rename_input: TextInput::new(),
+            move_targets: Vec::new(),
+            move_state: ListState::default(),
+            move_item: None,
             notes_input: TextInput::new(),
             notes_id: 0,
             folder_input: TextInput::new(),
@@ -414,9 +440,15 @@ impl App {
             drive_index: 0,
             name_input: TextInput::new(),
             read_hard_sectors: false,
+            read_opt_row: 0,
+            read_track_start: None,
+            read_track_end: None,
+            read_double_step: false,
             chosen_format: String::new(),
             chosen_drive: String::new(),
             read_job: None,
+            rpm_job: None,
+            rpm_result: None,
             read_outcome: None,
             write_state: ListState::default(),
             write_erase: false,
@@ -478,6 +510,7 @@ impl App {
             text_scroll: 0,
             text_rows: 0,
             text_dirty: false,
+            text_readonly: false,
             text_entry: None,
             text_temp: PathBuf::new(),
             text_confirm_discard: false,
@@ -565,6 +598,20 @@ impl App {
                 job.pump(&mut self.tool_versions);
                 if !job.is_done() {
                     self.version_job = Some(job);
+                }
+            }
+
+            // A drive-RPM measurement completes in the background so the menu
+            // stays responsive; fold its result into the menu note when it lands.
+            if let Some(mut job) = self.rpm_job.take() {
+                if job.pump() {
+                    self.rpm_result = Some(match job.result {
+                        Some(Ok(rpm)) => format!("{rpm:.1} RPM"),
+                        Some(Err(e)) => format!("failed: {e}"),
+                        None => "no reading".to_string(),
+                    });
+                } else {
+                    self.rpm_job = Some(job);
                 }
             }
 
@@ -734,6 +781,7 @@ impl App {
             Screen::Library => self.on_library_key(code, mods),
             Screen::LibraryConfirmDelete => self.on_library_delete_key(code),
             Screen::LibraryRename => self.on_library_rename_key(code, mods),
+            Screen::LibraryMove => self.on_library_move_key(code),
             Screen::EditNotes => self.on_edit_notes_key(code, mods),
             Screen::NewFolder => self.on_new_folder_key(code, mods),
             Screen::FormatPicker => self.on_format_key(code, mods),
@@ -1871,7 +1919,6 @@ impl App {
                 }
                 2 => self.cycle_default_drive(1),
                 3 => self.enter_drive_tuning(),
-                4 => self.start_clean(),
                 _ => {}
             },
             _ => {}
@@ -2293,19 +2340,59 @@ impl App {
             KeyCode::Enter => match self.menu_index {
                 0 => self.enter_read_flow(),
                 1 => self.enter_write_flow(),
-                2 => self.enter_library(),
-                3 => self.enter_create_flow(),
-                4 => self.enter_archive(),
-                5 => self.enter_tools(),
-                6 => {
+                2 => self.reset_device(),
+                3 => self.test_rpm(),
+                4 => self.start_clean(),
+                5 => self.enter_library(),
+                6 => self.enter_create_flow(),
+                7 => self.enter_archive(),
+                8 => self.enter_tools(),
+                9 => {
                     self.settings_index = 0;
                     self.settings_editing = false;
                     self.screen = Screen::Settings;
                 }
-                7 => self.should_quit = true,
+                10 => self.should_quit = true,
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// Reset the attached Greaseweazle to power-on defaults (`gw reset`). Quick
+    /// and non-destructive to any disk, so it runs inline with a status notice.
+    fn reset_device(&mut self) {
+        if !self.gw_ready() {
+            return;
+        }
+        self.notice = Some(match gwm_core::device::reset() {
+            Ok(()) => "Greaseweazle reset to power-on defaults.".to_string(),
+            Err(e) => format!("gw reset failed: {e}"),
+        });
+    }
+
+    /// Kick off a background `gw rpm` measurement of the default drive. The menu
+    /// shows "testing…" next to the item until the reading replaces it.
+    fn test_rpm(&mut self) {
+        if !self.gw_ready() {
+            return;
+        }
+        if self.rpm_job.is_some() {
+            return; // already measuring
+        }
+        self.rpm_result = None;
+        self.rpm_job = Some(RpmJob::start(self.core.settings.default_drive.clone()));
+    }
+
+    /// Text shown next to the "Test drive RPM" menu item: nothing until first
+    /// used, then "testing…", then the reading or a short error.
+    pub fn rpm_menu_note(&self) -> Option<String> {
+        if self.rpm_job.is_some() {
+            return Some("testing…".to_string());
+        }
+        match self.rpm_result.as_deref() {
+            Some(text) => Some(text.to_string()),
+            None => None,
         }
     }
 
@@ -2520,6 +2607,11 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Right => self.library_open_selected(),
             KeyCode::Char('/') => self.lib_filtering = true,
+            // Shift+M moves the selected file into a folder. Terminals encode it
+            // as either `Char('M')` or `Char('m')`+SHIFT, so accept both before
+            // the bare `m` (new folder) arm below.
+            KeyCode::Char('M') => self.enter_library_move(),
+            KeyCode::Char('m') if mods.contains(KeyModifiers::SHIFT) => self.enter_library_move(),
             KeyCode::Char('m') => {
                 self.folder_input.set(String::new());
                 self.screen = Screen::NewFolder;
@@ -2635,13 +2727,34 @@ impl App {
         };
         bytes.truncate(MAX);
         let fs = self.browse_driver;
-        let doc = gwm_core::textedit::TextDoc::open(&bytes, gwm_core::textedit::codec_for_fs(fs));
-        self.text_lines = doc.lines.iter().map(|l| l.chars().collect()).collect();
+        // A Commodore program file is tokenised BASIC, not text — showing raw
+        // bytes is line-link/token noise. When it parses as BASIC, show a
+        // read-only LISTing instead; otherwise fall back to the text editor.
+        let listing = (fs == FsKind::Cbm)
+            .then(|| gwm_core::cbm_basic::detokenize(&bytes))
+            .flatten();
+        let (lines, eol, trailing, readonly, title) = match listing {
+            Some(text) => (
+                text.lines().map(|l| l.chars().collect()).collect(),
+                gwm_core::textedit::Eol::Lf,
+                true,
+                true,
+                format!("{title}  ·  BASIC listing (read-only)"),
+            ),
+            None => {
+                let doc =
+                    gwm_core::textedit::TextDoc::open(&bytes, gwm_core::textedit::codec_for_fs(fs));
+                let lines = doc.lines.iter().map(|l| l.chars().collect()).collect();
+                (lines, doc.eol(), doc.trailing_newline(), false, title)
+            }
+        };
+        self.text_readonly = readonly;
+        self.text_lines = lines;
         if self.text_lines.is_empty() {
             self.text_lines.push(Vec::new());
         }
-        self.text_eol = doc.eol();
-        self.text_trailing = doc.trailing_newline();
+        self.text_eol = eol;
+        self.text_trailing = trailing;
         self.text_fs = fs;
         self.text_title = title;
         self.text_return = Screen::Browse;
@@ -2657,7 +2770,7 @@ impl App {
 
     fn on_text_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         if mods.contains(KeyModifiers::CONTROL) {
-            if code == KeyCode::Char('s') {
+            if code == KeyCode::Char('s') && !self.text_readonly {
                 self.text_save();
             }
             return;
@@ -2718,14 +2831,14 @@ impl App {
                 self.text_row = (self.text_row + step).min(last);
                 self.text_col = self.text_col.min(self.text_lines[self.text_row].len());
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if !self.text_readonly => {
                 let tail = self.text_lines[self.text_row].split_off(self.text_col);
                 self.text_lines.insert(self.text_row + 1, tail);
                 self.text_row += 1;
                 self.text_col = 0;
                 self.text_dirty = true;
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if !self.text_readonly => {
                 if self.text_col > 0 {
                     self.text_lines[self.text_row].remove(self.text_col - 1);
                     self.text_col -= 1;
@@ -2738,7 +2851,7 @@ impl App {
                     self.text_dirty = true;
                 }
             }
-            KeyCode::Delete => {
+            KeyCode::Delete if !self.text_readonly => {
                 if self.text_col < self.text_lines[self.text_row].len() {
                     self.text_lines[self.text_row].remove(self.text_col);
                     self.text_dirty = true;
@@ -2748,12 +2861,12 @@ impl App {
                     self.text_dirty = true;
                 }
             }
-            KeyCode::Tab => {
+            KeyCode::Tab if !self.text_readonly => {
                 self.text_lines[self.text_row].insert(self.text_col, '\t');
                 self.text_col += 1;
                 self.text_dirty = true;
             }
-            KeyCode::Char(c) if is_typing(mods) => {
+            KeyCode::Char(c) if is_typing(mods) && !self.text_readonly => {
                 self.text_lines[self.text_row].insert(self.text_col, c);
                 self.text_col += 1;
                 self.text_dirty = true;
@@ -3187,6 +3300,144 @@ impl App {
         self.screen = Screen::Library;
     }
 
+    /// Destination folders a file may be moved into: the store root plus every
+    /// catalogued or empty sub-folder (foreign tool/junk folders are hidden, same
+    /// as the library view), minus `exclude` (the file's current folder). Sorted
+    /// with the root first, then by relative path.
+    fn move_target_dirs(&self, exclude: Option<&Path>) -> Vec<PathBuf> {
+        let root = self.core.paths.library_dir.clone();
+        let image_dirs = self.catalogued_dirs();
+        let mut out = Vec::new();
+        if exclude != Some(root.as_path()) {
+            out.push(root.clone());
+        }
+        // Walk sub-folders with a depth cap, matching library.rs's bounded scan.
+        let mut stack = vec![(root.clone(), 0u32)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth >= 8 {
+                continue;
+            }
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || (dir == root && name == "originals") {
+                    continue;
+                }
+                // Only offer folders that lead to catalogued images or are empty,
+                // so unpacked tools and source trees don't clutter the picker.
+                let catalogued = image_dirs.contains(&path);
+                if (catalogued || dir_is_empty(&path)) && Some(path.as_path()) != exclude {
+                    out.push(path.clone());
+                }
+                if catalogued {
+                    stack.push((path, depth + 1)); // empty folders have nothing below
+                }
+            }
+        }
+        out.sort_by_key(|p| p.strip_prefix(&root).unwrap_or(p).to_string_lossy().to_lowercase());
+        out
+    }
+
+    /// Human label for a destination folder: the store root, or its path relative
+    /// to the root.
+    fn move_target_label(&self, dir: &Path) -> String {
+        match dir.strip_prefix(&self.core.paths.library_dir) {
+            Ok(rel) if rel.as_os_str().is_empty() => "the store root".to_string(),
+            Ok(rel) => format!("“{}”", rel.to_string_lossy()),
+            Err(_) => dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Name of the file being moved, for the move picker's header.
+    pub fn move_item_name(&self) -> Option<&str> {
+        self.move_item.as_ref().map(|(_, _, name)| name.as_str())
+    }
+
+    /// Display string for a destination folder row in the move picker.
+    pub fn move_target_display(&self, dir: &Path) -> String {
+        match dir.strip_prefix(&self.core.paths.library_dir) {
+            Ok(rel) if rel.as_os_str().is_empty() => "⌂  store root".to_string(),
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_) => dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn enter_library_move(&mut self) {
+        let Some((id, path, name)) = self.selected_library() else {
+            return;
+        };
+        let current = Path::new(&path).parent().map(Path::to_path_buf);
+        let targets = self.move_target_dirs(current.as_deref());
+        if targets.is_empty() {
+            self.notice =
+                Some("No other folder to move into — make one with “m” first.".to_string());
+            return;
+        }
+        self.move_item = Some((id, path, name));
+        self.move_targets = targets;
+        self.move_state.select(Some(0));
+        self.screen = Screen::LibraryMove;
+    }
+
+    fn on_library_move_key(&mut self, code: KeyCode) {
+        let count = self.move_targets.len();
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.move_item = None;
+                self.screen = Screen::Library;
+            }
+            KeyCode::Up | KeyCode::Char('k') => move_list(&mut self.move_state, count, -1),
+            KeyCode::Down | KeyCode::Char('j') => move_list(&mut self.move_state, count, 1),
+            KeyCode::Enter => self.do_move(),
+            _ => {}
+        }
+    }
+
+    fn do_move(&mut self) {
+        let Some((id, old_path, name)) = self.move_item.clone() else {
+            self.screen = Screen::Library;
+            return;
+        };
+        let Some(dest) = self
+            .move_state
+            .selected()
+            .and_then(|i| self.move_targets.get(i))
+            .cloned()
+        else {
+            self.screen = Screen::Library;
+            return;
+        };
+        let old = PathBuf::from(&old_path);
+        let new_path = dest.join(&name);
+        if new_path == old {
+            self.screen = Screen::Library;
+            return;
+        }
+        if new_path.exists() {
+            self.notice = Some("A file with that name already exists there.".to_string());
+        } else {
+            match std::fs::rename(&old, &new_path) {
+                Ok(()) => {
+                    let _ = self.core.catalog.update_path(id, &new_path.to_string_lossy());
+                    // Don't leave the stale content sidecar behind in the old folder.
+                    let _ = std::fs::remove_file(old.with_extension("txt"));
+                    let _ = self.reload_library();
+                    let label = self.move_target_label(&dest);
+                    self.notice = Some(format!("Moved “{name}” to {label}"));
+                }
+                Err(err) => self.notice = Some(format!("Move failed: {err}")),
+            }
+        }
+        self.move_item = None;
+        self.screen = Screen::Library;
+    }
+
     fn on_format_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         // Editing a format's label takes over the keyboard until Enter/Esc.
         if self.format_editing.is_some() {
@@ -3316,8 +3567,16 @@ impl App {
                 self.chosen_drive = DRIVE_OPTIONS[self.drive_index].0.to_string();
                 match self.flow {
                     Flow::Read => {
-                        // Pre-tick hard-sectors for known hard-sectored formats.
+                        // Pre-tick hard-sectors for known hard-sectored formats;
+                        // seed the track range from the format's standard cylinder
+                        // count (so the fields show real numbers, not "default"),
+                        // clearing any override from a previous read.
                         self.read_hard_sectors = is_hard_sectored(&self.chosen_format);
+                        self.read_opt_row = 0;
+                        let cyls = formats::format_cylinders(&self.chosen_format);
+                        self.read_track_start = cyls.map(|_| 0);
+                        self.read_track_end = cyls.map(|c| c.saturating_sub(1));
+                        self.read_double_step = false;
                         self.screen = Screen::ReadOptions;
                     }
                     Flow::Write => self.screen = Screen::WriteConfirm,
@@ -3339,17 +3598,39 @@ impl App {
         }
     }
 
+    /// Rows on the read-options screen (in display order).
+    const READ_OPT_ROWS: usize = 4; // hard-sectored, start, end, double-step
+
     fn on_read_options_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => self.screen = Screen::DrivePicker,
-            KeyCode::Char('h') | KeyCode::Char(' ') | KeyCode::Tab => {
-                self.read_hard_sectors = !self.read_hard_sectors;
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.read_opt_row =
+                    self.read_opt_row.checked_sub(1).unwrap_or(Self::READ_OPT_ROWS - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                self.read_opt_row = (self.read_opt_row + 1) % Self::READ_OPT_ROWS;
             }
             KeyCode::Enter => {
                 let default = self.default_name();
                 self.name_input.set(default);
                 self.screen = Screen::NameInput;
             }
+            _ => self.adjust_read_opt(code),
+        }
+    }
+
+    /// Change the value on the selected read-options row.
+    fn adjust_read_opt(&mut self, code: KeyCode) {
+        let toggle = matches!(
+            code,
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right | KeyCode::Char('x')
+        );
+        match self.read_opt_row {
+            0 if toggle => self.read_hard_sectors = !self.read_hard_sectors,
+            1 => adjust_track(&mut self.read_track_start, code),
+            2 => adjust_track(&mut self.read_track_end, code),
+            3 if toggle => self.read_double_step = !self.read_double_step,
             _ => {}
         }
     }
@@ -3416,20 +3697,51 @@ impl App {
         format!("{}-{stamp}.{ext}", self.chosen_format.replace('.', "_"))
     }
 
-    fn start_read(&mut self) {
+    /// The output filename for the read (typed name, or the timestamped default).
+    fn read_out_name(&self) -> String {
         let name = self.name_input.text().trim().replace('/', "_");
-        let name = if name.is_empty() {
+        if name.is_empty() {
             self.default_name()
         } else {
             name
-        };
-        let out_path = self.lib_base().join(name);
+        }
+    }
+
+    /// The `--tracks` spec for the current read-options selection.
+    fn read_tracks(&self) -> Option<String> {
+        gwm_core::device::read_tracks_arg(
+            &self.chosen_format,
+            self.read_track_start,
+            self.read_track_end,
+            self.read_double_step,
+        )
+    }
+
+    /// The full `gw read …` command the current selections will run — shown on
+    /// the name screen for documentation / reproducibility.
+    pub fn read_command_preview(&self) -> String {
+        let out = self.lib_base().join(self.read_out_name());
+        let args = gwm_core::device::build_read_args(
+            &self.chosen_format,
+            &self.chosen_drive,
+            None,
+            self.read_hard_sectors,
+            self.read_tracks().as_deref(),
+            &out.to_string_lossy(),
+        );
+        format!("gw {}", args.join(" "))
+    }
+
+    fn start_read(&mut self) {
+        let out_path = self.lib_base().join(self.read_out_name());
         // Push saved drive-timing tuning to the device before reading.
         let _ = gwm_core::device::apply_delays(&self.core.settings.tuning);
+        let tracks = self.read_tracks();
         self.read_job = Some(ReadJob::start(
             self.chosen_format.clone(),
             self.chosen_drive.clone(),
             self.read_hard_sectors,
+            tracks,
             out_path,
         ));
         self.read_outcome = None;
@@ -3615,7 +3927,7 @@ impl App {
         let drive = self.core.settings.default_drive.clone();
         let label = format!("Cleaning drive {drive}");
         let cmd = format!("gw clean --drive={drive} 2>&1");
-        self.install_return = Screen::Settings;
+        self.install_return = Screen::Menu;
         self.install_job = Some(InstallJob::start(label, cmd));
         self.screen = Screen::Installing;
     }
@@ -3629,6 +3941,22 @@ impl App {
             }
             self.screen = self.install_return;
         }
+    }
+}
+
+/// Edit an optional cylinder override on the read-options screen. `None` means
+/// "format default": Right/typing sets a number, Left counts down to `None`, and
+/// Backspace/Del clears back to the default. Capped at 84 (max realistic cyls).
+fn adjust_track(value: &mut Option<u32>, code: KeyCode) {
+    match code {
+        KeyCode::Right => *value = Some(value.map_or(0, |n| (n + 1).min(84))),
+        KeyCode::Left => *value = value.and_then(|n| n.checked_sub(1)),
+        KeyCode::Backspace | KeyCode::Delete => *value = None,
+        KeyCode::Char(c) if c.is_ascii_digit() => {
+            let d = c as u32 - '0' as u32;
+            *value = Some((value.unwrap_or(0) * 10 + d).min(84));
+        }
+        _ => {}
     }
 }
 

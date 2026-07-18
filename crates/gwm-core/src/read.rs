@@ -137,7 +137,10 @@ fn parse_plan(line: &str) -> Option<ReadEvent> {
     let mut revs = 0;
     for token in rest.split_whitespace() {
         if let Some(v) = token.strip_prefix("revs=") {
-            revs = v.parse().ok()?;
+            // gw prints fractional revs for some formats (e.g. Commodore's
+            // "revs=1.1"); accept a float, and never let a bad revs value abort
+            // the whole plan — the track total comes from the cyl/head range.
+            revs = v.parse::<f64>().map(|f| f.round() as u32).unwrap_or(0);
         } else {
             for part in token.split(':') {
                 if let Some(r) = part.strip_prefix("c=") {
@@ -159,11 +162,13 @@ fn parse_plan(line: &str) -> Option<ReadEvent> {
     })
 }
 
-/// `T74.1: IBM MFM (17/18 sectors) ... (Retry #1.2)` or `T74.1: Giving up: 1 sectors missing`
+/// `T74.1: IBM MFM (17/18 sectors) ... (Retry #1.2)` or `T74.1: Giving up: 1 sectors missing`.
+/// Under double-step gw appends the physical location — `T5.0 <- Drive 10.0: …` —
+/// so the logical `cyl.head` is only the first whitespace-delimited token.
 fn parse_track(line: &str) -> Option<ReadEvent> {
     let rest = line.strip_prefix('T')?;
     let (loc, tail) = rest.split_once(':')?;
-    let (c, h) = loc.split_once('.')?;
+    let (c, h) = loc.split_whitespace().next()?.split_once('.')?;
     let cyl = c.trim().parse().ok()?;
     let head = h.trim().parse().ok()?;
     let tail = tail.trim();
@@ -235,6 +240,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_plan_with_fractional_revs_and_step() {
+        // Commodore prints fractional revs and, when double-stepping, a step
+        // token — neither must stop the track total from being computed.
+        let ev = parse_read_line("Reading c=0-34:h=0:step=2 revs=1.1").unwrap();
+        assert_eq!(
+            ev,
+            ReadEvent::Plan {
+                cyl_min: 0,
+                cyl_max: 34,
+                head_min: 0,
+                head_max: 0,
+                revs: 1
+            }
+        );
+        assert_eq!(ev.total_tracks(), Some(35));
+    }
+
+    #[test]
     fn parses_good_track() {
         let ev =
             parse_read_line("T0.0: IBM MFM (18/18 sectors) from Raw Flux (160386 flux in 400.79ms)");
@@ -245,6 +268,24 @@ mod tests {
                 head: 0,
                 got: 18,
                 total: 18,
+                retry: None
+            })
+        );
+    }
+
+    #[test]
+    fn parses_double_step_track() {
+        // With step=2 gw appends the physical drive location before the colon.
+        let ev = parse_read_line(
+            "T5.0 <- Drive 10.0: Commodore GCR (17/17 sectors) from Raw Flux (300000 flux in 200ms)",
+        );
+        assert_eq!(
+            ev,
+            Some(ReadEvent::Track {
+                cyl: 5,
+                head: 0,
+                got: 17,
+                total: 17,
                 retry: None
             })
         );

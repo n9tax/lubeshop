@@ -299,6 +299,36 @@ pub fn default_extension(format: &str) -> &'static str {
     }
 }
 
+/// Practical track (cylinder) count for a standard disk of `format`, used to seed
+/// the read-options track range (`0 .. count-1`). Values follow greaseweazle's
+/// diskdefs, **except `commodore.1541`**: its diskdef spans 40 cylinders but a
+/// standard 1541 disk is 35 tracks. `None` for formats we don't have a curated
+/// figure for — those fall back to gw's own default track set.
+pub fn format_cylinders(format: &str) -> Option<u32> {
+    let n = match format {
+        "commodore.1541" => 35, // diskdef says 40; real disks are 35 tracks
+        "commodore.1571" => 35,
+        "commodore.1581" => 80,
+        "amiga.amigados" | "amiga.amigados_hd" => 80,
+        "apple2.nofs.140" | "apple2.appledos.140" | "apple2.prodos.140" => 35,
+        "atari.90" | "atari.130" => 40,
+        "acorn.adfs.160" | "acorn.dfs.ss" | "acorn.dfs.ds" => 40,
+        "acorn.adfs.320" | "acorn.adfs.640" | "acorn.adfs.800" | "acorn.adfs.1600"
+        | "acorn.dfs.ss80" | "acorn.dfs.ds80" => 80,
+        "coco.decb" => 35,
+        "coco.decb.40t" | "coco.os9.40ss" | "coco.os9.40ds" => 40,
+        "coco.os9.80ss" | "coco.os9.80ds" => 80,
+        "ibm.160" | "ibm.180" | "ibm.320" | "ibm.360" => 40,
+        "ibm.720" | "ibm.800" | "ibm.1200" | "ibm.1440" | "ibm.1680" | "ibm.dmf"
+        | "ibm.2880" => 80,
+        "msx.1d" | "msx.2d" => 40,
+        "msx.1dd" | "msx.2dd" => 80,
+        _ if format.starts_with("atarist.") => 80,
+        _ => return None,
+    };
+    Some(n)
+}
+
 /// Disk-image file suffixes (without the leading dot), recognised when scanning
 /// the storage folder. Parsed once from `gw read --help`'s "Supported file
 /// suffixes:" section, with a built-in fallback, plus `cpm`.
@@ -379,6 +409,15 @@ pub fn decoded_container_ext(fmt: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cylinder_counts_use_practical_1541_value() {
+        assert_eq!(format_cylinders("commodore.1541"), Some(35)); // not the diskdef's 40
+        assert_eq!(format_cylinders("ibm.1440"), Some(80));
+        assert_eq!(format_cylinders("ibm.360"), Some(40));
+        assert_eq!(format_cylinders("atarist.720"), Some(80)); // prefix match
+        assert_eq!(format_cylinders("some.unknown.format"), None);
+    }
 
     #[test]
     fn parses_suffixes_and_strips_dots() {

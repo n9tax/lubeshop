@@ -6,6 +6,7 @@
 
 pub mod archive;
 pub mod catalog;
+pub mod cbm_basic;
 pub mod cbm_disk;
 pub mod convert;
 pub mod device;

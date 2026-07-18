@@ -68,16 +68,15 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Paint the whole surface in the theme background first.
     frame.render_widget(Block::default().style(base()), area);
 
-    // The bottom bar is one line for a key hint, but a notice can be long (e.g.
-    // an install link), so grow it enough to wrap the whole message instead of
-    // running off the edge.
-    let status_h = match &app.notice {
-        Some(notice) => {
-            let w = area.width.saturating_sub(2).max(1) as usize;
-            (((notice.chars().count() + 2) / w) as u16 + 1).clamp(1, 5)
-        }
-        None => 1,
+    // The bottom bar is one line when the hint fits, but a long hint (crowded
+    // screens like Library/Browse) or a long notice (e.g. an install link) grows
+    // it enough to wrap the whole message instead of running off the edge.
+    let w = area.width.saturating_sub(2).max(1) as usize;
+    let status_chars = match &app.notice {
+        Some(notice) => notice.chars().count() + 2,
+        None => status_hint(app).chars().count(),
     };
+    let status_h = ((status_chars / w) as u16 + 1).clamp(1, 5);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -94,6 +93,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::Library => render_library(app, frame, chunks[1]),
         Screen::LibraryConfirmDelete => render_delete_confirm(app, frame, chunks[1]),
         Screen::LibraryRename => render_rename(app, frame, chunks[1]),
+        Screen::LibraryMove => render_library_move(app, frame, chunks[1]),
         Screen::EditNotes => render_edit_notes(app, frame, chunks[1]),
         Screen::NewFolder => render_new_folder(app, frame, chunks[1]),
         Screen::FormatPicker => render_format_picker(app, frame, chunks[1]),
@@ -147,23 +147,18 @@ fn para(lines: Vec<Line<'static>>) -> Paragraph<'static> {
     Paragraph::new(lines).style(base())
 }
 
-/// The upper-right badges: the running Lube Shop version, plus a red warning
-/// when `gw` is unavailable (the working version isn't shown — the user only
-/// needs to know when it's *missing*, since the app degrades gracefully).
+/// The upper-right badge: a red warning shown only when `gw` is unavailable.
+/// (The app degrades gracefully, so the user only needs to know when it's
+/// *missing* — the working version isn't worth the space.)
 fn header_badges(app: &App) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    if !app.core.gw.available {
-        spans.push(Span::styled(
+    if app.core.gw.available {
+        Vec::new()
+    } else {
+        vec![Span::styled(
             " gw: unavailable ",
             Style::default().fg(Color::White).bg(theme().danger),
-        ));
-        spans.push(Span::raw(" "));
+        )]
     }
-    spans.push(Span::styled(
-        format!(" Lube Shop {} ", env!("CARGO_PKG_VERSION")),
-        Style::default().fg(Color::Black).bg(theme().success),
-    ));
-    spans
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -178,6 +173,7 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     // line, freeing the whole footer for command hints.
     let title = Paragraph::new(Line::from(vec![
         Span::styled("The Lube Shop", accented()),
+        Span::styled(format!(" {}", env!("CARGO_PKG_VERSION")), dim()),
         Span::styled("  ·  Greaseweazle disk imaging", dim()),
     ]))
     .style(base())
@@ -197,7 +193,14 @@ fn render_menu(app: &App, frame: &mut Frame, area: Rect) {
         .map(|(i, label)| {
             let selected = i == app.menu_index;
             let (marker, style) = if selected { ("▸ ", hl()) } else { ("  ", base()) };
-            ListItem::new(Line::from(Span::styled(format!("{marker}{label}"), style)))
+            let mut spans = vec![Span::styled(format!("{marker}{label}"), style)];
+            // The RPM item carries a live "testing…"/result note beside its label.
+            if *label == "Test drive RPM" {
+                if let Some(note) = app.rpm_menu_note() {
+                    spans.push(Span::styled(format!("   {note}"), dim()));
+                }
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     frame.render_widget(List::new(items).style(base()).block(bordered("Main Menu")), area);
@@ -743,13 +746,45 @@ fn render_name_input(app: &App, frame: &mut Frame, area: Rect) {
             Span::raw(target.to_string_lossy().into_owned()),
         ]),
         Line::from(""),
+        Line::from(Span::styled("  Command that will run:", dim())),
+        Line::from(Span::styled(
+            format!("  {}", app.read_command_preview()),
+            Style::default().fg(theme().accent),
+        )),
+        Line::from(""),
         Line::from(Span::styled("  Enter to start reading · Esc to go back", dim())),
     ];
-    frame.render_widget(para(lines).block(bordered("Name the image")), area);
+    frame.render_widget(
+        para(lines).wrap(Wrap { trim: false }).block(bordered("Name the image")),
+        area,
+    );
 }
 
 fn render_read_options(app: &App, frame: &mut Frame, area: Rect) {
-    let toggle = if app.read_hard_sectors { "[x]" } else { "[ ]" };
+    // One selectable option row: a left marker, label, and its value.
+    let row = |sel: bool, label: &str, value: Vec<Span<'static>>| -> Line<'static> {
+        let marker = if sel { "▸ " } else { "  " };
+        let label_style = if sel { accented() } else { base() };
+        let mut spans = vec![Span::styled(format!("{marker}{label:<22}"), label_style)];
+        spans.extend(value);
+        Line::from(spans)
+    };
+    let check = |on: bool| -> Vec<Span<'static>> {
+        vec![Span::styled(
+            if on { "[x]" } else { "[ ]" },
+            Style::default().fg(theme().accent),
+        )]
+    };
+    let track = |v: Option<u32>| -> Vec<Span<'static>> {
+        vec![Span::styled(
+            match v {
+                Some(n) => n.to_string(),
+                None => "default".to_string(),
+            },
+            Style::default().add_modifier(Modifier::BOLD),
+        )]
+    };
+
     let lines = vec![
         Line::from(""),
         Line::from(vec![
@@ -759,25 +794,32 @@ fn render_read_options(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled(app.chosen_drive.clone(), Style::default().add_modifier(Modifier::BOLD)),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(format!("  {toggle} "), Style::default().fg(theme().accent)),
-            Span::styled(
-                "Hard-sectored disk",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("   (Space/h to toggle)", dim()),
-        ]),
+        row(app.read_opt_row == 0, "Hard-sectored disk", check(app.read_hard_sectors)),
+        row(app.read_opt_row == 1, "Start track", track(app.read_track_start)),
+        row(app.read_opt_row == 2, "End track", track(app.read_track_end)),
+        row(app.read_opt_row == 3, "Double-step (48→96 TPI)", check(app.read_double_step)),
         Line::from(""),
         Line::from(Span::styled(
-            "  Turn on for NorthStar, Micropolis and other disks with physical",
+            "  Hard-sectored: NorthStar/Micropolis disks with physical sector holes.",
             dim(),
         )),
         Line::from(Span::styled(
-            "  sector holes (passes --hard-sectors to gw).",
+            "  Start/End track: 0-based cylinder range; leave at default unless a disk",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "  is odd. Double-step reads a 48 TPI disk in a 96 TPI (80-track) drive;",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "  it defaults to a 40-track disk (0–39) — set End for other sizes.",
             dim(),
         )),
         Line::from(""),
-        Line::from(Span::styled("  Enter to continue · Esc to go back", dim())),
+        Line::from(Span::styled(
+            "  ↑/↓ row · ←/→ or type to change · Space toggle · Enter continue · Esc back",
+            dim(),
+        )),
     ];
     frame.render_widget(para(lines).block(bordered("Read options")), area);
 }
@@ -1026,10 +1068,6 @@ fn render_settings(app: &App, frame: &mut Frame, area: Rect) {
         ("Store folder (all data)", storage),
         ("Default drive", drive),
         ("Drive tuning (gw delays)", tuning),
-        (
-            "Clean drive (zig-zag)",
-            format!("drive {} — Enter to run", app.core.settings.default_drive),
-        ),
     ];
 
     let mut lines = vec![Line::from("")];
@@ -1156,6 +1194,34 @@ fn render_tuning_profiles(app: &App, frame: &mut Frame, area: Rect) {
         List::new(items).style(base()).block(bordered("Recall timing profile")),
         area,
     );
+}
+
+fn render_library_move(app: &mut App, frame: &mut Frame, area: Rect) {
+    let name = app.move_item_name().unwrap_or("this image").to_string();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(
+        para(vec![Line::from(Span::styled(format!("  Move “{name}” into:"), dim()))]),
+        rows[0],
+    );
+
+    let items: Vec<ListItem> = app
+        .move_targets
+        .iter()
+        .map(|dir| {
+            ListItem::new(Line::from(Span::styled(
+                app.move_target_display(dir),
+                Style::default().add_modifier(Modifier::BOLD),
+            )))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(bordered("Move to folder"))
+        .highlight_style(hl())
+        .highlight_symbol("▸ ");
+    frame.render_stateful_widget(list, rows[1], &mut app.move_state);
 }
 
 fn render_driver_picker(app: &App, frame: &mut Frame, area: Rect) {
@@ -1966,12 +2032,20 @@ fn render_archive_downloading(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_status(app: &App, frame: &mut Frame, area: Rect) {
-    let hint = if let Some(notice) = &app.notice {
-        Span::styled(format!("  {notice}"), Style::default().fg(theme().warning))
-    } else {
-        let text = match app.screen {
+    let hint = match &app.notice {
+        Some(notice) => Span::styled(format!("  {notice}"), Style::default().fg(theme().warning)),
+        None => Span::raw(status_hint(app)),
+    };
+    frame.render_widget(para(vec![Line::from(hint)]).wrap(Wrap { trim: false }), area);
+}
+
+/// The bottom-bar key hint for the current screen. Its own function so the
+/// layout can measure it and size the status bar to however many lines it wraps
+/// to (a terminal has no smaller font to shrink a long hint into).
+fn status_hint(app: &App) -> &'static str {
+    match app.screen {
             Screen::Menu => "  ↑/↓ move · Enter select · q quit",
-            Screen::Library => "  ↑/↓ · Enter open · b browse · g →Gotek · f format · h hex · n notes · r rename · d del",
+            Screen::Library => "  ↑/↓ · Enter open · b browse · g →Gotek · f format · h hex · n notes · r rename · M move · d del",
             Screen::GotekFormat => "  ↑/↓ choose format · Enter continue · Esc cancel",
             Screen::GotekDrive => {
                 if app.gotek_drives.is_empty() {
@@ -1986,7 +2060,11 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
             Screen::GotekDone => "  Enter to return",
             Screen::NewFolder => "  type name · Enter create · Esc cancel",
             Screen::TextEdit => {
-                "  arrows move · type to edit · Enter/Backspace/Del · Ctrl-S save · Esc leave"
+                if app.text_readonly {
+                    "  arrows/PgUp/PgDn move · read-only listing · Esc back"
+                } else {
+                    "  arrows move · type to edit · Enter/Backspace/Del · Ctrl-S save · Esc leave"
+                }
             }
             Screen::HexView => {
                 if app.hex_edit {
@@ -1999,13 +2077,16 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
             }
             Screen::LibraryConfirmDelete => "  y confirm · f toggle file · Esc cancel",
             Screen::LibraryRename => "  type name · Enter rename · Esc cancel",
+            Screen::LibraryMove => "  ↑/↓ pick folder · Enter move · Esc cancel",
             Screen::EditNotes => "  type notes · Enter save · Esc cancel",
             Screen::FormatPicker => {
                 "  type to filter · ↑/↓ · Enter pick · Ctrl+E edit label · Esc back"
             }
             Screen::DrivePicker => "  ↑/↓ move · Enter select · Esc back",
             Screen::NameInput => "  type a name · Enter start · Esc back",
-            Screen::ReadOptions => "  Space/h toggle hard-sectors · Enter continue · Esc back",
+            Screen::ReadOptions => {
+                "  ↑/↓ row · ←/→ or type to change · Space toggle · Enter continue · Esc back"
+            }
             Screen::Reading => {
                 if app.read_job.as_ref().is_some_and(|j| j.cancelled) {
                     "  stopping… waiting for gw to exit"
@@ -2057,11 +2138,7 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
                 "  ↑/↓ move · Enter download (images import · zips unpack · loose files → clipboard) · Esc back"
             }
             Screen::ArchiveDownloading => "  downloading… please wait",
-        };
-        Span::raw(text)
-    };
-
-    frame.render_widget(para(vec![Line::from(hint)]).wrap(Wrap { trim: false }), area);
+    }
 }
 
 #[cfg(test)]
@@ -2094,8 +2171,8 @@ mod render_smoke {
         use gwm_core::archive::{RemoteFile, SearchHit};
         let mut app = App::new(Core::init().unwrap());
 
-        // Menu → "Import from archive.org" (index 4) → search screen.
-        for _ in 0..4 {
+        // Menu → "Import from archive.org" (index 7) → search screen.
+        for _ in 0..7 {
             app.test_key(KeyCode::Down, KeyModifiers::NONE);
         }
         app.test_key(KeyCode::Enter, KeyModifiers::NONE);

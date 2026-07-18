@@ -10,6 +10,7 @@ mod gotek_job;
 mod install_job;
 mod net_job;
 mod read_job;
+mod rpm_job;
 mod text_input;
 mod theme;
 mod ui;
