@@ -149,23 +149,26 @@ echo "Installed atr to ~/.local/bin"
 "#,
 };
 
-/// xdt99 (xdm99): the TI-99 disk manager is a set of co-located Python scripts,
-/// not a pip package. Clone the repo and drop a launcher that runs `xdm99.py`
-/// from there, so its `from xcommon import …` sibling resolves (Python puts the
-/// script's own dir on the path). Needs `python3`, already present wherever gw
-/// (also Python) runs.
+/// xdt99 (xdm99 + xhm99): the TI-99 disk manager and HFE tool are co-located
+/// Python scripts, not a pip package. Clone the repo and drop launchers that run
+/// them from there, so their `from xcommon import …` sibling resolves (Python
+/// puts the script's own dir on the path). `xdm99` browses `.dsk` images; `xhm99`
+/// converts `.dsk` <-> HFE for the physical read/write path. Needs `python3`,
+/// already present wherever gw (also Python) runs.
 const XDT99: Recipe = Recipe {
     prereqs: &[Prereq::Git],
     steps: r#"
 share="$HOME/.local/share/lubeshop"
 rm -rf "$share/xdt99"; mkdir -p "$share" "$HOME/.local/bin"
 git clone --depth 1 https://github.com/endlos99/xdt99 "$share/xdt99"
-cat > "$HOME/.local/bin/xdm99" <<'WRAP'
+for t in xdm99 xhm99; do
+  cat > "$HOME/.local/bin/$t" <<WRAP
 #!/bin/sh
-exec python3 "$HOME/.local/share/lubeshop/xdt99/xdm99.py" "$@"
+exec python3 "\$HOME/.local/share/lubeshop/xdt99/$t.py" "\$@"
 WRAP
-chmod +x "$HOME/.local/bin/xdm99"
-echo "Installed xdm99 to ~/.local/bin"
+  chmod +x "$HOME/.local/bin/$t"
+done
+echo "Installed xdm99 and xhm99 to ~/.local/bin"
 "#,
 };
 

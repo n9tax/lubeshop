@@ -273,11 +273,13 @@ pub fn build_read_args(
     tracks: Option<&str>,
     out_path: &str,
 ) -> Vec<String> {
-    let mut args = vec![
-        "read".to_string(),
-        format!("--format={format}"),
-        format!("--drive={drive}"),
-    ];
+    let mut args = vec!["read".to_string()];
+    // An empty format means a container that carries its own encoding (HFE for
+    // the TI-99 path) — gw needs no `--format` then, and adding one would fail.
+    if !format.is_empty() {
+        args.push(format!("--format={format}"));
+    }
+    args.push(format!("--drive={drive}"));
     // Restrict which cylinders are read. Callers pass the result of
     // `read_tracks_arg`, which supplies the per-format default (e.g. the 1541's
     // 35-track cap) or the user's start/end/double-step overrides.
@@ -296,11 +298,13 @@ pub fn build_read_args(
 
 /// Build the argument vector for `gw write`.
 pub fn build_write_args(format: &str, drive: &str, erase: bool, in_path: &str) -> Vec<String> {
-    let mut args = vec![
-        "write".to_string(),
-        format!("--format={format}"),
-        format!("--drive={drive}"),
-    ];
+    let mut args = vec!["write".to_string()];
+    // Empty format = a self-describing bitstream container (HFE for TI-99): gw
+    // writes the bits directly and needs no `--format`.
+    if !format.is_empty() {
+        args.push(format!("--format={format}"));
+    }
+    args.push(format!("--drive={drive}"));
     if erase {
         // Erase each track immediately before writing it. (Confirmed against
         // greaseweazle tools/write.py — the flag is --pre-erase, not --erase.)
@@ -379,6 +383,17 @@ mod tests {
         let args = build_read_args("amiga.amigados", "a", Some(3), false, None, "out.adf");
         assert!(args.iter().any(|a| a == "--revs=3"));
         assert_eq!(args.last().unwrap(), "out.adf");
+    }
+
+    #[test]
+    fn args_omit_format_when_empty() {
+        // The TI-99 HFE path passes no format; gw must not get a `--format` flag.
+        let r = build_read_args("", "0", None, false, None, "out.hfe");
+        assert_eq!(r[0], "read");
+        assert!(!r.iter().any(|a| a.starts_with("--format")));
+        let w = build_write_args("", "0", false, "in.hfe");
+        assert!(!w.iter().any(|a| a.starts_with("--format")));
+        assert_eq!(w.last().unwrap(), "in.hfe");
     }
 
     #[test]

@@ -16,6 +16,60 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::error::{CoreError, Result};
+
+// ---- TI-99: V9T9 .dsk <-> HFE via xhm99 ----------------------------------
+//
+// gw reads/writes HFE bitstreams directly (no `--format` needed), but can't turn
+// a raw TI-99 sector image into one. `xhm99` (xdt99) does that conversion, so the
+// physical TI-99 path is: write = `.dsk` -> HFE (here) -> `gw write`; read =
+// `gw read` -> HFE -> `.dsk` (here).
+
+pub fn xhm99_available() -> bool {
+    crate::tools::installed("xhm99")
+}
+
+/// Convert a V9T9 `.dsk` sector image to an HFE bitstream (`xhm99 -T`).
+pub fn dsk_to_hfe(dsk: &Path, hfe: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(hfe);
+    run_xhm99(&["-T", &dsk.to_string_lossy(), "-o", &hfe.to_string_lossy()])?;
+    nonempty(hfe, "HFE conversion produced no output")
+}
+
+/// Convert an HFE bitstream back to a V9T9 `.dsk` sector image (`xhm99 -F`).
+pub fn hfe_to_dsk(hfe: &Path, dsk: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(dsk);
+    run_xhm99(&["-F", &hfe.to_string_lossy(), "-o", &dsk.to_string_lossy()])?;
+    nonempty(dsk, "disk conversion produced no output")
+}
+
+fn run_xhm99(args: &[&str]) -> Result<()> {
+    let out = Command::new("xhm99")
+        .args(args)
+        .output()
+        .map_err(|e| CoreError::Tool(format!("xhm99 could not run: {e}")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let msg = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("xhm99 failed");
+    Err(CoreError::Tool(format!("TI-99 HFE conversion failed: {msg}")))
+}
+
+fn nonempty(path: &Path, err: &str) -> Result<()> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() > 0 => Ok(()),
+        _ => Err(CoreError::Tool(err.to_string())),
+    }
+}
 use crate::proc;
 
 /// Run `gw convert IN OUT --format=FMT`. The conversion *direction* (flux→image
