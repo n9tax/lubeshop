@@ -143,6 +143,7 @@ fn tool_index_for_driver(driver: FsKind) -> Option<usize> {
         FsKind::Cbm => "c1541",
         FsKind::Amiga => "xdftool",
         FsKind::Apple => "applecommander-ac",
+        FsKind::Ti99 => "xdm99",
         FsKind::Trs => return None,
     };
     gwm_core::tools::TOOLS.iter().position(|t| t.cmd == cmd)

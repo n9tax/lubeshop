@@ -22,3 +22,5 @@ Cargo.lock.orig
 # Local disk-image test artifacts — not part of the repo
 *.d64
 *.dsk
+# Local test-image folders
+/tempTI99Images/

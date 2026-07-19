@@ -1213,6 +1213,121 @@ fn parse_ac_json(text: &str) -> Option<(u64, u64, Vec<FileEntry>)> {
     Some((used, free, files))
 }
 
+// ---- TI-99/4A: xdm99 (from the xdt99 toolkit) ----------------------------
+
+pub fn xdm99_available() -> bool {
+    have("xdm99")
+}
+
+/// Create a blank, formatted TI-99 disk of a standard geometry (SSSD/DSSD/DSDD)
+/// via `xdm99 -X`. The volume name comes from the file stem.
+pub fn ti99_mkfs(geometry: &str, image: &Path) -> Result<()> {
+    let mut cmd = Command::new("xdm99");
+    cmd.arg(image).arg("-X").arg(geometry);
+    run(cmd).map(|_| ())
+}
+
+/// TI-99/4A disks via `xdm99` — V9T9 `.dsk` sector images.
+pub struct Ti99Fs;
+
+impl Ti99Fs {
+    pub fn new() -> Self {
+        Ti99Fs
+    }
+}
+
+impl Default for Ti99Fs {
+    fn default() -> Self {
+        Ti99Fs::new()
+    }
+}
+
+impl ImageFs for Ti99Fs {
+    fn list(&self, image: &Path) -> Result<Vec<FileEntry>> {
+        let mut cmd = Command::new("xdm99");
+        cmd.arg(image);
+        Ok(parse_xdm99(&run(cmd)?))
+    }
+
+    fn extract(&self, image: &Path, entry: &FileEntry, dest: &Path) -> Result<()> {
+        let mut cmd = Command::new("xdm99");
+        cmd.arg(image).arg("-e").arg(&entry.name).arg("-o").arg(dest);
+        run(cmd).map(|_| ())
+    }
+
+    fn insert(&self, image: &Path, src: &Path, name: &str, _user: u8) -> Result<()> {
+        let mut cmd = Command::new("xdm99");
+        cmd.arg(image).arg("-a").arg(src).arg("-n").arg(name);
+        run(cmd).map(|_| ())
+    }
+
+    fn delete(&self, image: &Path, entry: &FileEntry) -> Result<()> {
+        let mut cmd = Command::new("xdm99");
+        cmd.arg(image).arg("-d").arg(&entry.name);
+        run(cmd).map(|_| ())
+    }
+
+    fn usage(&self, image: &Path) -> Result<FsUsage> {
+        let mut cmd = Command::new("xdm99");
+        cmd.arg(image);
+        parse_xdm99_usage(&run(cmd)?)
+            .ok_or_else(|| CoreError::Tool("could not read image capacity".to_string()))
+    }
+}
+
+/// Parse an `xdm99` catalog. The header and a dashed rule precede the files;
+/// each file row is a fixed 10-char name column followed by whitespace-separated
+/// `sectors type <n> B date time flags`.
+fn parse_xdm99(text: &str) -> Vec<FileEntry> {
+    let mut entries = Vec::new();
+    let mut in_files = false;
+    for line in text.lines() {
+        if line.starts_with("---") {
+            in_files = true;
+            continue;
+        }
+        if !in_files || line.trim().is_empty() || line.len() < 10 {
+            continue;
+        }
+        let name = line[..10].trim_end().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let rest: Vec<&str> = line[10..].split_whitespace().collect();
+        let sectors: u64 = rest.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        // Prefer the exact byte size ("<n> B" / "<n> KB"); fall back to sectors.
+        let size = xdm99_size(&rest).unwrap_or(sectors * 256);
+        entries.push(FileEntry { name, size, user: 0 });
+    }
+    entries
+}
+
+/// Find a `<number> B|KB` pair in the tokens and return it in bytes.
+fn xdm99_size(tokens: &[&str]) -> Option<u64> {
+    tokens.windows(2).find_map(|w| {
+        let n: u64 = w[0].parse().ok()?;
+        match w[1] {
+            "B" => Some(n),
+            "KB" => Some(n * 1024),
+            _ => None,
+        }
+    })
+}
+
+/// Used/free space from the catalog header, e.g. `NAME  :  27 used  333 free …`
+/// (sector counts → bytes at 256 B/sector).
+fn parse_xdm99_usage(text: &str) -> Option<FsUsage> {
+    let tokens: Vec<&str> = text.lines().next()?.split_whitespace().collect();
+    let before = |key: &str| -> Option<u64> {
+        let pos = tokens.iter().position(|t| *t == key)?;
+        tokens.get(pos.checked_sub(1)?)?.parse().ok()
+    };
+    Some(FsUsage {
+        used: before("used")? * 256,
+        free: before("free")? * 256,
+    })
+}
+
 /// A named option for creating a blank image (a diskdef, a size, a type…).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateOption {
@@ -1229,6 +1344,7 @@ pub enum FsKind {
     Trs,
     Amiga,
     Apple,
+    Ti99,
 }
 
 impl FsKind {
@@ -1239,6 +1355,7 @@ impl FsKind {
         FsKind::Trs,
         FsKind::Amiga,
         FsKind::Apple,
+        FsKind::Ti99,
     ];
 
     pub fn id(self) -> &'static str {
@@ -1249,6 +1366,7 @@ impl FsKind {
             FsKind::Trs => "trs",
             FsKind::Amiga => "amiga",
             FsKind::Apple => "apple",
+            FsKind::Ti99 => "ti99",
         }
     }
 
@@ -1264,6 +1382,7 @@ impl FsKind {
             FsKind::Trs => "TRS-80 · DMK / TRSDOS",
             FsKind::Amiga => "Amiga · ADF/HDF  (xdftool)",
             FsKind::Apple => "Apple II · DOS 3.3 / ProDOS  (AppleCommander)",
+            FsKind::Ti99 => "TI-99/4A · V9T9 DSK  (xdm99)",
         }
     }
 
@@ -1276,6 +1395,7 @@ impl FsKind {
             FsKind::Trs => "TRS-80",
             FsKind::Amiga => "Amiga",
             FsKind::Apple => "Apple II",
+            FsKind::Ti99 => "TI-99",
         }
     }
 
@@ -1288,6 +1408,7 @@ impl FsKind {
             FsKind::Trs => true,
             FsKind::Amiga => xdftool_available(),
             FsKind::Apple => applecommander_available(),
+            FsKind::Ti99 => xdm99_available(),
         }
     }
 
@@ -1306,7 +1427,8 @@ impl FsKind {
     pub fn browse_formats(self) -> Vec<String> {
         match self {
             FsKind::Cpm => cpm_formats(),
-            FsKind::Fat | FsKind::Cbm | FsKind::Trs | FsKind::Amiga | FsKind::Apple => Vec::new(),
+            FsKind::Fat | FsKind::Cbm | FsKind::Trs | FsKind::Amiga | FsKind::Apple
+            | FsKind::Ti99 => Vec::new(),
         }
     }
 
@@ -1321,6 +1443,9 @@ impl FsKind {
             FsKind::Trs => &["dmk"],
             FsKind::Amiga => &["adf", "hdf", "adz"],
             FsKind::Apple => &["po", "do", "2mg", "nib"],
+            // TI-99 images are `.dsk` (shared with Apple/TRS), so the user picks
+            // the driver rather than it being auto-detected from the extension.
+            FsKind::Ti99 => &[],
         }
     }
 
@@ -1342,6 +1467,7 @@ impl FsKind {
             FsKind::Trs => Box::new(TrsFs::new()),
             FsKind::Amiga => Box::new(AmigaFs::new()),
             FsKind::Apple => Box::new(AppleFs::new()),
+            FsKind::Ti99 => Box::new(Ti99Fs::new()),
         }
     }
 
@@ -1394,6 +1520,17 @@ impl FsKind {
                 label: label.to_string(),
             })
             .collect(),
+            FsKind::Ti99 => [
+                ("SSSD", "90 KB — single-sided (40T)"),
+                ("DSSD", "180 KB — double-sided (40T)"),
+                ("DSDD", "360 KB — double-sided DD (40T)"),
+            ]
+            .iter()
+            .map(|(id, label)| CreateOption {
+                id: id.to_string(),
+                label: label.to_string(),
+            })
+            .collect(),
             // No creation presets (no native TRSDOS formatter yet).
             FsKind::Trs => Vec::new(),
         }
@@ -1423,6 +1560,7 @@ impl FsKind {
                 "dos140" => "dsk",
                 _ => "po",
             },
+            FsKind::Ti99 => "dsk",
         }
     }
 
@@ -1433,6 +1571,7 @@ impl FsKind {
             FsKind::Cbm => cbm_mkfs(option, path),
             FsKind::Amiga => amiga_mkfs(option, path),
             FsKind::Apple => apple_mkfs(option, path),
+            FsKind::Ti99 => ti99_mkfs(option, path),
             FsKind::Trs => Err(CoreError::Tool(
                 "creating TRS-80 images is not supported".to_string(),
             )),
@@ -1597,6 +1736,33 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0], FileEntry { name: "hello.txt".to_string(), size: 16, user: 0 });
         assert_eq!(entries[2], FileEntry { name: "data.bin".to_string(), size: 2048, user: 3 });
+    }
+
+    // Real `xdm99` catalog output (v3.5.2). The name column is 10 chars wide and
+    // can contain spaces ("LONG NAME9").
+    const XDM99_CATALOG: &str = "\
+DISK_001  :     27 used  333 free   90 KB  1S/1D 40T  9 S/T
+----------------------------------------------------------------------------
+BIGONE       21  PROGRAM       5000 B             2026-07-18 19:25:26 C
+LONG NAME9    2  PROGRAM         14 B             2026-07-18 19:25:26 C
+SHORT         2  PROGRAM          4 B             2026-07-18 19:25:26 C
+";
+
+    #[test]
+    fn parses_xdm99_catalog() {
+        let entries = parse_xdm99(XDM99_CATALOG);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], FileEntry { name: "BIGONE".into(), size: 5000, user: 0 });
+        // A space inside the 10-char name field is preserved.
+        assert_eq!(entries[1], FileEntry { name: "LONG NAME9".into(), size: 14, user: 0 });
+        assert_eq!(entries[2], FileEntry { name: "SHORT".into(), size: 4, user: 0 });
+    }
+
+    #[test]
+    fn parses_xdm99_usage() {
+        let u = parse_xdm99_usage(XDM99_CATALOG).unwrap();
+        assert_eq!(u.used, 27 * 256);
+        assert_eq!(u.free, 333 * 256);
     }
 
     #[test]
