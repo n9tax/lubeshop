@@ -101,6 +101,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::NameInput => render_name_input(app, frame, chunks[1]),
         Screen::ReadOptions => render_read_options(app, frame, chunks[1]),
         Screen::Reading | Screen::ReadDone => render_reading(app, frame, chunks[1]),
+        Screen::Ti99Transfer | Screen::Ti99Done => render_ti99(app, frame, chunks[1]),
         Screen::WriteSource => render_write_source(app, frame, chunks[1]),
         Screen::WriteConfirm => render_write_confirm(app, frame, chunks[1]),
         Screen::Writing | Screen::WriteDone => render_writing(app, frame, chunks[1]),
@@ -871,6 +872,77 @@ fn render_reading(app: &App, frame: &mut Frame, area: Rect) {
             lines.push(Line::from(Span::styled(format!("  {note}"), dim())));
         }
         frame.render_widget(para(lines).block(bordered("Activity")), rows[3]);
+    }
+}
+
+fn render_ti99(app: &App, frame: &mut Frame, area: Rect) {
+    use crate::ti99_job::Ti99Phase;
+    let Some(job) = app.ti99_job.as_ref() else {
+        return;
+    };
+    let done = app.screen == Screen::Ti99Done;
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let name = if job.write {
+        job.source_name.clone()
+    } else {
+        job.dsk.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    };
+    frame.render_widget(
+        para(vec![Line::from(vec![
+            Span::styled(format!("  TI-99 {} ", if job.write { "write" } else { "read" }), dim()),
+            Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("   Drive ", dim()),
+            Span::styled(job.drive.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        ])]),
+        rows[0],
+    );
+
+    let ratio = job.progress_ratio();
+    let label = match (job.phase, job.total_tracks) {
+        (Ti99Phase::Converting, _) => "converting disk ↔ HFE…".to_string(),
+        (Ti99Phase::Transferring, Some(total)) => {
+            format!("{}/{} tracks — {}%", job.done_tracks, total, (ratio * 100.0) as u16)
+        }
+        (Ti99Phase::Transferring, None) => format!("{} tracks…", job.done_tracks),
+    };
+    frame.render_widget(gauge(ratio, label), rows[1]);
+    frame.render_widget(para(vec![Line::from(format!("  {}", job.current))]), rows[2]);
+
+    if done {
+        let mut lines: Vec<Line> = Vec::new();
+        match &app.ti99_outcome {
+            Some(Ok(msg)) => lines.push(Line::from(Span::styled(
+                format!("  {CHECK} {msg}"),
+                Style::default().fg(theme().success).add_modifier(Modifier::BOLD),
+            ))),
+            Some(Err(msg)) => lines.push(Line::from(Span::styled(
+                format!("  ✗ {msg}"),
+                Style::default().fg(theme().danger),
+            ))),
+            None => {}
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  Enter to return to the menu", dim())));
+        frame.render_widget(para(lines).block(bordered("Done")), rows[3]);
+    } else {
+        frame.render_widget(
+            para(vec![Line::from(Span::styled(
+                "  HFE pipeline: gw transfers the bitstream, xhm99 converts dsk ↔ HFE.",
+                dim(),
+            ))])
+            .wrap(Wrap { trim: false })
+            .block(bordered("Activity")),
+            rows[3],
+        );
     }
 }
 
@@ -2099,6 +2171,8 @@ fn status_hint(app: &App) -> &'static str {
             Screen::WriteConfirm => "  y write · e toggle erase · Esc cancel",
             Screen::Writing => "  writing… please wait",
             Screen::WriteDone => "  Enter return to menu",
+            Screen::Ti99Transfer => "  TI-99 transfer… please wait",
+            Screen::Ti99Done => "  Enter return to menu",
             Screen::Settings => "  ↑/↓ row · ←/→ change · Enter edit/open · Esc back",
             Screen::DriveTuning => "  ↑/↓ select · ←/→ adjust · s save · l load · r reset · Esc back",
             Screen::TuningSaveName => "  type a name · Enter save · Esc cancel",

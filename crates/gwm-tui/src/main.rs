@@ -11,6 +11,7 @@ mod install_job;
 mod net_job;
 mod read_job;
 mod rpm_job;
+mod ti99_job;
 mod text_input;
 mod theme;
 mod ui;

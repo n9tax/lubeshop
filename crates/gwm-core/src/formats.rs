@@ -68,7 +68,14 @@ pub fn system_for_format(format: &str) -> &'static str {
 /// *fallback* text — the front-end lets the user override any label and persists
 /// the correction. Guesses are deliberately conservative and note when they're
 /// unsure by echoing unrecognised tokens verbatim.
+/// Sentinel "format" for the TI-99 physical read/write path. Not a real gw
+/// format — it routes read/write through the HFE + xhm99 pipeline instead.
+pub const TI99: &str = "ti99";
+
 pub fn describe_format(format: &str) -> String {
+    if format == TI99 {
+        return "TI-99/4A — physical read/write (via HFE)".to_string();
+    }
     if let Some(text) = curated_description(format) {
         return text.to_string();
     }
@@ -295,6 +302,7 @@ pub fn default_extension(format: &str) -> &'static str {
         "atarist" => "st",
         "commodore" => "d64",
         "acorn" => "ssd",
+        "ti99" => "dsk", // TI-99 physical path produces/consumes V9T9 .dsk
         _ => "img",
     }
 }
@@ -319,6 +327,7 @@ pub fn gw_format_for_cpm_diskdef(diskdef: &str) -> Option<&'static str> {
 /// figure for — those fall back to gw's own default track set.
 pub fn format_cylinders(format: &str) -> Option<u32> {
     let n = match format {
+        "ti99" => 40, // standard TI-99 disks are 40 tracks
         "commodore.1541" => 35, // diskdef says 40; real disks are 35 tracks
         "commodore.1571" => 35,
         "commodore.1581" => 80,

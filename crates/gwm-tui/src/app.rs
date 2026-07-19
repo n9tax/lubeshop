@@ -28,6 +28,7 @@ use crate::install_job::InstallJob;
 use crate::net_job::{NetJob, NetRequest, NetResult};
 use crate::read_job::ReadJob;
 use crate::rpm_job::RpmJob;
+use crate::ti99_job::Ti99Job;
 use crate::text_input::TextInput;
 use crate::theme::{self, Theme};
 use crate::write_job::WriteJob;
@@ -99,6 +100,9 @@ pub enum Screen {
     WriteConfirm,
     Writing,
     WriteDone,
+    /// TI-99 physical read/write (via the HFE + xhm99 pipeline).
+    Ti99Transfer,
+    Ti99Done,
     Settings,
     Browse,
     BrowseInput,
@@ -250,6 +254,9 @@ pub struct App {
     pub chosen_drive: String,
 
     pub read_job: Option<ReadJob>,
+    /// TI-99 physical read/write job (HFE pipeline), and its outcome.
+    pub ti99_job: Option<Ti99Job>,
+    pub ti99_outcome: Option<Result<String, String>>,
     /// Background `gw rpm` measurement, and the last reading shown next to the
     /// "Test drive RPM" menu item (kept after the job clears).
     pub rpm_job: Option<RpmJob>,
@@ -448,6 +455,8 @@ impl App {
             chosen_format: String::new(),
             chosen_drive: String::new(),
             read_job: None,
+            ti99_job: None,
+            ti99_outcome: None,
             rpm_job: None,
             rpm_result: None,
             read_outcome: None,
@@ -560,6 +569,11 @@ impl App {
                 Screen::Reading => {
                     if self.read_job.as_mut().map(ReadJob::pump).unwrap_or(false) {
                         self.finalize_read();
+                    }
+                }
+                Screen::Ti99Transfer => {
+                    if self.ti99_job.as_mut().map(Ti99Job::pump).unwrap_or(false) {
+                        self.finalize_ti99();
                     }
                 }
                 Screen::Writing => {
@@ -747,6 +761,14 @@ impl App {
                 .map(|i| i as i64)
                 .unwrap_or(i64::MAX)
         });
+        // Offer the TI-99 physical path in read/write (it isn't a gw format, and
+        // can't decode a flux master, so not in the Decode flow).
+        if self.flow != Flow::Decode {
+            let n = needle.as_str();
+            if n.is_empty() || "ti99".contains(n) || "ti-99".contains(n) {
+                matches.insert(0, formats::TI99);
+            }
+        }
         matches
     }
 
@@ -793,6 +815,14 @@ impl App {
             Screen::WriteConfirm => self.on_write_confirm_key(code),
             Screen::Reading => self.on_reading_key(code),
             Screen::Writing => {} // destructive — runs to completion; Ctrl+C quits
+            Screen::Ti99Transfer => {} // runs to completion
+            Screen::Ti99Done => {
+                if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                    self.ti99_job = None;
+                    self.ti99_outcome = None;
+                    self.screen = Screen::Menu;
+                }
+            }
             Screen::ReadDone | Screen::WriteDone => self.on_done_key(code),
             Screen::Settings => self.on_settings_key(code, mods),
             Screen::DriverPicker => self.on_driver_key(code),
@@ -3745,6 +3775,21 @@ impl App {
         // Push saved drive-timing tuning to the device before reading.
         let _ = gwm_core::device::apply_delays(&self.core.settings.tuning);
         let tracks = self.read_tracks();
+        // TI-99 has no gw sector format — read via the HFE + xhm99 pipeline.
+        if self.chosen_format == formats::TI99 {
+            let name = file_name(&out_path);
+            self.ti99_job = Some(Ti99Job::start(
+                false,
+                self.chosen_drive.clone(),
+                out_path,
+                name,
+                tracks,
+                false,
+            ));
+            self.ti99_outcome = None;
+            self.screen = Screen::Ti99Transfer;
+            return;
+        }
         self.read_job = Some(ReadJob::start(
             self.chosen_format.clone(),
             self.chosen_drive.clone(),
@@ -3754,6 +3799,55 @@ impl App {
         ));
         self.read_outcome = None;
         self.screen = Screen::Reading;
+    }
+
+    /// Finish a TI-99 physical read/write: catalog the freshly-read `.dsk`, or
+    /// report the write outcome.
+    fn finalize_ti99(&mut self) {
+        let Some(job) = self.ti99_job.as_ref() else {
+            return;
+        };
+        let outcome = if job.write {
+            if job.succeeded() {
+                Ok(format!("Wrote “{}” to the disk", job.source_name))
+            } else {
+                Err(job
+                    .failed
+                    .clone()
+                    .unwrap_or_else(|| "write did not complete".to_string()))
+            }
+        } else if job.succeeded() {
+            let size = std::fs::metadata(&job.dsk).map(|m| m.len() as i64).unwrap_or(0);
+            let item = NewMediaItem {
+                kind: MediaKind::Image,
+                path: job.dsk.to_string_lossy().into_owned(),
+                format: Some(formats::TI99.to_string()),
+                system: Some("TI-99/4A".to_string()),
+                size_bytes: size,
+                sha256: gwm_core::util::sha256_file(&job.dsk).ok(),
+                source: Source::Device,
+                remote_id: None,
+                tags: Vec::new(),
+                notes: Some("read via HFE".to_string()),
+                fs_format: None,
+                fs_driver: Some(FsKind::Ti99.id().to_string()),
+            };
+            match self.core.catalog.insert(&item) {
+                Ok(_) => Ok(file_name(&job.dsk)),
+                Err(err) => Err(format!("read succeeded but cataloging failed: {err}")),
+            }
+        } else {
+            let _ = std::fs::remove_file(&job.dsk);
+            Err(job
+                .failed
+                .clone()
+                .unwrap_or_else(|| "read did not complete".to_string()))
+        };
+        if outcome.is_ok() {
+            let _ = self.reload_library();
+        }
+        self.ti99_outcome = Some(outcome);
+        self.screen = Screen::Ti99Done;
     }
 
     /// Reading screen: reads are non-destructive, so Esc (or `c`) aborts safely.
@@ -3821,6 +3915,20 @@ impl App {
     // --- write lifecycle -------------------------------------------------
 
     fn start_write(&mut self) {
+        // TI-99: convert the .dsk to HFE, then gw-write the bitstream.
+        if self.chosen_format == formats::TI99 {
+            self.ti99_job = Some(Ti99Job::start(
+                true,
+                self.chosen_drive.clone(),
+                self.chosen_source.clone(),
+                self.chosen_source_name.clone(),
+                None,
+                self.write_erase,
+            ));
+            self.ti99_outcome = None;
+            self.screen = Screen::Ti99Transfer;
+            return;
+        }
         let in_path = self.chosen_source.to_string_lossy().into_owned();
         self.write_job = Some(WriteJob::start(
             self.chosen_format.clone(),
@@ -4143,6 +4251,8 @@ mod format_labels {
     fn label_editor_prefills_and_cancels_without_saving() {
         let mut app = App::new(Core::init().unwrap());
         app.formats = vec!["ibm.1440".to_string()];
+        // Decode flow so the read/write-only TI-99 entry isn't injected here.
+        app.flow = Flow::Decode;
         app.screen = Screen::FormatPicker;
         app.reset_format_selection();
 
