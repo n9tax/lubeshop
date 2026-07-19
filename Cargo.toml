@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/gwm-core", "crates/gwm-tui"]
 
 [workspace.package]
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
