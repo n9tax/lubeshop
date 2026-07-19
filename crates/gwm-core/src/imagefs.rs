@@ -1765,6 +1765,25 @@ SHORT         2  PROGRAM          4 B             2026-07-18 19:25:26 C
         assert_eq!(u.free, 333 * 256);
     }
 
+    // Real disks carry mixed file types whose type column contains spaces
+    // ("INT/FIX 128") and a record-length token before the "<n> B" size.
+    #[test]
+    fn parses_xdm99_varied_file_types() {
+        let text = "\
+DISK_001  :     54 used  1386 free   360 KB  2S/2D 40T  18 S/T
+----------------------------------------------------------------------------
+BIGDATA      48  PROGRAM      12000 B             2026-07-18 20:08:26 C
+INTFIXFILE    2  INT/FIX 128    128 B    1 recs   2026-07-18 20:08:26 C
+MYBASIC       2  DIS/VAR 80      25 B    2 recs   2026-07-18 20:08:26 C
+";
+        let e = parse_xdm99(text);
+        assert_eq!(e.len(), 3);
+        assert_eq!(e[0], FileEntry { name: "BIGDATA".into(), size: 12000, user: 0 });
+        // The record-length token doesn't get mistaken for the byte size.
+        assert_eq!(e[1], FileEntry { name: "INTFIXFILE".into(), size: 128, user: 0 });
+        assert_eq!(e[2], FileEntry { name: "MYBASIC".into(), size: 25, user: 0 });
+    }
+
     #[test]
     fn parses_mdir_columns_with_sizes() {
         let text = " Volume in drive : is DISK 1\n\
