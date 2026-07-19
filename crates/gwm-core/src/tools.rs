@@ -149,6 +149,26 @@ echo "Installed atr to ~/.local/bin"
 "#,
 };
 
+/// xdt99 (xdm99): the TI-99 disk manager is a set of co-located Python scripts,
+/// not a pip package. Clone the repo and drop a launcher that runs `xdm99.py`
+/// from there, so its `from xcommon import …` sibling resolves (Python puts the
+/// script's own dir on the path). Needs `python3`, already present wherever gw
+/// (also Python) runs.
+const XDT99: Recipe = Recipe {
+    prereqs: &[Prereq::Git],
+    steps: r#"
+share="$HOME/.local/share/lubeshop"
+rm -rf "$share/xdt99"; mkdir -p "$share" "$HOME/.local/bin"
+git clone --depth 1 https://github.com/endlos99/xdt99 "$share/xdt99"
+cat > "$HOME/.local/bin/xdm99" <<'WRAP'
+#!/bin/sh
+exec python3 "$HOME/.local/share/lubeshop/xdt99/xdm99.py" "$@"
+WRAP
+chmod +x "$HOME/.local/bin/xdm99"
+echo "Installed xdm99 to ~/.local/bin"
+"#,
+};
+
 /// HxC (hxcfe): build just the command-line converter (not the Qt GUI). On macOS
 /// the binary is linked with `-rpath,@executable_path/../lib`, so the two dylibs
 /// it depends on (`libhxcfe`, `libusbhxcfe`) have to sit in `~/.local/lib/` for
@@ -236,6 +256,7 @@ pub const TOOLS: &[Tool] = &[
     Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/amitools-win64.zip", dir: "xdftool" }, homepage: "https://github.com/cnvogelg/amitools" , version: None, probe: None },
     Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Build(APPLECOMMANDER), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/applecommander-win64.zip", dir: "applecommander-ac" }, homepage: "https://applecommander.github.io/" , version: Some("13.1"), probe: Some(VersionProbe { args: &[], marker: "options [" }) },
     Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), win: WinSource::Todo, homepage: "https://github.com/jhallen/atari-tools" , version: None, probe: None },
+    Tool { cmd: "xdm99", label: "xdt99 (xdm99)", purpose: "TI-99/4A disk images", source: Source::Build(XDT99), win: WinSource::Todo, homepage: "https://github.com/endlos99/xdt99" , version: None, probe: None },
     Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), win: WinSource::FromAuthor("https://hxc2001.com/download/floppy_drive_emulator/"), homepage: "https://hxc2001.com/floppy_drive_emulator/" , version: Some("2.16.13.1"), probe: Some(VersionProbe { args: &[], marker: "converter v" }) },
 ];
 
