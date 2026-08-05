@@ -17,22 +17,35 @@ release workflow (`.github/workflows/release.yml`) fires on version tags.
 
 ## Cutting a release
 
-**The version lives in `Cargo.toml`, not the git tag.** The `.deb` version comes
-from `[workspace.package].version`, while the tarballs are named from the tag — so
-if you tag `v0.1.1` without bumping `Cargo.toml`, the `.deb` still says `0.1.0` and
-they disagree. Use the helper script so they can't drift:
+**The version lives in `Cargo.toml`, not the git tag** — and in two other places
+that must agree with it. The `.deb` version comes from `[workspace.package].version`,
+the tarballs are named from the tag, and `packaging/PKGBUILD`'s `pkgver` decides
+*which tag's source* Arch users build. Tag `v0.1.1` without bumping `Cargo.toml`
+and the `.deb` still says `0.1.0`; leave `pkgver` behind and `makepkg -si` silently
+builds an old release. Use the helper script so they can't drift:
 
 ```sh
-packaging/release.sh 0.1.1     # bumps Cargo.toml, syncs Cargo.lock, commits, tags
+packaging/release.sh 0.1.1     # bumps Cargo.toml + PKGBUILD, syncs Cargo.lock,
+                               # commits, tags
 git push && git push origin v0.1.1
 ```
+
+It refuses to run on a dirty tree, and it *bumps then commits* — so don't bump the
+version by hand first, or its commit finds nothing to do and `set -e` aborts before
+tagging. If the version is already committed, skip the script and just tag:
+`git tag -a vX.Y.Z -m "Release X.Y.Z — headline"` (existing tags are annotated).
 
 <details><summary>Doing it by hand instead</summary>
 
 1. Set `version` in the root `Cargo.toml` (`[workspace.package]`).
-2. `cargo update --workspace` to sync `Cargo.lock` (keeps `--locked` builds happy).
-3. `git commit -am "Release vX.Y.Z"`, then `git tag vX.Y.Z`.
-4. `git push && git push origin vX.Y.Z`.
+2. Set `pkgver` in `packaging/PKGBUILD` to match, and reset `pkgrel=1`.
+3. `cargo update --workspace` to sync `Cargo.lock` (keeps `--locked` builds happy).
+4. `git commit -am "Release vX.Y.Z"`, then `git tag -a vX.Y.Z`.
+5. `git push && git push origin vX.Y.Z`.
+
+Step 2 is the one that gets forgotten — it was missed for three consecutive
+releases, leaving `pkgver` at 1.0.0 while the crate reached 1.0.4. Nothing errors
+when it's wrong; Arch users just quietly get an old version.
 
 </details>
 
@@ -92,7 +105,13 @@ To publish:
 5. Test locally: `makepkg -si`.
 6. Push `PKGBUILD` + `.SRCINFO` to an `aur/lubeshop` git remote.
 
-Bump `pkgver` (and reset `pkgrel=1`) for each new upstream tag.
+`pkgver` and `pkgrel` are bumped for you by `release.sh` — they must match the
+tag, because `source=` fetches `v$pkgver`'s tarball. A stale `pkgver` doesn't
+error; it just builds the wrong release.
+
+`.SRCINFO` is only needed to publish to the AUR, and isn't generated
+automatically. If you do publish, add `makepkg --printsrcinfo > .SRCINFO` to
+`release.sh` at the same time so that can't drift either.
 
 ## Not yet (later phases)
 
