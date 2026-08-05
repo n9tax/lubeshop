@@ -10,8 +10,11 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
 
+use std::collections::HashMap;
+
 use gwm_core::device::{build_read_args, recalibrate};
-use gwm_core::read::{run_read_cancellable, ReadEvent};
+use gwm_core::diskmap::{DiskMap, TrackHealth};
+use gwm_core::read::{map_columns, run_read_cancellable, MapLine, ReadEvent};
 
 enum ReadMsg {
     Event(ReadEvent),
@@ -28,6 +31,16 @@ pub struct ReadJob {
     pub total_tracks: Option<u32>,
     pub done_tracks: u32,
     pub bad_tracks: u32,
+    /// Per-track sector recovery keyed by (cyl, head), as (good, total). Retries
+    /// keep the best `good`; a "gave up" sets `good = total - missing`. Feeds the
+    /// exported disk-health map.
+    track_health: HashMap<(u32, u32), (u32, u32)>,
+    /// `gw`'s end-of-read sector grid, accumulated as its rows arrive. This is
+    /// the only place `gw` says *which* sectors failed rather than how many, so
+    /// it is preferred over `track_health` when building the map.
+    grid_tens: Option<String>,
+    grid_units: Option<String>,
+    grid_rows: Vec<(u32, u32, String)>,
     pub current: String,
     pub notes: Vec<String>,
     pub summary: Option<(u32, u32, u32)>,
@@ -105,6 +118,10 @@ impl ReadJob {
             total_tracks: None,
             done_tracks: 0,
             bad_tracks: 0,
+            track_health: HashMap::new(),
+            grid_tens: None,
+            grid_units: None,
+            grid_rows: Vec::new(),
             current: String::new(),
             notes: Vec::new(),
             summary: None,
@@ -157,6 +174,10 @@ impl ReadJob {
                 if retry.is_none() {
                     self.done_tracks += 1;
                 }
+                // Keep the best recovery seen for this track (retries improve it).
+                let e = self.track_health.entry((cyl, head)).or_insert((got, total));
+                e.0 = e.0.max(got);
+                e.1 = total;
                 let tag = retry.map(|r| format!("  ({r})")).unwrap_or_default();
                 self.current = format!("T{cyl}.{head}: {got}/{total} sectors{tag}");
             }
@@ -166,6 +187,10 @@ impl ReadJob {
                 missing,
             } => {
                 self.bad_tracks += 1;
+                // Record the shortfall against this track's known sector total.
+                if let Some(e) = self.track_health.get_mut(&(cyl, head)) {
+                    e.0 = e.1.saturating_sub(missing);
+                }
                 self.notes
                     .push(format!("T{cyl}.{head}: gave up, {missing} sector(s) missing"));
             }
@@ -177,6 +202,14 @@ impl ReadJob {
             ReadEvent::Failed(msg) => {
                 self.failed.get_or_insert(msg);
             }
+            // The sector grid arrives at the very end, after every track.
+            ReadEvent::Map(MapLine::CylTens(cells)) => self.grid_tens = Some(cells),
+            ReadEvent::Map(MapLine::CylUnits(cells)) => self.grid_units = Some(cells),
+            ReadEvent::Map(MapLine::Row {
+                head,
+                sector,
+                cells,
+            }) => self.grid_rows.push((head, sector, cells)),
             ReadEvent::Plan { .. } | ReadEvent::Format(_) => {}
         }
     }
@@ -187,6 +220,32 @@ impl ReadJob {
             Some(total) if total > 0 => (self.done_tracks as f64 / total as f64).clamp(0.0, 1.0),
             _ => 0.0,
         }
+    }
+
+    /// Did we collect anything a health map could be drawn from?
+    pub fn has_track_health(&self) -> bool {
+        !self.track_health.is_empty() || !self.grid_rows.is_empty()
+    }
+
+    /// Build a disk-health map from the read.
+    ///
+    /// Prefers `gw`'s sector grid, which names every sector it missed, so a bad
+    /// wedge is drawn where the bad sector actually is. Falls back to per-track
+    /// counts when there is no grid — a read cancelled part-way, or one that
+    /// failed before the summary — where only the number of failures is known.
+    pub fn disk_map(&self, label: impl Into<String>) -> DiskMap {
+        if let (Some(tens), Some(units)) = (self.grid_tens.as_ref(), self.grid_units.as_ref()) {
+            if !self.grid_rows.is_empty() {
+                let columns = map_columns(tens, units);
+                return DiskMap::from_grid(label, &columns, &self.grid_rows);
+            }
+        }
+        let tracks = self
+            .track_health
+            .iter()
+            .map(|(&(cyl, head), &(good, total))| TrackHealth { cyl, head, total, good })
+            .collect();
+        DiskMap::from_tracks(label, tracks)
     }
 
     /// A read succeeded if it produced a summary and left a non-empty file.

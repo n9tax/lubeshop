@@ -3904,12 +3904,52 @@ impl App {
     }
 
     fn on_done_key(&mut self, code: KeyCode) {
-        if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
-            self.read_job = None;
-            self.read_outcome = None;
-            self.write_job = None;
-            self.write_outcome = None;
-            self.screen = Screen::Menu;
+        match code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {
+                self.read_job = None;
+                self.read_outcome = None;
+                self.write_job = None;
+                self.write_outcome = None;
+                self.screen = Screen::Menu;
+            }
+            // After a read: export the sector-health map and pop it open.
+            KeyCode::Char('v') | KeyCode::Char('m') => self.export_disk_map(),
+            _ => {}
+        }
+    }
+
+    /// Render the just-finished read's per-track recovery as a circular BMP
+    /// "disk platter" next to the capture, then open it in the host's default
+    /// image viewer (a TUI can't draw it in the terminal).
+    fn export_disk_map(&mut self) {
+        let Some(job) = self.read_job.as_ref() else {
+            return;
+        };
+        if !job.has_track_health() {
+            self.notice = Some("No per-track data to map for this read.".to_string());
+            return;
+        }
+        let label = file_name(&job.out_path);
+        let map = job.disk_map(&label);
+        let (good, total) = map.totals();
+        let bytes = gwm_core::diskmap::render_bmp(&map);
+        // Sibling of the capture, e.g. DISK.scp -> DISK.readmap.bmp.
+        let bmp_path = job.out_path.with_extension("readmap.bmp");
+        if let Err(err) = std::fs::write(&bmp_path, &bytes) {
+            self.notice = Some(format!("Could not write the sector map: {err}"));
+            return;
+        }
+        match open_in_viewer(&bmp_path) {
+            Ok(()) => {
+                self.notice =
+                    Some(format!("Sector map ({good}/{total} sectors) opened in your image viewer."))
+            }
+            Err(err) => {
+                self.notice = Some(format!(
+                    "Wrote {} but couldn't open a viewer: {err}",
+                    file_name(&bmp_path)
+                ))
+            }
         }
     }
 
@@ -4402,6 +4442,30 @@ fn file_name(path: &PathBuf) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("image")
         .to_string()
+}
+
+/// Open `path` in the host's default handler (image viewer / browser). Spawns
+/// detached so it never blocks the TUI. Platform-specific launcher.
+fn open_in_viewer(path: &Path) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "macos")]
+    let mut cmd = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // `start` is a cmd builtin; the empty "" is its window-title argument.
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut cmd = Command::new("xdg-open");
+
+    cmd.arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 fn item_file_name(item: &MediaItem) -> String {

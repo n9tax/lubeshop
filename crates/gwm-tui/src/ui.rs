@@ -977,6 +977,12 @@ fn render_outcome(app: &App, job: &crate::read_job::ReadJob, frame: &mut Frame, 
         None => {}
     }
     lines.push(Line::from(""));
+    if job.has_track_health() {
+        lines.push(Line::from(Span::styled(
+            "  Press v to view a disk-health map (opens in your image viewer)",
+            Style::default().fg(theme().accent),
+        )));
+    }
     lines.push(Line::from(Span::styled("  Enter to return to the menu", dim())));
     frame.render_widget(para(lines).block(bordered("Done")), area);
 }
@@ -2169,7 +2175,13 @@ fn status_hint(app: &App) -> &'static str {
                     "  reading… · Esc or c to cancel"
                 }
             }
-            Screen::ReadDone => "  Enter return to menu",
+            Screen::ReadDone => {
+                if app.read_job.as_ref().map(|j| j.has_track_health()).unwrap_or(false) {
+                    "  v view sector map · Enter return to menu"
+                } else {
+                    "  Enter return to menu"
+                }
+            }
             Screen::CleanOptions => "  Space toggle · Enter start cleaning · Esc back",
             Screen::DiagOptions => "  ↑/↓ row · ←/→ change · Enter start · Esc back",
             Screen::Diag => {

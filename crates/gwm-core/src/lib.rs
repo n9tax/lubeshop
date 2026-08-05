@@ -11,6 +11,7 @@ pub mod cbm_disk;
 pub mod convert;
 pub mod device;
 pub mod diag;
+pub mod diskmap;
 pub mod error;
 pub mod formats;
 pub mod imagefs;

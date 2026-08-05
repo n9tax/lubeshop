@@ -48,7 +48,40 @@ pub enum ReadEvent {
     Summary { found: u32, total: u32, percent: u32 },
     /// A hard failure, e.g. `Command Failed: Seek: Track 0 not found`.
     Failed(String),
+    /// One line of the end-of-read sector grid.
+    Map(MapLine),
 }
+
+/// A line of `gw`'s end-of-read sector grid — the only place it says *which*
+/// sectors failed rather than how many.
+///
+/// ```text
+/// Cyl-> 0         1         2         3
+/// H. S: 0123456789012345678901234567890123456789
+/// 0. 0: .........X..............................
+/// ```
+///
+/// The two header rows carry the tens and units digit of each cylinder, so the
+/// column-to-cylinder mapping is read off them rather than assumed contiguous.
+/// Every row shares a fixed 6-character prefix (`Cyl-> `, `H. S: `, `H.SS: `),
+/// and the cells after it line up one per cylinder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapLine {
+    /// Tens digit per cylinder, blank where it hasn't changed.
+    CylTens(String),
+    /// Units digit per cylinder.
+    CylUnits(String),
+    /// One (head, sector) row. `'.'` = recovered, `'X'` = missing, `' '` = this
+    /// track wasn't read, or has fewer sectors than this row's index.
+    Row {
+        head: u32,
+        sector: u32,
+        cells: String,
+    },
+}
+
+/// Width of the fixed label column on every sector-grid row.
+const MAP_PREFIX: usize = 6;
 
 impl ReadEvent {
     /// Total number of tracks implied by a [`ReadEvent::Plan`], for sizing a
@@ -70,6 +103,12 @@ impl ReadEvent {
 /// Parse a single line of `gw` output into a [`ReadEvent`], or `None` if the
 /// line is noise we don't model (e.g. the end-of-read sector map).
 pub fn parse_read_line(raw: &str) -> Option<ReadEvent> {
+    // Before trimming: the grid's cells are positional, and a track that wasn't
+    // read is a *space*, so trailing blanks are data. Only line endings go.
+    if let Some(map) = parse_map_line(raw.trim_end_matches(['\r', '\n'])) {
+        return Some(ReadEvent::Map(map));
+    }
+
     let line = raw.trim();
     if line.is_empty() {
         return None;
@@ -91,6 +130,61 @@ pub fn parse_read_line(raw: &str) -> Option<ReadEvent> {
         return parse_summary(line);
     }
     None
+}
+
+/// Recognise one line of the end-of-read sector grid.
+///
+/// Deliberately strict about the prefix: a data row is `H.SS: `, which would
+/// otherwise be easy to confuse with ordinary output. Anything past the prefix
+/// is taken verbatim — the cells are positional.
+fn parse_map_line(line: &str) -> Option<MapLine> {
+    if line.len() < MAP_PREFIX {
+        return None;
+    }
+    let (prefix, cells) = line.split_at(MAP_PREFIX);
+    if prefix == "Cyl-> " {
+        return Some(MapLine::CylTens(cells.to_string()));
+    }
+    if prefix == "H. S: " {
+        return Some(MapLine::CylUnits(cells.to_string()));
+    }
+    // `%d.%2d: ` — head, '.', sector right-aligned in two columns, ': '.
+    let bytes = prefix.as_bytes();
+    if bytes[1] != b'.' || bytes[4] != b':' || bytes[5] != b' ' {
+        return None;
+    }
+    let head: u32 = prefix[0..1].parse().ok()?;
+    let sector: u32 = prefix[2..4].trim().parse().ok()?;
+    Some(MapLine::Row {
+        head,
+        sector,
+        cells: cells.to_string(),
+    })
+}
+
+/// Turn the grid's two header rows into the cylinder number of each column.
+///
+/// The tens row only prints a digit when it *changes*, so it is carried
+/// forward across the blanks: `0` then nine blanks means columns 0-9 are all
+/// in the 0-9 decade.
+pub fn map_columns(tens: &str, units: &str) -> Vec<u32> {
+    let mut out = Vec::with_capacity(units.len());
+    let mut tens_chars = tens.chars();
+    let mut decade = 0u32;
+    for unit in units.chars() {
+        if let Some(t) = tens_chars.next() {
+            if let Some(d) = t.to_digit(10) {
+                decade = d;
+            }
+        }
+        match unit.to_digit(10) {
+            Some(u) => out.push(decade * 10 + u),
+            // A column with no units digit isn't a cylinder; keep the vector
+            // aligned with the cell strings by parking it out of range.
+            None => out.push(u32::MAX),
+        }
+    }
+    out
 }
 
 /// Spawn `gw read` with `args`, invoking `on_event` for every parsed
@@ -341,13 +435,116 @@ mod tests {
     }
 
     #[test]
-    fn ignores_sector_map_noise() {
-        assert_eq!(parse_read_line("Cyl-> 0 "), None);
-        assert_eq!(parse_read_line("H. S: 01"), None);
-        assert_eq!(
+    /// The end-of-read sector grid used to be discarded as noise. It is now the
+    /// source for the disk-health map — it is the only place `gw` says *which*
+    /// sectors failed — so these lines parse instead of being dropped. See the
+    /// `sector_grid` tests below.
+    fn parses_the_sector_map_it_used_to_ignore() {
+        assert!(matches!(
+            parse_read_line("Cyl-> 0 "),
+            Some(ReadEvent::Map(MapLine::CylTens(_)))
+        ));
+        assert!(matches!(
+            parse_read_line("H. S: 01"),
+            Some(ReadEvent::Map(MapLine::CylUnits(_)))
+        ));
+        assert!(matches!(
             parse_read_line("1. 8: .......................................XXXX..."),
-            None
-        );
+            Some(ReadEvent::Map(MapLine::Row { head: 1, sector: 8, .. }))
+        ));
         assert_eq!(parse_read_line(""), None);
+        // Genuinely unrelated output is still ignored.
+        assert_eq!(parse_read_line("some other gw chatter"), None);
+    }
+}
+
+#[cfg(test)]
+mod sector_grid {
+    use super::*;
+
+    /// Captured verbatim from a real `gw read` of a 40-track 360K disk, with an
+    /// X punched in to stand for a sector that didn't recover.
+    const TENS: &str = "Cyl-> 0         1         2         3         ";
+    const UNITS: &str = "H. S: 0123456789012345678901234567890123456789";
+    const ROW: &str = "0. 0: .........X..............................";
+
+    #[test]
+    fn recognises_the_three_row_kinds() {
+        assert_eq!(
+            parse_read_line(TENS),
+            Some(ReadEvent::Map(MapLine::CylTens(
+                "0         1         2         3         ".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_read_line(UNITS),
+            Some(ReadEvent::Map(MapLine::CylUnits(
+                "0123456789012345678901234567890123456789".to_string()
+            )))
+        );
+        let Some(ReadEvent::Map(MapLine::Row { head, sector, cells })) = parse_read_line(ROW)
+        else {
+            panic!("expected a grid row");
+        };
+        assert_eq!((head, sector), (0, 0));
+        assert_eq!(cells.chars().nth(9), Some('X'));
+        assert_eq!(cells.chars().filter(|c| *c == '.').count(), 39);
+    }
+
+    /// Sector numbers past 9 are right-aligned in two columns, and head 1 rows
+    /// look the same — both easy to get wrong with a naive split.
+    #[test]
+    fn handles_two_digit_sectors_and_head_one() {
+        let Some(ReadEvent::Map(MapLine::Row { head, sector, .. })) =
+            parse_read_line("1.17: ..........")
+        else {
+            panic!("expected a grid row");
+        };
+        assert_eq!((head, sector), (1, 17));
+    }
+
+    /// Trailing spaces are a track that wasn't read, not padding — trimming the
+    /// line before parsing would silently turn "never read" into "absent".
+    #[test]
+    fn trailing_blanks_survive_as_cells() {
+        let Some(ReadEvent::Map(MapLine::Row { cells, .. })) = parse_read_line("0. 3: ..XX  \r\n")
+        else {
+            panic!("expected a grid row");
+        };
+        assert_eq!(cells, "..XX  ");
+    }
+
+    /// Ordinary output must not be mistaken for a grid row.
+    #[test]
+    fn ignores_lines_that_only_look_similar() {
+        assert!(matches!(
+            parse_read_line("T0.0: IBM MFM (9/9 sectors) from Raw Flux (88810 flux in 400.34ms)"),
+            Some(ReadEvent::Track { .. })
+        ));
+        assert!(matches!(
+            parse_read_line("Found 720 sectors of 720 (100%)"),
+            Some(ReadEvent::Summary { .. })
+        ));
+        assert_eq!(parse_read_line("Format ibm.360"), Some(ReadEvent::Format("ibm.360".into())));
+    }
+
+    #[test]
+    fn columns_carry_the_tens_digit_forward() {
+        let cols = map_columns(&TENS[MAP_PREFIX..], &UNITS[MAP_PREFIX..]);
+        assert_eq!(cols.len(), 40);
+        assert_eq!(cols[0], 0);
+        assert_eq!(cols[9], 9);
+        assert_eq!(cols[10], 10); // the tens digit only printed once, at col 10
+        assert_eq!(cols[25], 25);
+        assert_eq!(cols[39], 39);
+    }
+
+    /// A read of a non-contiguous or offset cylinder range must still map
+    /// columns to the right cylinders.
+    #[test]
+    fn columns_handle_an_offset_range() {
+        // Cylinders 8-12: tens digit changes partway through.
+        let cols = map_columns("0 1  ", "89012");
+        assert_eq!(cols, vec![8, 9, 10, 11, 12]);
     }
 }

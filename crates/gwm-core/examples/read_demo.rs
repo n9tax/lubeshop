@@ -58,6 +58,7 @@ fn main() {
             percent,
         } => println!("[done] {found}/{total} sectors ({percent}%)"),
         ReadEvent::Failed(msg) => println!("[FAILED] {msg}"),
+        ReadEvent::Map(line) => println!("[map] {line:?}"),
     });
 
     match result {
