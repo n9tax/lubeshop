@@ -9,7 +9,7 @@
 #   2. Push pkgname/PKGBUILD/.SRCINFO to the AUR git remote.
 # (sha256sums are SKIP because GitHub's auto-generated tarballs aren't byte-stable.)
 pkgname=lubeshop
-pkgver=1.0.0
+pkgver=1.0.4
 pkgrel=1
 pkgdesc="TUI front-end for the Greaseweazle floppy flux reader/writer + a manager for flux captures and decoded disk images"
 arch=('x86_64' 'aarch64')

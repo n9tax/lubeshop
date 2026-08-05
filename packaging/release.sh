@@ -42,7 +42,15 @@ sed -i -E "s/^version = \"[^\"]*\"/version = \"$ver\"/" Cargo.toml
 # Sync Cargo.lock to the new version so --locked/--frozen builds keep working.
 cargo update --workspace --quiet
 
-git add Cargo.toml Cargo.lock
+# Keep the Arch recipe in step. Its source= line fetches the v$pkgver tarball,
+# so a stale pkgver doesn't error -- it quietly builds an *old* release for
+# anyone following the README's `makepkg -si` instructions. That is how it sat
+# at 1.0.0 through three releases: this script bumped the crate and forgot the
+# package. A new upstream version also restarts the package revision.
+sed -i -E "s/^pkgver=.*/pkgver=$ver/" packaging/PKGBUILD
+sed -i -E "s/^pkgrel=.*/pkgrel=1/" packaging/PKGBUILD
+
+git add Cargo.toml Cargo.lock packaging/PKGBUILD
 git commit -q -m "Release v$ver"
 git tag "v$ver"
 
