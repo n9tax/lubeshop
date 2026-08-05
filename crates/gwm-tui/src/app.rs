@@ -19,6 +19,7 @@ use gwm_core::Core;
 
 use crate::count_job::{CountJob, CountState};
 use crate::diag_job::DiagJob;
+use crate::scan_job::ScanJob;
 use crate::gotek_job::GotekJob;
 use crate::version_job::{VersionJob, VersionState};
 use gwm_core::convert::GotekFormat;
@@ -103,6 +104,8 @@ pub enum Screen {
     Diag,
     /// Head-cleaning set-up (drive geometry) before the zig-zag runs.
     CleanOptions,
+    /// A surface scan sweeping every track, then its result.
+    Scanning,
     WriteSource,
     WriteConfirm,
     Writing,
@@ -277,6 +280,12 @@ pub struct App {
     pub diag_opts: gwm_core::diag::DiagOptions,
     pub diag_opt_row: usize,
     pub diag_supported: bool,
+    /// A running (or finished) surface scan, and where its map was written.
+    pub scan_job: Option<ScanJob>,
+    pub scan_map_path: Option<std::path::PathBuf>,
+    /// Exaggeration applied to measured angles in the last map, so the screen
+    /// can say so rather than implying the picture is to scale.
+    pub scan_angle_gain: Option<f64>,
     pub read_outcome: Option<Result<String, String>>,
 
     pub write_state: ListState,
@@ -486,6 +495,9 @@ impl App {
             },
             diag_opt_row: 0,
             diag_supported,
+            scan_job: None,
+            scan_map_path: None,
+            scan_angle_gain: None,
             read_outcome: None,
             write_state: ListState::default(),
             write_erase: false,
@@ -613,6 +625,11 @@ impl App {
                 Screen::Diag => {
                     if let Some(job) = self.diag_job.as_mut() {
                         job.pump();
+                    }
+                }
+                Screen::Scanning => {
+                    if self.scan_job.as_mut().map(ScanJob::pump).unwrap_or(false) {
+                        self.finalize_scan();
                     }
                 }
                 Screen::Installing => {
@@ -851,6 +868,7 @@ impl App {
             Screen::DiagOptions => self.on_diag_options_key(code),
             Screen::Diag => self.on_diag_key(code),
             Screen::CleanOptions => self.on_clean_options_key(code),
+            Screen::Scanning => self.on_scanning_key(code),
             Screen::Writing => {} // destructive — runs to completion; Ctrl+C quits
             Screen::Ti99Transfer => {} // runs to completion
             Screen::Ti99Done => {
@@ -2478,7 +2496,7 @@ impl App {
     /// value the tool can't guess: 500kbps is both 1.2MB 5.25" HD at 360rpm
     /// and 1.44MB 3.5" HD at 300rpm, so it can't be derived from the rest.
     pub const DIAG_RATES: [u32; 4] = [250, 300, 500, 1000];
-    pub const DIAG_OPT_ROWS: usize = 5;
+    pub const DIAG_OPT_ROWS: usize = 6;
 
     fn enter_diag(&mut self) {
         if !self.gw_ready() {
@@ -2511,6 +2529,9 @@ impl App {
                 self.diag_opt_row = (self.diag_opt_row + 1) % Self::DIAG_OPT_ROWS;
             }
             KeyCode::Enter => self.start_diag(),
+            // The same options describe a surface scan, so it starts here too
+            // rather than making the user fill the form in twice.
+            KeyCode::Char('s') => self.start_scan(),
             _ => self.adjust_diag_opt(code),
         }
     }
@@ -2558,6 +2579,11 @@ impl App {
                 }
             },
             4 => self.diag_opts.double_step = !self.diag_opts.double_step,
+            // Cylinders: 35 (a 1541) up to 84, covering every drive we'd meet.
+            5 => {
+                self.diag_opts.cyls =
+                    (self.diag_opts.cyls as isize + delta).clamp(35, 84) as u32
+            }
             _ => {}
         }
     }
@@ -2610,6 +2636,79 @@ impl App {
             _ => return,
         };
         job.send(cmd);
+    }
+
+    /// How many revolutions each track's angles are averaged over. Three takes
+    /// most of the jitter out without tripling the sweep time.
+    const SCAN_REVS: u32 = 3;
+
+    /// Sweep the whole surface, measuring where every sector physically sits.
+    fn start_scan(&mut self) {
+        if !self.diag_supported {
+            return;
+        }
+        self.diag_opts.step_delay = self.core.settings.tuning.get("step").copied();
+        self.scan_map_path = None;
+        self.scan_job = Some(ScanJob::start(
+            &diag_command(&self.core),
+            &self.diag_opts,
+            2,
+            Self::SCAN_REVS,
+        ));
+        self.screen = Screen::Scanning;
+    }
+
+    /// Write the scanned map next to the library and open it.
+    fn finalize_scan(&mut self) {
+        let Some(job) = self.scan_job.as_ref() else {
+            return;
+        };
+        if job.tracks.is_empty() {
+            self.notice = Some(match job.outcome.as_ref() {
+                Some(Err(err)) => err.clone(),
+                _ => "The scan measured nothing — is there a disk in the drive?".to_string(),
+            });
+            return;
+        }
+        let label = format!("drive-{}", self.diag_opts.drive.to_uppercase());
+        let mut map = job.disk_map(&label);
+        let bytes = gwm_core::diskmap::render(&mut map);
+        let path = self.core.paths.store_dir.join(format!("{label}.surface.bmp"));
+        if let Err(err) = std::fs::write(&path, &bytes) {
+            self.notice = Some(format!("Could not write the surface map: {err}"));
+            return;
+        }
+        self.scan_map_path = Some(path.clone());
+        self.scan_angle_gain = map.angle_gain;
+        if let Err(err) = open_in_viewer(&path) {
+            self.notice = Some(format!(
+                "Wrote {} but couldn't open a viewer: {err}",
+                file_name(&path)
+            ));
+        }
+    }
+
+    fn on_scanning_key(&mut self, code: KeyCode) {
+        let running = self
+            .scan_job
+            .as_ref()
+            .map(|j| j.outcome.is_none())
+            .unwrap_or(false);
+        match code {
+            // Stopping mid-sweep still maps whatever was measured, which is
+            // the point of being able to stop a slow scan of a bad disk.
+            KeyCode::Esc | KeyCode::Char('c') if running => {
+                if let Some(job) = self.scan_job.as_ref() {
+                    job.cancel();
+                }
+            }
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') if !running => {
+                self.scan_job = None;
+                self.scan_map_path = None;
+                self.screen = Screen::Menu;
+            }
+            _ => {}
+        }
     }
 
     /// Leave the diagnostic, making sure the drive is released first.

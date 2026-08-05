@@ -104,6 +104,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::DiagOptions => render_diag_options(app, frame, chunks[1]),
         Screen::Diag => render_diag(app, frame, chunks[1]),
         Screen::CleanOptions => render_clean_options(app, frame, chunks[1]),
+        Screen::Scanning => render_scanning(app, frame, chunks[1]),
         Screen::Ti99Transfer | Screen::Ti99Done => render_ti99(app, frame, chunks[1]),
         Screen::WriteSource => render_write_source(app, frame, chunks[1]),
         Screen::WriteConfirm => render_write_confirm(app, frame, chunks[1]),
@@ -2183,7 +2184,16 @@ fn status_hint(app: &App) -> &'static str {
                 }
             }
             Screen::CleanOptions => "  Space toggle · Enter start cleaning · Esc back",
-            Screen::DiagOptions => "  ↑/↓ row · ←/→ change · Enter start · Esc back",
+            Screen::Scanning => {
+                if app.scan_job.as_ref().map(|j| j.outcome.is_none()).unwrap_or(false) {
+                    "  scanning… · Esc or c to stop (keeps what's measured)"
+                } else {
+                    "  Enter return to menu"
+                }
+            }
+            Screen::DiagOptions => {
+                "  ↑/↓ row · ←/→ change · Enter live · s surface scan · Esc back"
+            }
             Screen::Diag => {
                 "  ←/→ step · 0-9 jump ×10 · h head · r recal · m motor · s select · d density · q back"
             }
@@ -2281,6 +2291,126 @@ fn render_clean_options(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para(lines).block(bordered("Clean drive")), area);
 }
 
+fn render_scanning(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(job) = app.scan_job.as_ref() else {
+        frame.render_widget(
+            para(vec![Line::from("  No scan running.")]).block(bordered("Surface scan")),
+            area,
+        );
+        return;
+    };
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let done = job.outcome.is_some();
+    let (good, total) = job.totals();
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            if done {
+                "  Scan complete."
+            } else {
+                "  Measuring where every sector sits — a seek and three revolutions per track."
+            },
+            if done { accented() } else { dim() },
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Tracks   ", dim()),
+            Span::styled(format!("{}/{}", job.tracks.len(), job.total), bold),
+        ]),
+        Line::from(vec![
+            Span::styled("  Sectors  ", dim()),
+            Span::styled(
+                format!("{good}/{total}"),
+                Style::default()
+                    .fg(if total > 0 && good == total {
+                        theme().success
+                    } else {
+                        theme().danger
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+    if let Some((lo, hi)) = job.rpm_range() {
+        lines.push(Line::from(vec![
+            Span::styled("  Spindle  ", dim()),
+            Span::styled(format!("{lo:.2}–{hi:.2} rpm"), bold),
+            Span::styled(format!("   (spread {:.3})", hi - lo), dim()),
+        ]));
+    }
+    if !job.current.is_empty() && !done {
+        lines.push(Line::from(Span::styled(format!("  {}", job.current), dim())));
+    }
+    lines.push(Line::from(""));
+
+    if done {
+        if let Some(path) = app.scan_map_path.as_ref() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  Map written to {}",
+                    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                ),
+                Style::default().fg(theme().success),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  It should have opened in your image viewer.",
+                dim(),
+            )));
+            // Never let the picture imply it is to scale.
+            if let Some(gain) = app.scan_angle_gain {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  Sector positions are real, but their differences are drawn {gain:.0}× \
+                         larger than life —"
+                    ),
+                    dim(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  they span a fraction of a degree and would otherwise be invisible. Ragged",
+                    dim(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  wedge edges between rings mean the geometry really does vary track to track.",
+                    dim(),
+                )));
+            }
+        }
+        if let Some(Err(err)) = job.outcome.as_ref() {
+            lines.push(Line::from(Span::styled(
+                format!("  {err}"),
+                Style::default().fg(theme().danger),
+            )));
+        }
+        if job.is_cancelled() {
+            lines.push(Line::from(Span::styled(
+                "  Stopped early — the map covers only the tracks reached.",
+                Style::default().fg(theme().warning),
+            )));
+        }
+    }
+    for note in job.notices.iter().rev().take(3) {
+        lines.push(Line::from(Span::styled(
+            format!("  {note}"),
+            Style::default().fg(theme().warning),
+        )));
+    }
+
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(area);
+    frame.render_widget(para(lines).block(bordered("Surface scan")), inner[0]);
+    frame.render_widget(
+        Gauge::default()
+            .block(bordered("Progress"))
+            .gauge_style(Style::default().fg(theme().accent))
+            .ratio(job.progress_ratio()),
+        inner[1],
+    );
+}
+
 // ---- Live drive diagnostic ------------------------------------------------
 
 fn render_diag_options(app: &App, frame: &mut Frame, area: Rect) {
@@ -2318,6 +2448,11 @@ fn render_diag_options(app: &App, frame: &mut Frame, area: Rect) {
             app.diag_opt_row == 4,
             "Double-step (48→96 TPI)",
             if opts.double_step { "[x]".into() } else { "[ ]".to_string() },
+        ),
+        row(
+            app.diag_opt_row == 5,
+            "Cylinders (scan only)",
+            opts.cyls.to_string(),
         ),
         Line::from(""),
         Line::from(Span::styled(

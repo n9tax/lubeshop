@@ -270,13 +270,17 @@ const MAX_RADIUS: f64 = 620.0;
 /// every ring lines up perfectly and the picture says nothing.
 const DEVIATION_TARGET: f64 = 0.055; // ~20 degrees
 
+/// Drawn wedge boundaries for each `(head, cyl)`, in revolutions from the
+/// index mark.
+type Boundaries = BTreeMap<(u32, u32), Vec<f64>>;
+
 /// Per-track drawn wedge boundaries, in revolutions from the index mark.
 ///
 /// With measured angles the boundaries are the disk's reference geometry plus
 /// each track's *exaggerated* deviation from it, so track-to-track skew — the
 /// thing that is real but sub-degree — becomes something you can see. Returns
 /// the gain applied, so the caller can say what it did.
-fn placements(map: &DiskMap) -> (BTreeMap<(u32, u32), Vec<f64>>, Option<f64>) {
+fn placements(map: &DiskMap) -> (Boundaries, Option<f64>) {
     if map.measured.is_empty() {
         return (BTreeMap::new(), None);
     }
@@ -359,7 +363,7 @@ pub fn render_bmp(map: &DiskMap) -> Vec<u8> {
     draw(map, &placements(map).0)
 }
 
-fn draw(map: &DiskMap, drawn: &BTreeMap<(u32, u32), Vec<f64>>) -> Vec<u8> {
+fn draw(map: &DiskMap, drawn: &Boundaries) -> Vec<u8> {
     let heads = map.heads.max(1) as usize;
     let cyls = map.cyls.max(1) as usize;
 

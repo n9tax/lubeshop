@@ -42,6 +42,10 @@ pub struct DiagOptions {
     /// Step delay in microseconds for this session only. `None` keeps whatever
     /// `gw delays` already has set.
     pub step_delay: Option<u32>,
+    /// Cylinders the drive has, and so how far a surface scan sweeps. Wrong
+    /// here and the scan either stops short of the disk or drives the head
+    /// into the stop, so it is asked for rather than assumed.
+    pub cyls: u32,
 }
 
 impl Default for DiagOptions {
@@ -53,6 +57,7 @@ impl Default for DiagOptions {
             secs: None,
             double_step: false,
             step_delay: None,
+            cyls: 40,
         }
     }
 }
@@ -582,10 +587,10 @@ impl ScanTrack {
 }
 
 /// Build the argument vector for a surface scan.
-pub fn build_scan_args(opts: &DiagOptions, cyls: u32, heads: u32, revs: u32) -> Vec<String> {
+pub fn build_scan_args(opts: &DiagOptions, heads: u32, revs: u32) -> Vec<String> {
     let mut args = build_diag_args(opts);
     args.push("--scan".to_string());
-    args.push(format!("--cyls={cyls}"));
+    args.push(format!("--cyls={}", opts.cyls));
     args.push(format!("--heads={heads}"));
     args.push(format!("--revs={revs}"));
     args
@@ -647,7 +652,8 @@ mod scan_tests {
 
     #[test]
     fn scan_args_carry_the_geometry() {
-        let args = build_scan_args(&DiagOptions::default(), 40, 2, 3);
+        let opts = DiagOptions { cyls: 40, ..Default::default() };
+        let args = build_scan_args(&opts, 2, 3);
         assert!(args.iter().any(|a| a == "--scan"));
         assert!(args.iter().any(|a| a == "--cyls=40"));
         assert!(args.iter().any(|a| a == "--heads=2"));
@@ -655,4 +661,61 @@ mod scan_tests {
         // Still a batch session: the scan speaks the same protocol.
         assert!(args.iter().any(|a| a == "--batch"));
     }
+}
+
+/// Run a surface scan to completion, calling `on_line` for each line of output.
+///
+/// Blocking — run it on a worker thread. Unlike a live session this ends by
+/// itself, so it is an ordinary run-and-wait rather than a [`DiagSession`].
+/// Flipping `cancel` kills the child, which ends the sweep part-way with
+/// whatever it had measured up to that point.
+pub fn run_scan<F: FnMut(String)>(
+    cmd: &str,
+    args: &[String],
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    mut on_line: F,
+) -> Result<(), String> {
+    let mut child = Command::new(cmd)
+        .args(args)
+        // stdin stays open but silent: the scan takes no commands, and closing
+        // it would end the session at its first poll.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start the scan ({cmd}): {e}"))?;
+
+    let stdout = child.stdout.take().expect("stdout was requested piped");
+    let child = Arc::new(Mutex::new(child));
+
+    // The read loop blocks until the child writes, so it can't notice a cancel
+    // on its own; killing the child closes stdout, which ends the loop.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watch_child = Arc::clone(&child);
+    let watch_stop = Arc::clone(&stop);
+    let watcher = thread::spawn(move || loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Ok(mut c) = watch_child.lock() {
+                let _ = c.kill();
+            }
+            return;
+        }
+        if watch_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    });
+
+    for line in BufReader::new(stdout).lines() {
+        match line {
+            Ok(line) => on_line(line),
+            Err(_) => break,
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = watcher.join();
+    if let Ok(mut c) = child.lock() {
+        let _ = c.wait();
+    }
+    Ok(())
 }

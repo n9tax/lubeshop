@@ -257,6 +257,24 @@ Keys: `←`/`→` step one track, `0`-`9` jump to that track ×10, `h` head, `r`
 recalibrate, `m` motor, `s` drive-select (independent of the motor — some drives
 gate the head-load solenoid off select, not motor-on), `d` density, `q` back.
 
+### Surface scan
+
+From the same set-up screen, `s` sweeps the whole disk instead of running live,
+measuring **where every sector physically sits** — the angle from the index hole
+at which it passes the head — and exports a platter picture of the result. About
+a minute for a double-sided 40-track disk.
+
+An ordinary read can't do this: it reports which sectors came back, not where
+they are, so a map built from one has to draw them evenly spaced and identical on
+every track. A scan draws each wedge where the sector actually is, so the wedge
+edges line up between rings only if the geometry really is consistent. Ragged
+edges are a finding — head-to-head skew, a wandering spindle, a warped disk.
+
+The differences are tiny — a fraction of a degree against a whole platter — so
+they're **exaggerated** to be visible at all, and the screen tells you by how
+much. A disk whose tracks genuinely agree gets no exaggeration, so you can't
+mistake noise for a fault.
+
 This one needs the **diagnostic fork** of the Greaseweazle tools, since `gw diag`
 isn't in an upstream release. Install **Greaseweazle diag** from the **Tools**
 screen and it's picked up automatically — it goes in beside your normal `gw` as
