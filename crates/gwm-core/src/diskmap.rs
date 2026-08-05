@@ -15,13 +15,27 @@
 //! which; those are spread evenly around the ring and the picture is honest
 //! about being approximate only in so far as this comment is.
 //!
-//! **What it can't show.** Sector *angular position* is not measured. `gw`
-//! reports sector identities, not where they physically sit, so wedges are
-//! drawn at equal angles in index order starting from the index mark. Real
-//! disks are interleaved and skewed, so this is a schematic of the track's
-//! contents, not a photograph of the platter — and because every ring is laid
-//! out by the same rule, wedge boundaries always line up between rings. They
-//! cannot reveal rotational speed variation.
+//! **Where the wedges sit.** Two cases, and the difference matters.
+//!
+//! From an ordinary read, sector *position* is unknown — `gw` reports sector
+//! identities, not where they physically sit — so wedges are drawn at equal
+//! angles in index order. That is a schematic of a track's contents, and
+//! because every ring follows the same rule its wedge boundaries always line
+//! up. Alignment there means nothing.
+//!
+//! From a surface scan ([`DiskMap::from_scan`], fed by `gw diag --scan`), each
+//! sector's angle from the index pulse is measured, and wedges sit where the
+//! sectors actually are. Now boundaries line up between rings only if the
+//! disk's geometry really is consistent, so ragged boundaries are a genuine
+//! finding: head-to-head skew, a wandering spindle, a warped disk.
+//!
+//! Those deviations are small — a fraction of a degree against a 360° platter,
+//! invisible if drawn true to scale — so they are **exaggerated**, by a factor
+//! chosen from the worst deviation on the disk. [`render`] records that factor
+//! in [`DiskMap::angle_gain`] so the caller can state it. A map with amplified
+//! positions and no way to say by how much is a map that misleads; deviations
+//! are measured against the disk's own average geometry rather than an ideal
+//! even division, since sectors are not evenly spaced to begin with.
 //!
 //! BMP (24-bit, uncompressed) is written by hand so we pull in no image crate,
 //! consistent with the rest of the app avoiding heavy dependencies.
@@ -47,6 +61,17 @@ pub struct TrackHealth {
     pub good: u32,
 }
 
+/// A sector measured in place by a surface scan: where it actually is, rather
+/// than where an even division of the track would put it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeasuredSector {
+    /// The sector's own number, from its address mark.
+    pub id: u32,
+    pub ok: bool,
+    /// Position in the revolution, `0.0..1.0` from the index pulse.
+    pub angle: f64,
+}
+
 /// Everything needed to draw one disk's read-health platter(s).
 #[derive(Debug, Clone)]
 pub struct DiskMap {
@@ -57,6 +82,15 @@ pub struct DiskMap {
     /// `(head, cyl)` → each sector's state, indexed as `gw` numbers them.
     /// A track absent from here was never read, and is drawn hollow.
     pub tracks: BTreeMap<(u32, u32), Vec<SectorState>>,
+    /// `(head, cyl)` → sectors with measured angles, when a surface scan
+    /// supplied them. Empty for a map built from an ordinary read, which
+    /// cannot know where sectors are.
+    pub measured: BTreeMap<(u32, u32), Vec<MeasuredSector>>,
+    /// How far measured deviations were exaggerated when drawing, or `None`
+    /// when positions are schematic. Real deviations are a fraction of a
+    /// degree against a 360° platter — invisible at true scale — so the map
+    /// is only useful if it says by how much it lied.
+    pub angle_gain: Option<f64>,
 }
 
 impl DiskMap {
@@ -68,7 +102,60 @@ impl DiskMap {
             heads,
             cyls,
             tracks,
+            measured: BTreeMap::new(),
+            angle_gain: None,
         }
+    }
+
+    /// Build from a surface scan, which measured where every sector is.
+    ///
+    /// `scans` is `(head, cyl, sectors)`. Sector state comes from the same
+    /// pass, so this needs no separate read.
+    pub fn from_scan(
+        label: impl Into<String>,
+        scans: Vec<(u32, u32, Vec<MeasuredSector>)>,
+    ) -> Self {
+        let mut states: BTreeMap<(u32, u32), Vec<SectorState>> = BTreeMap::new();
+        let mut measured: BTreeMap<(u32, u32), Vec<MeasuredSector>> = BTreeMap::new();
+        for (head, cyl, mut sectors) in scans {
+            // Drawn in the order they pass the head, which is the order they
+            // physically sit on the track -- not their numbering, which
+            // interleave scrambles.
+            sectors.sort_by(|a, b| a.angle.total_cmp(&b.angle));
+            states.insert(
+                (head, cyl),
+                sectors
+                    .iter()
+                    .map(|s| if s.ok { SectorState::Good } else { SectorState::Bad })
+                    .collect(),
+            );
+            measured.insert((head, cyl), sectors);
+        }
+        let mut map = Self::new(label, states);
+        map.measured = measured;
+        map
+    }
+
+    /// Mean angle of each sector id across every track that has it: the disk's
+    /// own reference geometry, which each track is then compared against.
+    ///
+    /// Taken from the disk rather than from an even division of the track,
+    /// because sectors are not evenly spaced to begin with — the inter-sector
+    /// gaps differ, and gap 4 before the index is much larger than the rest.
+    /// Comparing against an ideal would drown the track-to-track differences
+    /// we actually care about in that much larger, entirely normal, offset.
+    fn reference_angles(&self) -> BTreeMap<u32, f64> {
+        let mut sums: BTreeMap<u32, (f64, u32)> = BTreeMap::new();
+        for sectors in self.measured.values() {
+            for s in sectors {
+                let e = sums.entry(s.id).or_insert((0.0, 0));
+                e.0 += s.angle;
+                e.1 += 1;
+            }
+        }
+        sums.into_iter()
+            .map(|(id, (sum, n))| (id, sum / n as f64))
+            .collect()
     }
 
     /// Build from `gw`'s end-of-read sector grid: the exact per-sector truth.
@@ -178,8 +265,101 @@ const HUB_FRAC: f64 = 0.18;
 /// Keep a single platter within this, however many cylinders there are.
 const MAX_RADIUS: f64 = 620.0;
 
+/// How much of the platter the largest measured deviation should span, in
+/// revolutions. Deviations are a fraction of a degree; without exaggeration
+/// every ring lines up perfectly and the picture says nothing.
+const DEVIATION_TARGET: f64 = 0.055; // ~20 degrees
+
+/// Per-track drawn wedge boundaries, in revolutions from the index mark.
+///
+/// With measured angles the boundaries are the disk's reference geometry plus
+/// each track's *exaggerated* deviation from it, so track-to-track skew — the
+/// thing that is real but sub-degree — becomes something you can see. Returns
+/// the gain applied, so the caller can say what it did.
+fn placements(map: &DiskMap) -> (BTreeMap<(u32, u32), Vec<f64>>, Option<f64>) {
+    if map.measured.is_empty() {
+        return (BTreeMap::new(), None);
+    }
+    let reference = map.reference_angles();
+
+    // Largest deviation anywhere on the disk sets the gain, so the worst
+    // offender is clearly visible and everything else is to the same scale.
+    let mut worst: f64 = 0.0;
+    for sectors in map.measured.values() {
+        for s in sectors {
+            if let Some(&r) = reference.get(&s.id) {
+                worst = worst.max(wrapped_delta(s.angle, r).abs());
+            }
+        }
+    }
+    // A disk with no measurable variation needs no exaggeration; and cap the
+    // gain so a single freak track can't smear the whole picture.
+    let gain = if worst < 1e-9 {
+        1.0
+    } else {
+        (DEVIATION_TARGET / worst).clamp(1.0, 2000.0)
+    };
+
+    let mut out = BTreeMap::new();
+    for (&key, sectors) in &map.measured {
+        let mut angles = Vec::with_capacity(sectors.len());
+        for s in sectors {
+            let base = reference.get(&s.id).copied().unwrap_or(s.angle);
+            let dev = wrapped_delta(s.angle, base);
+            angles.push((base + dev * gain).rem_euclid(1.0));
+        }
+        out.insert(key, angles);
+    }
+    (out, Some(gain))
+}
+
+/// Signed difference between two positions on a circle, in `-0.5..0.5`.
+fn wrapped_delta(a: f64, b: f64) -> f64 {
+    let d = (a - b).rem_euclid(1.0);
+    if d > 0.5 {
+        d - 1.0
+    } else {
+        d
+    }
+}
+
+/// Which wedge an angle falls in, given the drawn boundaries, and how far
+/// through it. Boundaries are in revolution order but the last wedge wraps
+/// past the index, so the search has to wrap with it.
+fn wedge_at(bounds: &[f64], a: f64) -> Option<(usize, f64)> {
+    let n = bounds.len();
+    if n == 0 {
+        return None;
+    }
+    for i in 0..n {
+        let start = bounds[i];
+        let end = bounds[(i + 1) % n];
+        let span = (end - start).rem_euclid(1.0);
+        let span = if span <= 0.0 { 1.0 } else { span };
+        let into = (a - start).rem_euclid(1.0);
+        if into < span {
+            return Some((i, into / span));
+        }
+    }
+    None
+}
+
+/// Render `map`, recording on it the exaggeration applied to measured angles
+/// so the caller can state it. Prefer this over [`render_bmp`] whenever the
+/// map came from a surface scan: a picture with amplified positions and no way
+/// to say by how much is a picture that misleads.
+pub fn render(map: &mut DiskMap) -> Vec<u8> {
+    let (drawn, gain) = placements(map);
+    map.angle_gain = gain.filter(|g| *g > 1.0);
+    draw(map, &drawn)
+}
+
 /// Render `map` to BMP bytes. One platter per head, side by side.
 pub fn render_bmp(map: &DiskMap) -> Vec<u8> {
+    draw(map, &placements(map).0)
+}
+
+fn draw(map: &DiskMap, drawn: &BTreeMap<(u32, u32), Vec<f64>>) -> Vec<u8> {
     let heads = map.heads.max(1) as usize;
     let cyls = map.cyls.max(1) as usize;
 
@@ -240,12 +420,27 @@ pub fn render_bmp(map: &DiskMap) -> Vec<u8> {
                     continue;
                 };
 
-                let n = states.len();
-                let pos = a * n as f64;
-                let sector = (pos.floor() as usize).min(n - 1);
+                // With a scan, wedges sit at measured (exaggerated) positions;
+                // without one, they divide the ring evenly.
+                let (sector, into) = match drawn.get(&(head as u32, cyl as u32)) {
+                    Some(bounds) => match wedge_at(bounds, a) {
+                        Some(v) => v,
+                        None => continue,
+                    },
+                    None => {
+                        let pos = a * states.len() as f64;
+                        (
+                            (pos.floor() as usize).min(states.len() - 1),
+                            pos.fract(),
+                        )
+                    }
+                };
+                if sector >= states.len() {
+                    continue;
+                }
                 // Blank the trailing slice of each wedge: the sector gaps that
                 // make the ring read as a pizza rather than a band.
-                if pos.fract() > 1.0 - WEDGE_GAP {
+                if into > 1.0 - WEDGE_GAP {
                     continue;
                 }
 
@@ -442,6 +637,98 @@ mod tests {
         let (w, h) = dims(&bmp);
         let found = (MARGIN..w / 2).any(|x| pixel_at(&bmp, w, h, x, h / 2) == UNREAD);
         assert!(found, "the unread ring wasn't drawn hollow");
+    }
+
+    fn measured(id: u32, angle: f64) -> MeasuredSector {
+        MeasuredSector { id, ok: true, angle }
+    }
+
+    #[test]
+    fn wrapped_delta_takes_the_short_way_round() {
+        assert!((wrapped_delta(0.1, 0.2) + 0.1).abs() < 1e-12);
+        // 0.01 is just *after* the index, 0.99 just before: a tenth of a
+        // revolution apart, not nine tenths.
+        assert!((wrapped_delta(0.01, 0.99) - 0.02).abs() < 1e-12);
+        assert!((wrapped_delta(0.99, 0.01) + 0.02).abs() < 1e-12);
+    }
+
+    #[test]
+    fn wedge_lookup_wraps_past_the_index() {
+        let bounds = vec![0.1, 0.4, 0.7];
+        assert_eq!(wedge_at(&bounds, 0.1).unwrap().0, 0);
+        assert_eq!(wedge_at(&bounds, 0.5).unwrap().0, 1);
+        // The last wedge runs from 0.7 round through the index to 0.1, so
+        // both of these belong to it.
+        assert_eq!(wedge_at(&bounds, 0.8).unwrap().0, 2);
+        assert_eq!(wedge_at(&bounds, 0.05).unwrap().0, 2);
+    }
+
+    /// Sectors are drawn in the order they pass the head, not in numbering
+    /// order — interleaved disks write 1,6,2,7,… around the track.
+    #[test]
+    fn scan_orders_sectors_by_position_not_by_number() {
+        let map = DiskMap::from_scan(
+            "d",
+            vec![(0, 0, vec![measured(1, 0.0), measured(6, 0.11), measured(2, 0.22)])],
+        );
+        let ids: Vec<u32> = map.measured[&(0, 0)].iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![1, 6, 2]);
+    }
+
+    /// Real deviations are a fraction of a degree against a 360° platter, so
+    /// they must be exaggerated to be visible at all — and the factor has to
+    /// be reported, or the picture is a lie.
+    #[test]
+    fn measured_deviations_are_amplified_and_the_gain_reported() {
+        // Two cylinders, one sector 0.001 of a revolution (0.36°) apart.
+        let mut map = DiskMap::from_scan(
+            "d",
+            vec![
+                (0, 0, vec![measured(1, 0.200), measured(2, 0.600)]),
+                (0, 1, vec![measured(1, 0.201), measured(2, 0.601)]),
+            ],
+        );
+        let _ = render(&mut map);
+        let gain = map.angle_gain.expect("no gain recorded");
+        assert!(gain > 1.0, "deviation was not amplified: {gain}");
+
+        // The drawn separation should land near the target, not at the raw
+        // 0.0005 half-deviation either side of the mean.
+        let (drawn, _) = placements(&map);
+        let a = drawn[&(0, 0)][0];
+        let b = drawn[&(0, 1)][0];
+        let sep = wrapped_delta(b, a).abs();
+        assert!(sep > 0.02, "drawn separation too small to see: {sep}");
+    }
+
+    /// A disk with identical geometry on every track must not have noise
+    /// amplified into a fake wobble.
+    #[test]
+    fn identical_tracks_get_no_amplification() {
+        let tracks: Vec<_> = (0..4)
+            .map(|cyl| (0u32, cyl, vec![measured(1, 0.2), measured(2, 0.6)]))
+            .collect();
+        let mut map = DiskMap::from_scan("d", tracks);
+        let _ = render(&mut map);
+        assert_eq!(map.angle_gain, None, "invented a wobble out of nothing");
+    }
+
+    /// A scan carries recovery state too, so it needs no separate read.
+    #[test]
+    fn scan_carries_sector_state() {
+        let map = DiskMap::from_scan(
+            "d",
+            vec![(
+                0,
+                0,
+                vec![
+                    MeasuredSector { id: 1, ok: true, angle: 0.0 },
+                    MeasuredSector { id: 2, ok: false, angle: 0.5 },
+                ],
+            )],
+        );
+        assert_eq!(map.totals(), (1, 2));
+        assert_eq!(map.tracks[&(0, 0)][1], SectorState::Bad);
     }
 
     #[test]

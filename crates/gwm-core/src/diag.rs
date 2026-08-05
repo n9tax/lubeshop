@@ -533,3 +533,126 @@ mod tests {
         assert!(parse_line(r#"{"t":"weather","sunny":true}"#).is_none());
     }
 }
+
+// ---- surface scan ----------------------------------------------------------
+
+/// One track measured by `gw diag --scan`: where its sectors physically sit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScanTrack {
+    pub cyl: u32,
+    pub head: u32,
+    /// Measured spindle speed for this track, or `None` if no index was found.
+    pub rpm: Option<f64>,
+    /// How many revolutions the angles were averaged over.
+    #[serde(default)]
+    pub revs: u32,
+    pub sectors: Vec<ScanSector>,
+}
+
+/// One sector, as found on the track.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScanSector {
+    /// The sector's own number, from its address mark.
+    pub id: u32,
+    /// The cylinder its header *claims*, which is not always where it is.
+    pub c: u32,
+    pub h: u32,
+    /// Size code: `128 << n` bytes.
+    pub n: u32,
+    /// Data CRC checked out on at least one revolution.
+    pub ok: bool,
+    /// Position in the revolution, `0.0..1.0` from the index pulse.
+    pub angle: f64,
+    /// Time from the index pulse, in milliseconds.
+    pub ms: f64,
+}
+
+impl ScanTrack {
+    /// Whether every sector on this track read cleanly.
+    pub fn all_good(&self) -> bool {
+        !self.sectors.is_empty() && self.sectors.iter().all(|s| s.ok)
+    }
+
+    /// Sectors whose header names a different cylinder than where the head is
+    /// — the track is mistracking, or the disk was written on a misaligned
+    /// drive. Empty on a healthy track.
+    pub fn off_track(&self) -> Vec<&ScanSector> {
+        self.sectors.iter().filter(|s| s.c != self.cyl).collect()
+    }
+}
+
+/// Build the argument vector for a surface scan.
+pub fn build_scan_args(opts: &DiagOptions, cyls: u32, heads: u32, revs: u32) -> Vec<String> {
+    let mut args = build_diag_args(opts);
+    args.push("--scan".to_string());
+    args.push(format!("--cyls={cyls}"));
+    args.push(format!("--heads={heads}"));
+    args.push(format!("--revs={revs}"));
+    args
+}
+
+/// Turn one line of a scan's output into a track, or `None` for the hello,
+/// event and bye records (which [`parse_line`] already models).
+pub fn parse_scan_line(line: &str) -> Option<ScanTrack> {
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if value.get("t").and_then(|t| t.as_str()) != Some("track") {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    /// A real record, trimmed, as emitted against a 360K disk.
+    const TRACK: &str = r#"{"t":"track","cyl":0,"head":1,"rpm":300.122,"revs":3,
+        "sectors":[
+          {"id":1,"c":0,"h":1,"n":2,"ok":true,"angle":0.02567,"ms":5.1317},
+          {"id":2,"c":0,"h":1,"n":2,"ok":false,"angle":0.13096,"ms":26.1809}]}"#;
+
+    #[test]
+    fn parses_a_scan_track() {
+        let t = parse_scan_line(TRACK).expect("expected a track");
+        assert_eq!((t.cyl, t.head), (0, 1));
+        assert_eq!(t.rpm, Some(300.122));
+        assert_eq!(t.revs, 3);
+        assert_eq!(t.sectors.len(), 2);
+        assert_eq!(t.sectors[0].id, 1);
+        assert!((t.sectors[0].angle - 0.02567).abs() < 1e-9);
+        assert!(!t.all_good(), "one sector failed");
+    }
+
+    #[test]
+    fn other_record_types_are_not_tracks() {
+        assert!(parse_scan_line(r#"{"t":"bye"}"#).is_none());
+        assert!(parse_scan_line(r#"{"t":"event","level":"info","msg":"x"}"#).is_none());
+        assert!(parse_scan_line("not json").is_none());
+    }
+
+    /// A sector whose header names a different cylinder is the signature of a
+    /// mistracking head, and worth surfacing separately from a CRC failure.
+    #[test]
+    fn off_track_sectors_are_picked_out() {
+        let t = parse_scan_line(
+            r#"{"t":"track","cyl":5,"head":0,"rpm":300.0,"revs":2,"sectors":[
+                {"id":1,"c":5,"h":0,"n":2,"ok":true,"angle":0.0,"ms":0.0},
+                {"id":2,"c":4,"h":0,"n":2,"ok":true,"angle":0.5,"ms":100.0}]}"#,
+        )
+        .unwrap();
+        let stray = t.off_track();
+        assert_eq!(stray.len(), 1);
+        assert_eq!(stray[0].c, 4);
+    }
+
+    #[test]
+    fn scan_args_carry_the_geometry() {
+        let args = build_scan_args(&DiagOptions::default(), 40, 2, 3);
+        assert!(args.iter().any(|a| a == "--scan"));
+        assert!(args.iter().any(|a| a == "--cyls=40"));
+        assert!(args.iter().any(|a| a == "--heads=2"));
+        assert!(args.iter().any(|a| a == "--revs=3"));
+        // Still a batch session: the scan speaks the same protocol.
+        assert!(args.iter().any(|a| a == "--batch"));
+    }
+}
