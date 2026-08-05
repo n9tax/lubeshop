@@ -34,6 +34,13 @@ screen.
 - **Decode flux captures** — raw flux files (`.hfe`/`.scp`/`.raw`) aren't directly
   readable; the app decodes them to a browsable image on the fly (including TRS-80
   captures, via HxC).
+- **Clean drive heads** — runs Greaseweazle's zig-zag cleaning pass, with a
+  48 TPI tick for 40-track drives so the sweep doesn't run the head into the stop.
+- **Diagnose a drive live** — keep a disk spinning and steer the head by hand while
+  the screen shows spindle speed, how many sectors are reading cleanly off the track
+  under the head, and the state of the interface lines. Good for chasing down bad
+  alignment, a slipping belt, or a drive that only *sometimes* reads. Reads only —
+  it never writes to the disk. See **Drive diagnostic** below.
 
 Your whole library — images, catalog, and settings — lives in **one portable
 folder** you can copy to another machine and pick right back up.
@@ -227,6 +234,34 @@ shows the keys for the current screen, but the essentials:
 There are several themes too (a plain dark and light, plus retro **Borland**,
 **C64**, and **VIC-20** palettes) under **Settings**, along with the store-folder
 location and drive-tuning options for stubborn drives.
+
+---
+
+## Drive diagnostic
+
+**Main menu → Drive diagnostic.** Put a disk in, choose the data rate, and the
+drive stays spinning while you drive the head around. Every half second you get a
+fresh read of whatever track is under the head:
+
+- **RPM**, with a meter against the nominal spindle speed and a trend strip, so a
+  drive that's slightly fast, drifting, or dropping out is obvious at a glance.
+- **Sectors** read cleanly off this track, against how many were expected — green
+  when the track is perfect, red when it isn't.
+- **Stray sectors**: sectors that decoded fine but whose headers name a *different*
+  track. That means the head isn't where the drive thinks it is — a classic
+  mistracking or alignment symptom.
+- **Interface lines**: drive-select, motor, write-protect, track-0 and density,
+  each shown as what it *means* rather than as a raw pin level.
+
+Keys: `←`/`→` step one track, `0`-`9` jump to that track ×10, `h` head, `r`
+recalibrate, `m` motor, `s` drive-select (independent of the motor — some drives
+gate the head-load solenoid off select, not motor-on), `d` density, `q` back.
+
+This one needs the **diagnostic fork** of the Greaseweazle tools, since `gw diag`
+isn't in an upstream release. Install **Greaseweazle diag** from the **Tools**
+screen and it's picked up automatically — it goes in beside your normal `gw` as
+`gw-diag`, so reads and writes stay on the release build. To point at a different
+build instead, set `diag_command` in `settings.toml`.
 
 ---
 

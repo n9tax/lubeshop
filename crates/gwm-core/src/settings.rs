@@ -9,6 +9,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// `skip_serializing_if` helper: keeps default-`false` flags out of the file.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -16,6 +21,19 @@ pub struct Settings {
     pub theme: String,
     /// Drive selector pre-selected in the read/write wizards.
     pub default_drive: String,
+    /// Command to run for the live drive diagnostic. The `diag` command only
+    /// exists in the diagnostic fork of the Greaseweazle tools, so this is
+    /// kept separate from the `gw` used for reads and writes: point it at the
+    /// fork without giving up a known-good `gw` for everything else. Absent =
+    /// use plain `gw`, which works when the fork *is* what is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diag_command: Option<String>,
+    /// Whether the drive being cleaned is a 48 TPI (40-cylinder) one. `gw clean`
+    /// defaults to 80 cylinders, which on a 40-cylinder drive drives the head
+    /// into the stop for half of every pass, so the zig-zag has to be told.
+    /// Persisted because it is a property of the user's drive, not of the run.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clean_48tpi: bool,
     /// Greaseweazle drive-delay overrides, keyed by flag name (`step`, `settle`,
     /// …). Applied to the device before reads. Empty = leave gw defaults.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -49,6 +67,8 @@ impl Default for Settings {
         Self {
             theme: "dark".to_string(),
             default_drive: "a".to_string(),
+            diag_command: None,
+            clean_48tpi: false,
             tuning: HashMap::new(),
             tuning_profiles: BTreeMap::new(),
             recent_formats: Vec::new(),
@@ -91,6 +111,8 @@ mod tests {
         let settings = Settings {
             theme: "c64".to_string(),
             default_drive: "b".to_string(),
+            diag_command: Some("/opt/gw-diag/bin/gw".to_string()),
+            clean_48tpi: true,
             tuning: std::collections::HashMap::from([("step".to_string(), 16000)]),
             tuning_profiles: std::collections::BTreeMap::from([(
                 "Shugart SA400".to_string(),
@@ -112,6 +134,11 @@ mod tests {
         let loaded = Settings::load(&dir);
         assert_eq!(loaded.theme, "c64");
         assert_eq!(loaded.default_drive, "b");
+        assert_eq!(
+            loaded.diag_command.as_deref(),
+            Some("/opt/gw-diag/bin/gw")
+        );
+        assert!(loaded.clean_48tpi);
         assert_eq!(loaded.tuning.get("step"), Some(&16000));
         assert_eq!(
             loaded.tuning_profiles.get("Shugart SA400").and_then(|p| p.get("step")),

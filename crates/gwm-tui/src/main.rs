@@ -4,6 +4,7 @@
 
 mod app;
 mod count_job;
+mod diag_job;
 mod download_job;
 mod file_browser;
 mod gotek_job;

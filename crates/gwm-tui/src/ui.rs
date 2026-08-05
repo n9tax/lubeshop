@@ -101,6 +101,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::NameInput => render_name_input(app, frame, chunks[1]),
         Screen::ReadOptions => render_read_options(app, frame, chunks[1]),
         Screen::Reading | Screen::ReadDone => render_reading(app, frame, chunks[1]),
+        Screen::DiagOptions => render_diag_options(app, frame, chunks[1]),
+        Screen::Diag => render_diag(app, frame, chunks[1]),
+        Screen::CleanOptions => render_clean_options(app, frame, chunks[1]),
         Screen::Ti99Transfer | Screen::Ti99Done => render_ti99(app, frame, chunks[1]),
         Screen::WriteSource => render_write_source(app, frame, chunks[1]),
         Screen::WriteConfirm => render_write_confirm(app, frame, chunks[1]),
@@ -2167,6 +2170,11 @@ fn status_hint(app: &App) -> &'static str {
                 }
             }
             Screen::ReadDone => "  Enter return to menu",
+            Screen::CleanOptions => "  Space toggle · Enter start cleaning · Esc back",
+            Screen::DiagOptions => "  ↑/↓ row · ←/→ change · Enter start · Esc back",
+            Screen::Diag => {
+                "  ←/→ step · 0-9 jump ×10 · h head · r recal · m motor · s select · d density · q back"
+            }
             Screen::WriteSource => "  ↑/↓ move · Enter select · Esc back",
             Screen::WriteConfirm => "  y write · e toggle erase · Esc cancel",
             Screen::Writing => "  writing… please wait",
@@ -2215,6 +2223,358 @@ fn status_hint(app: &App) -> &'static str {
     }
 }
 
+fn render_clean_options(app: &App, frame: &mut Frame, area: Rect) {
+    let on = app.core.settings.clean_48tpi;
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Cleaning drive ", dim()),
+            Span::styled(
+                app.core.settings.default_drive.to_uppercase(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("▸ 48 TPI drive (40 track)  ", accented()),
+            Span::styled(
+                if on { "[x]" } else { "[ ]" },
+                Style::default().fg(theme().accent),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Tick this for a 40-track drive — an early 5.25\" like a Tandon TM100-1,",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "  a 1541, or an 8-inch drive. The cleaning sweep then covers 40 cylinders",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "  instead of 80, so the head isn't driven into the stop on every pass.",
+            dim(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Leave it clear for an 80-track drive (1.2MB 5.25\", any 3.5\").",
+            dim(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Put a cleaning disk in the drive before you start.",
+            Style::default().fg(theme().warning),
+        )),
+    ];
+    frame.render_widget(para(lines).block(bordered("Clean drive")), area);
+}
+
+// ---- Live drive diagnostic ------------------------------------------------
+
+fn render_diag_options(app: &App, frame: &mut Frame, area: Rect) {
+    // 25 wide, not the 22 the read-options screen uses: the longest label here
+    // is "Double-step (48→96 TPI)", which needs the extra room to keep the
+    // value column aligned.
+    let row = |sel: bool, label: &str, value: String| -> Line<'static> {
+        let marker = if sel { "▸ " } else { "  " };
+        let label_style = if sel { accented() } else { base() };
+        Line::from(vec![
+            Span::styled(format!("{marker}{label:<25}"), label_style),
+            Span::styled(value, Style::default().add_modifier(Modifier::BOLD)),
+        ])
+    };
+    let opts = &app.diag_opts;
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Spin a disk and watch the drive read it, live.",
+            dim(),
+        )),
+        Line::from(""),
+        row(app.diag_opt_row == 0, "Drive", opts.drive.to_uppercase()),
+        row(app.diag_opt_row == 1, "Data rate", format!("{} kbps", opts.rate)),
+        row(app.diag_opt_row == 2, "Encoding", opts.encoding.to_uppercase()),
+        row(
+            app.diag_opt_row == 3,
+            "Sectors per track",
+            match opts.secs {
+                Some(n) => n.to_string(),
+                None => "guess from rate + rpm".to_string(),
+            },
+        ),
+        row(
+            app.diag_opt_row == 4,
+            "Double-step (48→96 TPI)",
+            if opts.double_step { "[x]".into() } else { "[ ]".to_string() },
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Data rate is the one value that can't be guessed: 250 for double",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "  density, 500 for high density. 500kbps is both a 1.2MB 5.25\" and a",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "  1.44MB 3.5\" disk, at different spindle speeds — so you pick it.",
+            dim(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Nothing here writes to the disk. Reads only.",
+            Style::default().fg(theme().success),
+        )),
+    ];
+    frame.render_widget(para(lines).block(bordered("Drive diagnostic")), area);
+}
+
+/// A compact bar for a value against a nominal target, e.g. RPM against 300.
+fn meter(value: f64, nominal: f64, width: usize, colour: Color) -> Vec<Span<'static>> {
+    // Show +-10% around nominal, so a healthy drive sits mid-bar and a sick
+    // one is visibly pinned to an end rather than merely "somewhere left".
+    let lo = nominal * 0.9;
+    let frac = ((value - lo) / (nominal * 0.2)).clamp(0.0, 1.0);
+    let filled = (frac * width as f64).round() as usize;
+    vec![
+        Span::styled("▐".to_string(), dim()),
+        Span::styled("█".repeat(filled), Style::default().fg(colour)),
+        Span::styled("░".repeat(width.saturating_sub(filled)), dim()),
+        Span::styled("▌".to_string(), dim()),
+    ]
+}
+
+/// The RPM trend strip: one column per recent reading, a gap for a dropout.
+fn rpm_trend(history: &std::collections::VecDeque<Option<f64>>, nominal: f64) -> Vec<Span<'static>> {
+    const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    history
+        .iter()
+        .map(|sample| match sample {
+            None => Span::styled("·".to_string(), Style::default().fg(theme().danger)),
+            Some(rpm) => {
+                let frac = ((rpm - nominal * 0.9) / (nominal * 0.2)).clamp(0.0, 1.0);
+                let idx = ((frac * (BLOCKS.len() - 1) as f64).round() as usize).min(BLOCKS.len() - 1);
+                let in_range = (rpm - nominal).abs() <= 5.0;
+                let colour = if in_range { theme().success } else { theme().warning };
+                Span::styled(BLOCKS[idx].to_string(), Style::default().fg(colour))
+            }
+        })
+        .collect()
+}
+
+fn render_diag(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(job) = app.diag_job.as_ref() else {
+        frame.render_widget(
+            para(vec![Line::from("  The diagnostic is not running.")])
+                .block(bordered("Drive diagnostic")),
+            area,
+        );
+        return;
+    };
+
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+
+    let Some(status) = job.status.as_ref() else {
+        lines.push(Line::from(Span::styled(
+            "  Starting the drive and homing the head…",
+            accented(),
+        )));
+        for (is_error, text) in &job.notices {
+            let style = if *is_error {
+                Style::default().fg(theme().danger)
+            } else {
+                dim()
+            };
+            lines.push(Line::from(Span::styled(format!("  {text}"), style)));
+        }
+        frame.render_widget(para(lines).block(bordered("Drive diagnostic")), area);
+        return;
+    };
+
+    // Position.
+    lines.push(Line::from(vec![
+        Span::styled("  Drive ", dim()),
+        Span::styled(status.drive.clone(), bold),
+        Span::styled("     Track ", dim()),
+        Span::styled(format!("{:<4}", status.cyl), bold),
+        Span::styled(" Head ", dim()),
+        Span::styled(status.head.to_string(), bold),
+        Span::styled(
+            if app.diag_opts.double_step {
+                "   (double-stepping)"
+            } else {
+                ""
+            },
+            dim(),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    // Spindle speed, with a meter against the nearer standard speed.
+    let nominal = if status.rpm.unwrap_or(300.0) >= 330.0 { 360.0 } else { 300.0 };
+    let rpm_colour = match status.rpm_in_range() {
+        Some(true) => theme().success,
+        Some(false) => theme().danger,
+        None => theme().dim,
+    };
+    let mut rpm_line = vec![
+        Span::styled("  RPM    ", dim()),
+        Span::styled(
+            match (status.motor, status.rpm) {
+                (false, _) => "motor off".to_string(),
+                (true, None) => "no index".to_string(),
+                (true, Some(rpm)) => format!("{rpm:.2}"),
+            },
+            Style::default().fg(rpm_colour).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(rpm) = status.rpm {
+        rpm_line.push(Span::styled(format!("{:width$}", "", width = 3), dim()));
+        rpm_line.extend(meter(rpm, nominal, 16, rpm_colour));
+        rpm_line.push(Span::styled(format!("  nominal {nominal:.0}"), dim()));
+    }
+    lines.push(Line::from(rpm_line));
+
+    // Sector health for the track under the head.
+    let sect_colour = match status.track_is_clean() {
+        Some(true) => theme().success,
+        Some(false) => theme().danger,
+        None => theme().dim,
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  Sect   ", dim()),
+        Span::styled(
+            format!(
+                "{}/{}",
+                status.sect,
+                status.secs.map(|s| s.to_string()).unwrap_or("?".into())
+            ),
+            Style::default().fg(sect_colour).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            match status.track_is_clean() {
+                Some(true) => "        every expected sector read cleanly",
+                Some(false) => "        short read — alignment, speed or media",
+                None => "        expected count unknown (set sectors/track)",
+            },
+            dim(),
+        ),
+    ]));
+
+    // Off-track sectors: the head is reading somewhere it shouldn't be.
+    lines.push(Line::from(vec![
+        Span::styled("  Stray  ", dim()),
+        if status.off_track.is_empty() {
+            Span::styled("none", Style::default().fg(theme().success))
+        } else {
+            Span::styled(
+                status
+                    .off_track
+                    .iter()
+                    .map(|(cyl, n)| format!("{n} from track {cyl}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                Style::default().fg(theme().danger).add_modifier(Modifier::BOLD),
+            )
+        },
+        Span::styled(
+            if status.off_track.is_empty() {
+                ""
+            } else {
+                "   the head is mistracking"
+            },
+            dim(),
+        ),
+    ]));
+
+    // RPM trend.
+    if job.rpm_history.iter().any(Option::is_some) {
+        let mut trend = vec![Span::styled("  Trend  ", dim())];
+        trend.extend(rpm_trend(&job.rpm_history, nominal));
+        lines.push(Line::from(trend));
+    }
+    lines.push(Line::from(""));
+
+    // Interface lines. Raw level plus what it means, since the bus is
+    // active-low and the raw level alone misleads.
+    let onoff = |on: bool| -> Span<'static> {
+        Span::styled(
+            if on { "on " } else { "off" }.to_string(),
+            Style::default().fg(if on { theme().success } else { theme().dim }),
+        )
+    };
+    let tri = |level: Option<bool>, when_low: &str, when_high: &str| -> Span<'static> {
+        match level {
+            None => Span::styled("unknown".to_string(), dim()),
+            Some(true) => Span::styled(when_high.to_string(), base()),
+            Some(false) => Span::styled(when_low.to_string(), base()),
+        }
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  SEL ", dim()),
+        onoff(status.sel),
+        Span::styled("   MOT ", dim()),
+        onoff(status.motor),
+        Span::styled("   WP ", dim()),
+        match status.write_protected {
+            Some(true) => Span::styled(
+                "protected".to_string(),
+                Style::default().fg(theme().warning),
+            ),
+            Some(false) => Span::styled("writable".to_string(), base()),
+            None => Span::styled("unknown".to_string(), dim()),
+        },
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  TK0 ", dim()),
+        match status.at_track0 {
+            Some(true) => Span::styled(
+                "at track 0".to_string(),
+                Style::default().fg(theme().success),
+            ),
+            Some(false) => Span::styled("off track 0".to_string(), base()),
+            None => Span::styled("unknown".to_string(), dim()),
+        },
+        Span::styled("   DEN ", dim()),
+        Span::styled(
+            if status.density { "high" } else { "low " }.to_string(),
+            base(),
+        ),
+        Span::styled("   DC34 ", dim()),
+        tri(status.dc, "low", "high"),
+    ]));
+
+    // Notices from the tool, newest last.
+    if !job.notices.is_empty() {
+        lines.push(Line::from(""));
+        for (is_error, text) in &job.notices {
+            lines.push(Line::from(Span::styled(
+                format!("  {text}"),
+                if *is_error {
+                    Style::default().fg(theme().danger)
+                } else {
+                    dim()
+                },
+            )));
+        }
+    }
+
+    if let Some(reason) = job.failed.as_ref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {reason}"),
+            Style::default().fg(theme().danger).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Press any key to return to the menu.",
+            dim(),
+        )));
+    }
+
+    frame.render_widget(para(lines).block(bordered("Drive diagnostic — live")), area);
+}
+
 #[cfg(test)]
 mod render_smoke {
     use super::*;
@@ -2240,13 +2600,72 @@ mod render_smoke {
         }
     }
 
+    /// The diagnostic screens must render from job state alone, with no
+    /// device attached and no session running: the options form, the
+    /// "starting up" state before the first reading, and a full live frame.
+    #[test]
+    fn diag_screens_render() {
+        let mut app = App::new(Core::init().unwrap());
+        app.screen = Screen::DiagOptions;
+        for row in 0..App::DIAG_OPT_ROWS {
+            app.diag_opt_row = row;
+            let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            t.draw(|f| render(&mut app, f)).unwrap();
+        }
+
+        // The live screen with no job at all must not panic either — that is
+        // the state a stale Screen::Diag would leave behind.
+        app.screen = Screen::Diag;
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| render(&mut app, f)).unwrap();
+    }
+
+    /// A live frame built from a real status record, including the failure
+    /// banner, so the layout is exercised without hardware.
+    #[test]
+    fn diag_live_frame_renders_from_a_status_record() {
+        use gwm_core::diag::{parse_line, DiagEvent};
+
+        // Built through the real parser rather than by hand, so the record
+        // this screen is drawn from stays the record the tool actually sends.
+        let status = parse_line(
+            r#"{"t":"status","drive":"A","cyl":17,"head":1,"rpm":297.53,
+                "motor":true,"sect":8,"secs":9,"off_track":[[16,2]],
+                "sel":true,"density":false,"wp":true,"write_protected":false,
+                "tk0":true,"at_track0":false,"dc":null}"#,
+        )
+        .expect("a status event");
+
+        let mut app = App::new(Core::init().unwrap());
+        app.screen = Screen::Diag;
+        let mut job = crate::diag_job::DiagJob::detached_for_test();
+        job.absorb(status);
+        job.absorb(DiagEvent::Notice {
+            is_error: true,
+            text: "Seek failed".to_string(),
+        });
+        job.absorb(DiagEvent::Failed("the session ended".to_string()));
+        app.diag_job = Some(job);
+
+        for name in ["dark", "borland"] {
+            app.theme = crate::theme::by_name(name);
+            let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            t.draw(|f| render(&mut app, f)).unwrap();
+        }
+    }
+
     #[test]
     fn archive_screens_render() {
         use gwm_core::archive::{RemoteFile, SearchHit};
         let mut app = App::new(Core::init().unwrap());
 
-        // Menu → "Import from archive.org" (index 7) → search screen.
-        for _ in 0..7 {
+        // Menu → "Import from archive.org" → search screen. Found by name so
+        // inserting a menu item above it doesn't silently retarget this test.
+        let archive_row = MENU_ITEMS
+            .iter()
+            .position(|item| item.contains("archive.org"))
+            .expect("the archive.org menu item");
+        for _ in 0..archive_row {
             app.test_key(KeyCode::Down, KeyModifiers::NONE);
         }
         app.test_key(KeyCode::Enter, KeyModifiers::NONE);

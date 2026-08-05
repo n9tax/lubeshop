@@ -18,6 +18,7 @@ use gwm_core::models::{MediaItem, MediaKind, NewMediaItem, Source};
 use gwm_core::Core;
 
 use crate::count_job::{CountJob, CountState};
+use crate::diag_job::DiagJob;
 use crate::gotek_job::GotekJob;
 use crate::version_job::{VersionJob, VersionState};
 use gwm_core::convert::GotekFormat;
@@ -33,11 +34,12 @@ use crate::text_input::TextInput;
 use crate::theme::{self, Theme};
 use crate::write_job::WriteJob;
 
-pub const MENU_ITEMS: [&str; 11] = [
+pub const MENU_ITEMS: [&str; 12] = [
     "Read a disk",
     "Write a disk",
     "Reset the device",
     "Test drive RPM",
+    "Drive diagnostic",
     "Clean drive",
     "Library",
     "New image",
@@ -96,6 +98,11 @@ pub enum Screen {
     ReadOptions,
     Reading,
     ReadDone,
+    /// Live drive diagnostic: set-up form, then the running session.
+    DiagOptions,
+    Diag,
+    /// Head-cleaning set-up (drive geometry) before the zig-zag runs.
+    CleanOptions,
     WriteSource,
     WriteConfirm,
     Writing,
@@ -261,6 +268,15 @@ pub struct App {
     /// "Test drive RPM" menu item (kept after the job clears).
     pub rpm_job: Option<RpmJob>,
     pub rpm_result: Option<String>,
+    /// The live drive diagnostic: the running session, the options it will be
+    /// (or was) started with, and the selected row on the options screen.
+    /// `diag_supported` caches whether the configured command can do it at
+    /// all, probed once at startup so the menu can say so up front rather
+    /// than failing after the user commits.
+    pub diag_job: Option<DiagJob>,
+    pub diag_opts: gwm_core::diag::DiagOptions,
+    pub diag_opt_row: usize,
+    pub diag_supported: bool,
     pub read_outcome: Option<Result<String, String>>,
 
     pub write_state: ListState,
@@ -412,6 +428,10 @@ pub struct App {
 impl App {
     pub fn new(core: Core) -> Self {
         let theme = theme::by_name(&core.settings.theme);
+        // Probed once here rather than per-visit: it spawns `gw diag --help`,
+        // which is cheap but not free, and the answer can't change while we run.
+        let diag_supported = gwm_core::diag::probe(&diag_command(&core));
+        let diag_drive = core.settings.default_drive.clone();
         Self {
             core,
             screen: Screen::Menu,
@@ -459,6 +479,13 @@ impl App {
             ti99_outcome: None,
             rpm_job: None,
             rpm_result: None,
+            diag_job: None,
+            diag_opts: gwm_core::diag::DiagOptions {
+                drive: diag_drive,
+                ..Default::default()
+            },
+            diag_opt_row: 0,
+            diag_supported,
             read_outcome: None,
             write_state: ListState::default(),
             write_erase: false,
@@ -579,6 +606,13 @@ impl App {
                 Screen::Writing => {
                     if self.write_job.as_mut().map(WriteJob::pump).unwrap_or(false) {
                         self.finalize_write();
+                    }
+                }
+                // The diagnostic streams readings for as long as the screen is
+                // up; pump() just absorbs whatever arrived since the last frame.
+                Screen::Diag => {
+                    if let Some(job) = self.diag_job.as_mut() {
+                        job.pump();
                     }
                 }
                 Screen::Installing => {
@@ -814,6 +848,9 @@ impl App {
             Screen::WriteSource => self.on_write_source_key(code),
             Screen::WriteConfirm => self.on_write_confirm_key(code),
             Screen::Reading => self.on_reading_key(code),
+            Screen::DiagOptions => self.on_diag_options_key(code),
+            Screen::Diag => self.on_diag_key(code),
+            Screen::CleanOptions => self.on_clean_options_key(code),
             Screen::Writing => {} // destructive — runs to completion; Ctrl+C quits
             Screen::Ti99Transfer => {} // runs to completion
             Screen::Ti99Done => {
@@ -2380,17 +2417,18 @@ impl App {
                 1 => self.enter_write_flow(),
                 2 => self.reset_device(),
                 3 => self.test_rpm(),
-                4 => self.start_clean(),
-                5 => self.enter_library(),
-                6 => self.enter_create_flow(),
-                7 => self.enter_archive(),
-                8 => self.enter_tools(),
-                9 => {
+                4 => self.enter_diag(),
+                5 => self.start_clean(),
+                6 => self.enter_library(),
+                7 => self.enter_create_flow(),
+                8 => self.enter_archive(),
+                9 => self.enter_tools(),
+                10 => {
                     self.settings_index = 0;
                     self.settings_editing = false;
                     self.screen = Screen::Settings;
                 }
-                10 => self.should_quit = true,
+                11 => self.should_quit = true,
                 _ => {}
             },
             _ => {}
@@ -2432,6 +2470,154 @@ impl App {
             Some(text) => Some(text.to_string()),
             None => None,
         }
+    }
+
+    // ---- Live drive diagnostic -------------------------------------------
+
+    /// Data rates offered on the options screen, in kbps. Rate is the one
+    /// value the tool can't guess: 500kbps is both 1.2MB 5.25" HD at 360rpm
+    /// and 1.44MB 3.5" HD at 300rpm, so it can't be derived from the rest.
+    pub const DIAG_RATES: [u32; 4] = [250, 300, 500, 1000];
+    pub const DIAG_OPT_ROWS: usize = 5;
+
+    fn enter_diag(&mut self) {
+        if !self.gw_ready() {
+            return;
+        }
+        if !self.diag_supported {
+            self.notice = Some(format!(
+                "The live diagnostic needs the Greaseweazle diagnostic fork — \
+                 '{}' has no 'diag --batch'. Set diag_command in settings.toml \
+                 to point at it.",
+                diag_command(&self.core)
+            ));
+            return;
+        }
+        self.diag_opts.drive = self.core.settings.default_drive.clone();
+        self.diag_opt_row = 0;
+        self.screen = Screen::DiagOptions;
+    }
+
+    fn on_diag_options_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Backspace => self.screen = Screen::Menu,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.diag_opt_row = self
+                    .diag_opt_row
+                    .checked_sub(1)
+                    .unwrap_or(Self::DIAG_OPT_ROWS - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                self.diag_opt_row = (self.diag_opt_row + 1) % Self::DIAG_OPT_ROWS;
+            }
+            KeyCode::Enter => self.start_diag(),
+            _ => self.adjust_diag_opt(code),
+        }
+    }
+
+    fn adjust_diag_opt(&mut self, code: KeyCode) {
+        let delta: isize = match code {
+            KeyCode::Left | KeyCode::Char('h') => -1,
+            KeyCode::Right | KeyCode::Char('l') => 1,
+            KeyCode::Char(' ') | KeyCode::Char('x') => 1,
+            _ => return,
+        };
+        match self.diag_opt_row {
+            // Drive: the same selectors gw takes, IBM/PC then Shugart.
+            0 => {
+                const DRIVES: [&str; 6] = ["a", "b", "0", "1", "2", "3"];
+                let mut i = DRIVES
+                    .iter()
+                    .position(|d| *d == self.diag_opts.drive)
+                    .unwrap_or(0);
+                move_list_index(&mut i, DRIVES.len(), delta);
+                self.diag_opts.drive = DRIVES[i].to_string();
+            }
+            1 => {
+                let mut i = Self::DIAG_RATES
+                    .iter()
+                    .position(|r| *r == self.diag_opts.rate)
+                    .unwrap_or(0);
+                move_list_index(&mut i, Self::DIAG_RATES.len(), delta);
+                self.diag_opts.rate = Self::DIAG_RATES[i];
+            }
+            2 => {
+                self.diag_opts.encoding = if self.diag_opts.encoding == "mfm" {
+                    "fm".to_string()
+                } else {
+                    "mfm".to_string()
+                };
+            }
+            // Sectors/track: None = let the tool guess from rate and rpm.
+            3 => match (self.diag_opts.secs, delta) {
+                (None, 1) => self.diag_opts.secs = Some(1),
+                (None, _) => {}
+                (Some(1), -1) => self.diag_opts.secs = None,
+                (Some(n), d) => {
+                    self.diag_opts.secs = Some((n as isize + d).clamp(1, 64) as u32)
+                }
+            },
+            4 => self.diag_opts.double_step = !self.diag_opts.double_step,
+            _ => {}
+        }
+    }
+
+    fn start_diag(&mut self) {
+        // Carry the user's saved drive tuning in, so the diagnostic steps the
+        // same way a read does. Without this the session would use whatever
+        // the firmware defaults to and mislead anyone tuning a fussy drive.
+        self.diag_opts.step_delay = self.core.settings.tuning.get("step").copied();
+        match DiagJob::start(&diag_command(&self.core), &self.diag_opts) {
+            Ok(job) => {
+                self.diag_job = Some(job);
+                self.screen = Screen::Diag;
+            }
+            Err(err) => self.notice = Some(err),
+        }
+    }
+
+    /// Keys on the live diagnostic screen. Deliberately the same letters the
+    /// standalone `gw diag` uses, so muscle memory carries over.
+    fn on_diag_key(&mut self, code: KeyCode) {
+        use gwm_core::diag::DiagCommand;
+
+        if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.leave_diag();
+            return;
+        }
+        let Some(job) = self.diag_job.as_mut() else {
+            self.screen = Screen::Menu;
+            return;
+        };
+        if !job.is_live() {
+            // Session is over; any key returns rather than pretending the
+            // controls still do something.
+            self.leave_diag();
+            return;
+        }
+        let cmd = match code {
+            KeyCode::Left | KeyCode::Char('-') | KeyCode::Char(',') => DiagCommand::Step(-1),
+            KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('.') => DiagCommand::Step(1),
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                // Same as the CLI: a digit jumps to that track times ten.
+                DiagCommand::Goto(c.to_digit(10).unwrap_or(0) * 10)
+            }
+            KeyCode::Char('h') => DiagCommand::Head(1 - job.want_head),
+            KeyCode::Char('m') => DiagCommand::Motor(!job.want_motor),
+            KeyCode::Char('s') => DiagCommand::Select(!job.want_select),
+            KeyCode::Char('d') => DiagCommand::Density(!job.want_density),
+            KeyCode::Char('r') => DiagCommand::Recal,
+            _ => return,
+        };
+        job.send(cmd);
+    }
+
+    /// Leave the diagnostic, making sure the drive is released first.
+    fn leave_diag(&mut self) {
+        if let Some(mut job) = self.diag_job.take() {
+            job.stop();
+        }
+        self.screen = Screen::Menu;
     }
 
     fn gw_ready(&mut self) -> bool {
@@ -3971,6 +4157,11 @@ impl App {
         // not block the render). Fills in `tool_versions` as results arrive.
         self.tool_versions = vec![VersionState::Pending; gwm_core::tools::TOOLS.len()];
         self.version_job = Some(VersionJob::start());
+        // Installing the diagnostic fork from this screen is the usual way the
+        // answer changes mid-session, so re-probe here rather than leaving the
+        // startup result to go stale and the menu to refuse a tool that is now
+        // sitting right there.
+        self.diag_supported = gwm_core::diag::probe(&diag_command(&self.core));
     }
 
     fn enter_tools(&mut self) {
@@ -4034,15 +4225,41 @@ impl App {
         }
     }
 
-    /// Clean the (default) drive with a zig-zag pattern via `gw clean`.
+    /// Ask about the drive's geometry before cleaning it.
     fn start_clean(&mut self) {
         if !self.core.gw.available {
             self.notice = Some("gw is unavailable — check the footer.".to_string());
             return;
         }
+        self.screen = Screen::CleanOptions;
+    }
+
+    fn on_clean_options_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Backspace => self.screen = Screen::Menu,
+            KeyCode::Char(' ')
+            | KeyCode::Char('x')
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down => {
+                self.core.settings.clean_48tpi = !self.core.settings.clean_48tpi;
+                // A drive's TPI doesn't change between runs, so remember it.
+                let _ = self.core.save_settings();
+            }
+            KeyCode::Enter => self.run_clean(),
+            _ => {}
+        }
+    }
+
+    /// Clean the (default) drive with a zig-zag pattern via `gw clean`.
+    fn run_clean(&mut self) {
         let drive = self.core.settings.default_drive.clone();
         let label = format!("Cleaning drive {drive}");
-        let cmd = format!("gw clean --drive={drive} 2>&1");
+        let cmd = format!(
+            "gw clean --drive={drive}{} 2>&1",
+            clean_cyls_arg(self.core.settings.clean_48tpi)
+        );
         self.install_return = Screen::Menu;
         self.install_job = Some(InstallJob::start(label, cmd));
         self.screen = Screen::Installing;
@@ -4063,6 +4280,42 @@ impl App {
 /// Edit an optional cylinder override on the read-options screen. `None` means
 /// "format default": Right/typing sets a number, Left counts down to `None`, and
 /// Backspace/Del clears back to the default. Capped at 84 (max realistic cyls).
+/// Which `gw` runs the live diagnostic.
+///
+/// `diag` exists only in the diagnostic fork of the Greaseweazle tools, so
+/// this is settable separately from the `gw` used for reads and writes: point
+/// it at the fork without giving up a known-good `gw` for everything else.
+/// Unset means plain `gw`, which is right when the fork *is* what is
+/// installed.
+fn diag_command(core: &Core) -> String {
+    if let Some(cmd) = core.settings.diag_command.as_ref() {
+        return cmd.clone();
+    }
+    // The Tools screen installs the fork as `gw-diag` (pipx --suffix) so it can
+    // sit beside a stock `gw`. Prefer it when it's there, so installing from
+    // Tools is all the user has to do; otherwise plain `gw`, which is right
+    // when the fork is what got installed under that name.
+    if gwm_core::tools::installed("gw-diag") {
+        "gw-diag".to_string()
+    } else {
+        "gw".to_string()
+    }
+}
+
+/// The cylinder-count argument for `gw clean`.
+///
+/// `gw clean` defaults to 80 cylinders. On a 48 TPI (40-cylinder) drive that
+/// walks the head into the stop for half of every pass — noisy at best — so a
+/// 48 TPI drive is told its real geometry. An 80-cylinder drive wants gw's own
+/// default, hence no flag rather than an explicit 80.
+fn clean_cyls_arg(is_48tpi: bool) -> &'static str {
+    if is_48tpi {
+        " --cyls=40"
+    } else {
+        ""
+    }
+}
+
 fn adjust_track(value: &mut Option<u32>, code: KeyCode) {
     match code {
         KeyCode::Right => *value = Some(value.map_or(0, |n| (n + 1).min(84))),
@@ -4221,6 +4474,47 @@ fn unique_sibling(base: &Path, ext: &str) -> PathBuf {
         }
     }
     base.with_extension(ext)
+}
+
+#[cfg(test)]
+mod clean_options {
+    use super::*;
+
+    /// The 48 TPI tick is the whole point of the screen: it must reach the
+    /// command line, and must *not* appear for an 80-track drive (where gw's
+    /// own default is what we want).
+    #[test]
+    fn cyls_flag_only_appears_for_a_48_tpi_drive() {
+        assert_eq!(clean_cyls_arg(true), " --cyls=40");
+        assert_eq!(clean_cyls_arg(false), "");
+
+        // The shape the command actually takes, both ways round.
+        assert_eq!(
+            format!("gw clean --drive=a{} 2>&1", clean_cyls_arg(true)),
+            "gw clean --drive=a --cyls=40 2>&1"
+        );
+        assert_eq!(
+            format!("gw clean --drive=a{} 2>&1", clean_cyls_arg(false)),
+            "gw clean --drive=a 2>&1"
+        );
+    }
+
+    /// Space toggles the tick, and Enter goes on to run the clean rather than
+    /// toggling. Driven through the real key handler.
+    #[test]
+    fn space_toggles_and_esc_backs_out() {
+        let mut app = App::new(Core::init().unwrap());
+        app.screen = Screen::CleanOptions;
+        let before = app.core.settings.clean_48tpi;
+
+        app.test_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(app.core.settings.clean_48tpi, !before);
+        app.test_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(app.core.settings.clean_48tpi, before, "not a one-way switch");
+
+        app.test_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::Menu);
+    }
 }
 
 #[cfg(test)]

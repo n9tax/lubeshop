@@ -57,6 +57,15 @@ pub enum Source {
     /// A Python tool installed with `pipx` from a `git+…` URL (some projects, like
     /// greaseweazle, aren't published to PyPI). `pipx` needs `git` to clone it.
     PipGit(&'static str),
+    /// Like [`Source::PipGit`], but with `pipx install --suffix` so the console
+    /// scripts land under a suffixed name. The Greaseweazle diagnostic fork
+    /// provides a `gw` command of its own, which would fight the stock `gw`
+    /// pipx already manages for one name; the suffix installs it alongside as
+    /// `gw-diag` instead, leaving reads and writes on the release build.
+    PipGitSuffixed {
+        url: &'static str,
+        suffix: &'static str,
+    },
     /// Only in the Arch User Repository; elsewhere a manual download.
     Aur(&'static str),
     /// Not packaged anywhere — build/download it ourselves into `~/.local/bin`.
@@ -253,6 +262,7 @@ echo "Built and installed c1541 to ~/.local/bin"
 /// The tools the app can drive, in menu order.
 pub const TOOLS: &[Tool] = &[
     Tool { cmd: "gw", label: "Greaseweazle (gw)", purpose: "Read & write physical floppies", source: Source::PipGit("git+https://github.com/keirf/greaseweazle@latest"), win: WinSource::BundleFolder { url: "https://github.com/keirf/greaseweazle/releases/download/v1.23/greaseweazle-1.23-win64.zip", dir: "gw" }, homepage: "https://github.com/keirf/greaseweazle" , version: Some("1.23"), probe: Some(VersionProbe { args: &["info"], marker: "Host Tools:" }) },
+    Tool { cmd: "gw-diag", label: "Greaseweazle diag", purpose: "Live drive diagnostic (optional)", source: Source::PipGitSuffixed { url: "git+https://github.com/n9tax/greaseweazle@diag-batch", suffix: "-diag" }, win: WinSource::FromAuthor("https://github.com/n9tax/greaseweazle"), homepage: "https://github.com/n9tax/greaseweazle" , version: None, probe: None },
     Tool { cmd: "cpmls", label: "cpmtools", purpose: "CP/M disk images", source: Source::System("cpmtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/cpmtools-win64.zip"), homepage: "http://www.moria.de/~michael/cpmtools/" , version: None, probe: None },
     Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/mtools-win64.zip"), homepage: "https://www.gnu.org/software/mtools/" , version: Some("4.0.49"), probe: Some(VersionProbe { args: &["--version"], marker: "mtools" }) },
     Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::Vice, win: WinSource::Winget("VICE-Team.VICE.GTK3"), homepage: "https://vice-emu.sourceforge.io/" , version: None, probe: None },
@@ -517,10 +527,14 @@ fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx:
                 }
             }
         }
-        Source::PipGit(url) => {
+        Source::PipGit(url) | Source::PipGitSuffixed { url, .. } => {
+            let suffix = match source {
+                Source::PipGitSuffixed { suffix, .. } => format!(" --suffix={suffix}"),
+                _ => String::new(),
+            };
             if !has_pipx {
                 InstallPlan::Manual {
-                    note: format!("Needs Python's pipx. Install pipx, then run: pipx install {url} —"),
+                    note: format!("Needs Python's pipx. Install pipx, then run: pipx install{suffix} {url} —"),
                     site: "https://pipx.pypa.io/stable/installation/",
                 }
             } else {
@@ -545,7 +559,9 @@ fn resolve(source: Source, homepage: &'static str, pm: Option<PkgMgr>, has_pipx:
                     }
                     None => String::new(),
                 };
-                InstallPlan::Run(format!("{prep}pipx install {url} && pipx ensurepath"))
+                InstallPlan::Run(format!(
+                    "{prep}pipx install{suffix} {url} && pipx ensurepath"
+                ))
             }
         }
         Source::Aur(pkg) => match pm {
@@ -968,6 +984,28 @@ mod tests {
             resolve(Source::PipGit(url), HP, Some(PkgMgr::Apt), false),
             InstallPlan::Manual { .. }
         ));
+    }
+
+    /// The diagnostic fork ships its own `gw` script, so it must install under
+    /// a suffixed name or it fights the stock `gw` for the same command.
+    #[cfg(not(windows))]
+    #[test]
+    fn pipgit_suffixed_installs_alongside_the_stock_gw() {
+        let url = "git+https://github.com/n9tax/greaseweazle@diag-batch";
+        let source = Source::PipGitSuffixed { url, suffix: "-diag" };
+        assert_eq!(
+            resolve(source, HP, Some(PkgMgr::Apt), true),
+            InstallPlan::Run(format!(
+                "sudo apt-get install -y git build-essential python3-dev && \
+                 pipx install --suffix=-diag {url} && pipx ensurepath"
+            ))
+        );
+        // The hand-run command shown without pipx must carry the suffix too,
+        // or following it clobbers the stock gw.
+        let InstallPlan::Manual { note, .. } = resolve(source, HP, Some(PkgMgr::Apt), false) else {
+            panic!("expected manual guidance without pipx");
+        };
+        assert!(note.contains("--suffix=-diag"), "{note}");
     }
 
     #[cfg(not(windows))]
