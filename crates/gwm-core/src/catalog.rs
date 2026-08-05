@@ -14,11 +14,43 @@ pub struct Catalog {
     conn: Connection,
 }
 
+/// How long to wait for another connection to release a lock before giving up.
+/// SQLite's default is zero, so the first contended statement fails outright
+/// with `database is locked` — wrong for a store the user can legitimately open
+/// twice. Locks here are held for milliseconds, so anything reaching this limit
+/// is genuinely stuck rather than merely busy.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Switch the database to WAL journalling, tolerating losing the race for it.
+///
+/// This needs handling of its own rather than relying on [`BUSY_TIMEOUT`],
+/// because SQLite **does not invoke the busy handler** for a `journal_mode`
+/// change: converting to or from WAL wants an exclusive lock and returns
+/// `SQLITE_BUSY` immediately if another connection holds the file. Two
+/// instances opening a fresh store together is enough to trigger it, which is
+/// exactly what parallel tests — and a user's second window — do.
+///
+/// So: retry briefly, and if it still loses, carry on anyway. WAL is a
+/// concurrency optimisation, not a correctness requirement, and refusing to
+/// open someone's library over a journalling preference would be a poor trade.
+/// Whoever won the race has already set it, and this connection inherits it.
+fn enable_wal(conn: &Connection) {
+    for attempt in 0..10 {
+        if conn.pragma_update(None, "journal_mode", "WAL").is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
+    }
+}
+
 impl Catalog {
     /// Open (creating if needed) the catalog database and apply migrations.
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Set first: the migration below takes locks, so a timeout applied
+        // afterwards would come too late to protect it.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        enable_wal(&conn);
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let catalog = Self { conn };
         catalog.migrate()?;
@@ -267,5 +299,58 @@ mod tests {
 
         cat.delete(id).unwrap();
         assert_eq!(cat.count().unwrap(), 0);
+    }
+
+    /// Many connections opening the same fresh catalog at once must all
+    /// succeed.
+    ///
+    /// The contended step is the first `journal_mode = WAL` switch, which needs
+    /// an exclusive lock and which SQLite fails *without* consulting the busy
+    /// handler — so no timeout alone can save it. Against a database already in
+    /// WAL the pragma is a no-op and nothing collides, which is why this races
+    /// on a freshly created file, and why the barrier matters: it is how CI
+    /// broke, with parallel test threads all calling Core::init at once.
+    #[test]
+    fn concurrent_opens_of_a_fresh_database_all_succeed() {
+        let dir = std::env::temp_dir().join(format!("gwm-catalog-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("catalog.db");
+
+        // A barrier so every thread reaches Catalog::open at the same instant;
+        // without it the collision depends on scheduling luck and the test
+        // catches the bug only sometimes.
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let db = db.clone();
+                let gate = std::sync::Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    let cat = Catalog::open(&db).expect("open under contention");
+                    cat.insert(&NewMediaItem {
+                        kind: MediaKind::Image,
+                        path: format!("/lib/race-{i}.img"),
+                        format: None,
+                        system: None,
+                        size_bytes: 1,
+                        sha256: None,
+                        source: Source::Import,
+                        remote_id: None,
+                        tags: Vec::new(),
+                        notes: None,
+                        fs_format: None,
+                        fs_driver: None,
+                    })
+                    .expect("insert under contention");
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("a thread panicked -- database is locked?");
+        }
+
+        assert_eq!(Catalog::open(&db).unwrap().count().unwrap(), 16);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
