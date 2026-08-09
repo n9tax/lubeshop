@@ -989,25 +989,43 @@ fn render_outcome(app: &App, job: &crate::read_job::ReadJob, frame: &mut Frame, 
 }
 
 fn render_write_source(app: &mut App, frame: &mut Frame, area: Rect) {
-    let block = bordered(&format!("Select image to write ({})", app.library.len()));
-    let items: Vec<ListItem> = app
-        .library
+    let rows = app.write_rows();
+    let file_count = rows.iter().filter(|r| matches!(r, LibRow::File(_))).count();
+    let crumb = if app.write_subpath.as_os_str().is_empty() {
+        "Select image to write".to_string()
+    } else {
+        format!("Select image to write / {}", app.write_subpath.display())
+    };
+    let items: Vec<ListItem> = rows
         .iter()
-        .map(|item| {
-            let name = Path::new(&item.path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(item.path.as_str());
-            let format = item.format.as_deref().unwrap_or("—");
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{name:<30}"), Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  {format}"), dim()),
-            ]))
+        .map(|row| match row {
+            LibRow::Parent => ListItem::new(Line::from(Span::styled("..".to_string(), dim()))),
+            LibRow::Folder(name) => ListItem::new(Line::from(Span::styled(
+                format!("{name}/"),
+                Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+            ))),
+            LibRow::File(id) => {
+                let item = app.library.iter().find(|it| it.id == *id);
+                let name = item
+                    .map(|it| {
+                        Path::new(&it.path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(it.path.as_str())
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                let format = item.and_then(|it| it.format.as_deref()).unwrap_or("—");
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{name:<30}"), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {format}"), dim()),
+                ]))
+            }
         })
         .collect();
     let list = List::new(items)
         .style(base())
-        .block(block)
+        .block(bordered(&format!("{crumb} ({file_count})")))
         .highlight_style(hl())
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(list, area, &mut app.write_state);
@@ -2197,7 +2215,7 @@ fn status_hint(app: &App) -> &'static str {
             Screen::Diag => {
                 "  ←/→ step · 0-9 jump ×10 · h head · r recal · m motor · s select · d density · q back"
             }
-            Screen::WriteSource => "  ↑/↓ move · Enter select · Esc back",
+            Screen::WriteSource => "  ↑/↓ move · → open folder · ← up · Enter pick/open · Esc back",
             Screen::WriteConfirm => "  y write · e toggle erase · Esc cancel",
             Screen::Writing => "  writing… please wait",
             Screen::WriteDone => "  Enter return to menu",

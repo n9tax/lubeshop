@@ -119,6 +119,10 @@ impl Core {
             // Re-apply tuning from the newly-loaded settings.
             let _ = device::apply_delays(&self.settings.tuning);
         }
+        // Point lubeshop at a folder of disk images and they should just show up:
+        // import any recognised files already sitting in the new store. Best-
+        // effort — a scan hiccup shouldn't block the relocation itself.
+        let _ = crate::library::scan_import(&self.catalog, &self.paths.library_dir);
         self.save_settings()
     }
 }

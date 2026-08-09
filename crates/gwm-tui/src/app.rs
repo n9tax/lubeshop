@@ -289,6 +289,9 @@ pub struct App {
     pub read_outcome: Option<Result<String, String>>,
 
     pub write_state: ListState,
+    /// Current folder within the store while picking a write source (independent
+    /// of the Library screen's own `lib_subpath`).
+    pub write_subpath: PathBuf,
     pub write_erase: bool,
     chosen_source: PathBuf,
     pub chosen_source_name: String,
@@ -500,6 +503,7 @@ impl App {
             scan_angle_gain: None,
             read_outcome: None,
             write_state: ListState::default(),
+            write_subpath: PathBuf::new(),
             write_erase: false,
             chosen_source: PathBuf::new(),
             chosen_source_name: String::new(),
@@ -2748,12 +2752,19 @@ impl App {
         if !self.gw_ready() {
             return;
         }
+        // Import any files dropped into the store (or present after a relocation)
+        // so the write picker never shows an empty library just because the user
+        // hasn't opened the Library screen since. Mirrors `enter_library`.
+        let _ = gwm_core::library::scan_import(&self.core.catalog, &self.core.paths.library_dir);
+        let _ = self.reload_library();
         if self.library.is_empty() {
             self.notice = Some("No images in your library to write.".to_string());
             return;
         }
         self.flow = Flow::Write;
         self.write_erase = false;
+        // Start the write picker at the top of the store's folder tree.
+        self.write_subpath = PathBuf::new();
         self.write_state.select(Some(0));
         self.screen = Screen::WriteSource;
     }
@@ -2785,13 +2796,20 @@ impl App {
     /// Folder-aware rows for the current directory: `..`, sub-folders, then the
     /// media files that live directly in this folder (respecting the filter).
     pub fn library_rows(&self) -> Vec<LibRow> {
-        let base = self.lib_base();
+        self.library_rows_at(&self.lib_subpath, &self.lib_filter)
+    }
+
+    /// Rows for the folder-aware library view at an arbitrary `subpath`, filtered
+    /// by `filter`. Shared by the Library screen (its `lib_subpath`) and the write
+    /// picker (its own `write_subpath`), so both navigate the same folder tree.
+    pub fn library_rows_at(&self, subpath: &Path, filter: &str) -> Vec<LibRow> {
+        let base = self.core.paths.library_dir.join(subpath);
         let mut rows = Vec::new();
-        if !self.lib_subpath.as_os_str().is_empty() {
+        if !subpath.as_os_str().is_empty() {
             rows.push(LibRow::Parent);
         }
 
-        let at_root = self.lib_subpath.as_os_str().is_empty();
+        let at_root = subpath.as_os_str().is_empty();
         // Directories that (recursively) contain a catalogued image, so we can
         // hide foreign folders — unpacked tools, source trees, etc. — that the
         // user happens to keep inside the store. Built from the catalog, which
@@ -2824,7 +2842,7 @@ impl App {
         folders.sort_by_key(|s| s.to_lowercase());
         rows.extend(folders.into_iter().map(LibRow::Folder));
 
-        let needle = self.lib_filter.to_lowercase();
+        let needle = filter.to_lowercase();
         for item in &self.library {
             if Path::new(&item.path).parent() != Some(base.as_path()) {
                 continue;
@@ -3958,38 +3976,89 @@ impl App {
         }
     }
 
+    /// Folder-aware rows for the write-source picker (the store's folder tree at
+    /// `write_subpath`), the same view the Library screen shows.
+    pub fn write_rows(&self) -> Vec<LibRow> {
+        self.library_rows_at(&self.write_subpath, "")
+    }
+
+    fn write_selected_row(&self) -> Option<LibRow> {
+        self.write_state
+            .selected()
+            .and_then(|i| self.write_rows().into_iter().nth(i))
+    }
+
     fn on_write_source_key(&mut self, code: KeyCode) {
+        let n = self.write_rows().len();
         match code {
-            KeyCode::Esc | KeyCode::Backspace => self.screen = Screen::Menu,
-            KeyCode::Up | KeyCode::Char('k') => move_list(&mut self.write_state, self.library.len(), -1),
-            KeyCode::Down | KeyCode::Char('j') => move_list(&mut self.write_state, self.library.len(), 1),
-            KeyCode::Enter => {
-                let picked = self
-                    .write_state
-                    .selected()
-                    .and_then(|i| self.library.get(i))
-                    .map(|item| (item.path.clone(), item.format.clone()));
-                if let Some((path, format)) = picked {
-                    self.chosen_source = PathBuf::from(&path);
-                    self.chosen_source_name = file_name(&self.chosen_source);
-                    match format {
-                        Some(fmt) => {
-                            self.chosen_format = fmt;
-                            self.drive_index = 0;
-                            self.screen = Screen::DrivePicker;
-                        }
-                        None => {
-                            if self.formats.is_empty() {
-                                self.formats = formats::list_formats();
-                            }
-                            self.format_filter.clear();
-                            self.format_state.select(Some(0));
-                            self.screen = Screen::FormatPicker;
-                        }
-                    }
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Menu,
+            KeyCode::Up | KeyCode::Char('k') => move_list(&mut self.write_state, n, -1),
+            KeyCode::Down | KeyCode::Char('j') => move_list(&mut self.write_state, n, 1),
+            KeyCode::Backspace | KeyCode::Left => {
+                if self.write_subpath.as_os_str().is_empty() {
+                    self.screen = Screen::Menu;
+                } else {
+                    self.write_subpath.pop();
+                    self.write_state.select(Some(0));
                 }
             }
+            KeyCode::Right => {
+                // Descend into a folder (but never "pick" a file on Right).
+                match self.write_selected_row() {
+                    Some(LibRow::Folder(name)) => {
+                        self.write_subpath.push(name);
+                        self.write_state.select(Some(0));
+                    }
+                    Some(LibRow::Parent) => {
+                        self.write_subpath.pop();
+                        self.write_state.select(Some(0));
+                    }
+                    _ => {}
+                }
+            }
+            KeyCode::Enter => match self.write_selected_row() {
+                Some(LibRow::Parent) => {
+                    self.write_subpath.pop();
+                    self.write_state.select(Some(0));
+                }
+                Some(LibRow::Folder(name)) => {
+                    self.write_subpath.push(name);
+                    self.write_state.select(Some(0));
+                }
+                Some(LibRow::File(id)) => self.pick_write_source(id),
+                None => {}
+            },
             _ => {}
+        }
+    }
+
+    /// Commit the highlighted file as the write source and continue to the drive
+    /// picker (or format picker if the image's format isn't known).
+    fn pick_write_source(&mut self, id: i64) {
+        let Some((path, format)) = self
+            .library
+            .iter()
+            .find(|it| it.id == id)
+            .map(|it| (it.path.clone(), it.format.clone()))
+        else {
+            return;
+        };
+        self.chosen_source = PathBuf::from(&path);
+        self.chosen_source_name = file_name(&self.chosen_source);
+        match format {
+            Some(fmt) => {
+                self.chosen_format = fmt;
+                self.drive_index = 0;
+                self.screen = Screen::DrivePicker;
+            }
+            None => {
+                if self.formats.is_empty() {
+                    self.formats = formats::list_formats();
+                }
+                self.format_filter.clear();
+                self.format_state.select(Some(0));
+                self.screen = Screen::FormatPicker;
+            }
         }
     }
 
