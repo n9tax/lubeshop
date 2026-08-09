@@ -2,9 +2,10 @@
 //! progress events.
 //!
 //! The grammar below was derived from real `gw` 1.23 output captured against a
-//! Greaseweazle V4.1 reading a 1.44MB MS-DOS disk. Everything `gw` prints goes
-//! to **stderr**, line-buffered, and updates within a track are separated by
-//! carriage returns — so the runner splits on both `\r` and `\n`.
+//! Greaseweazle V4.1 reading a 1.44MB MS-DOS disk. Updates within a track are
+//! separated by carriage returns — so the runner splits on both `\r` and `\n`.
+//! (`gw` has moved its output between stdout and stderr across versions; the
+//! runner in `proc.rs` captures both, so this parser sees the lines regardless.)
 //!
 //! Sample lines:
 //! ```text
