@@ -52,9 +52,10 @@ make CC="$CC -fgnu89-inline" LDFLAGS="-static"
 echo ">> packaging"
 STAGE="$WORK/xdms"
 mkdir -p "$STAGE"
-# mingw links `-o xdms`, producing a PE binary named `xdms`; ship it as xdms.exe.
-command -v "$STRIP" >/dev/null 2>&1 && "$STRIP" src/xdms || true
-cp src/xdms "$STAGE/xdms.exe"
+# The Makefile links `-o xdms`, but mingw-gcc auto-appends `.exe`, so the output
+# is `src/xdms.exe`.
+command -v "$STRIP" >/dev/null 2>&1 && "$STRIP" src/xdms.exe || true
+cp src/xdms.exe "$STAGE/xdms.exe"
 # xDMS is public domain; ship its COPYING + a source note.
 cp COPYING "$STAGE/LICENSE-xdms.txt" 2>/dev/null || true
 cat > "$STAGE/SOURCE.txt" <<EOF
