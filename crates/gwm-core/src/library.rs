@@ -1,7 +1,8 @@
 //! Library-management helpers that operate on catalog entries.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::catalog::Catalog;
 use crate::error::Result;
@@ -52,18 +53,30 @@ pub fn check_integrity(item: &MediaItem) -> Integrity {
 /// folder and have them show up. Imported entries have no known format (the user
 /// can set one later); flux-suffixed files are catalogued as flux masters.
 pub fn scan_import(catalog: &Catalog, dir: &Path) -> Result<usize> {
+    scan_import_with_progress(catalog, dir, &mut |_| {})
+}
+
+/// Like [`scan_import`], but calls `on_progress(added_so_far)` after each file is
+/// imported — for a background indexer to report progress. Hashing every file is
+/// the slow part, so a big folder must run this off the render thread.
+pub fn scan_import_with_progress(
+    catalog: &Catalog,
+    dir: &Path,
+    on_progress: &mut dyn FnMut(usize),
+) -> Result<usize> {
     let known: HashSet<String> = catalog.list()?.into_iter().map(|item| item.path).collect();
     let suffixes = crate::formats::image_suffixes();
     let mut added = 0;
     // Bound the walk so a mis-configured storage dir (e.g. `~` or a symlink loop)
     // can't freeze the app: never follow symlinks, cap depth and entries visited.
     let mut budget: usize = 50_000;
-    scan_dir(catalog, dir, &known, suffixes, &mut added, &mut budget, 0);
+    scan_dir(catalog, dir, &known, suffixes, &mut added, &mut budget, 0, on_progress);
     Ok(added)
 }
 
 /// Recursively import new image files from `dir` (so files in sub-folders the
 /// user created are picked up too).
+#[allow(clippy::too_many_arguments)]
 fn scan_dir(
     catalog: &Catalog,
     dir: &Path,
@@ -72,6 +85,7 @@ fn scan_dir(
     added: &mut usize,
     budget: &mut usize,
     depth: u32,
+    on_progress: &mut dyn FnMut(usize),
 ) {
     if depth > 12 {
         return;
@@ -107,7 +121,7 @@ fn scan_dir(
             continue;
         }
         if file_type.is_dir() {
-            scan_dir(catalog, &path, known, suffixes, added, budget, depth + 1);
+            scan_dir(catalog, &path, known, suffixes, added, budget, depth + 1, on_progress);
             continue;
         }
         if !file_type.is_file() {
@@ -116,6 +130,17 @@ fn scan_dir(
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(ext) => ext.to_lowercase(),
             None => continue,
+        };
+        // An Amiga DMS archive isn't a disk image; unpack it to a sibling `.adf`
+        // (once) and catalogue THAT instead so the disk is browsable/writable.
+        // If `xdms` isn't installed the unpack yields nothing and we skip it.
+        let (path, ext) = if ext == "dms" {
+            match unpack_dms(&path) {
+                Some(adf) => (adf, "adf".to_string()),
+                None => continue,
+            }
+        } else {
+            (path, ext)
         };
         if !suffixes.iter().any(|s| *s == ext) {
             continue;
@@ -148,8 +173,37 @@ fn scan_dir(
         };
         if catalog.insert(&item).is_ok() {
             *added += 1;
+            on_progress(*added);
         }
     }
+}
+
+/// Unpack an Amiga **DMS** (Disk Masher System) archive to a sibling `.adf` using
+/// `xdms`, so a dropped `.dms` becomes a browsable/writable disk image. Returns
+/// the `.adf` path if it exists afterward (already unpacked or freshly made), or
+/// `None` if `xdms` is missing or the unpack failed.
+///
+/// `xdms u FILE.dms` writes `FILE.adf` into the working directory, so we run it in
+/// the archive's own folder with a relative name and let the result land beside it.
+pub fn unpack_dms(dms: &Path) -> Option<PathBuf> {
+    let adf = dms.with_extension("adf");
+    if adf.exists() {
+        return Some(adf); // already unpacked on a previous scan
+    }
+    let dir = dms.parent()?;
+    let name = dms.file_name()?;
+    // `.status()` returns Err (→ None) when `xdms` isn't installed; success is
+    // judged by the .adf actually appearing (don't trust the exit code alone).
+    Command::new("xdms")
+        .current_dir(dir)
+        .arg("u")
+        .arg(name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    adf.exists().then_some(adf)
 }
 
 /// Human-friendly byte size, e.g. `1.4 MB`.
@@ -195,6 +249,31 @@ mod tests {
         assert_eq!(scan_import(&catalog, &base).unwrap(), 0);
         assert_eq!(catalog.count().unwrap(), 2);
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unpack_dms_reuses_an_existing_adf() {
+        // If the .adf is already there (unpacked on a prior scan), reuse it —
+        // no need for xdms, so this holds on any machine.
+        let base = std::env::temp_dir().join(format!("gwm-dms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("game.dms"), b"dms").unwrap();
+        std::fs::write(base.join("game.adf"), b"adf").unwrap();
+        assert_eq!(unpack_dms(&base.join("game.dms")), Some(base.join("game.adf")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unpack_dms_none_when_it_cannot_produce_an_adf() {
+        // A .dms with no sibling .adf: without a working xdms (or on a bogus
+        // input) nothing is produced, so we get None and skip it.
+        let base = std::env::temp_dir().join(format!("gwm-dms2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("bogus.dms"), b"not a real dms").unwrap();
+        assert_eq!(unpack_dms(&base.join("bogus.dms")), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

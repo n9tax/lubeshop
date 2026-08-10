@@ -156,14 +156,26 @@ fn para(lines: Vec<Line<'static>>) -> Paragraph<'static> {
 /// (The app degrades gracefully, so the user only needs to know when it's
 /// *missing* — the working version isn't worth the space.)
 fn header_badges(app: &App) -> Vec<Span<'static>> {
-    if app.core.gw.available {
-        Vec::new()
-    } else {
-        vec![Span::styled(
+    let mut badges = Vec::new();
+    if !app.core.gw.available {
+        badges.push(Span::styled(
             " gw: unavailable ",
             Style::default().fg(Color::White).bg(theme().danger),
-        )]
+        ));
     }
+    // "update available" / "restart to apply" badge (menu action `U`).
+    if app.update_restart_pending {
+        badges.push(Span::styled(
+            " restart to update ",
+            Style::default().fg(Color::Black).bg(theme().success),
+        ));
+    } else if let Some(info) = &app.update_info {
+        badges.push(Span::styled(
+            format!(" update {} — press U ", info.version),
+            Style::default().fg(Color::Black).bg(theme().warning),
+        ));
+    }
+    badges
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -299,9 +311,13 @@ fn render_library(app: &mut App, frame: &mut Frame, area: Rect) {
             _ => None,
         });
 
+    let title = match app.indexing_note() {
+        Some(note) => format!("{crumb} ({file_count}) · {note}"),
+        None => format!("{crumb} ({file_count})"),
+    };
     let list = List::new(items)
         .style(base())
-        .block(bordered(&format!("{crumb} ({file_count})")))
+        .block(bordered(&title))
         .highlight_style(hl())
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(list, cols[0], &mut app.lib_state);
@@ -1023,9 +1039,13 @@ fn render_write_source(app: &mut App, frame: &mut Frame, area: Rect) {
             }
         })
         .collect();
+    let title = match app.indexing_note() {
+        Some(note) => format!("{crumb} ({file_count}) · {note}"),
+        None => format!("{crumb} ({file_count})"),
+    };
     let list = List::new(items)
         .style(base())
-        .block(bordered(&format!("{crumb} ({file_count})")))
+        .block(bordered(&title))
         .highlight_style(hl())
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(list, area, &mut app.write_state);

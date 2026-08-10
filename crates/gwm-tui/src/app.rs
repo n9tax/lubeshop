@@ -21,6 +21,8 @@ use crate::count_job::{CountJob, CountState};
 use crate::diag_job::DiagJob;
 use crate::scan_job::ScanJob;
 use crate::gotek_job::GotekJob;
+use crate::index_job::IndexJob;
+use crate::update_job::{UpdateApplyJob, UpdateCheckJob};
 use crate::version_job::{VersionJob, VersionState};
 use gwm_core::convert::GotekFormat;
 use gwm_core::usb::UsbDrive;
@@ -270,6 +272,17 @@ pub struct App {
     /// Background `gw rpm` measurement, and the last reading shown next to the
     /// "Test drive RPM" menu item (kept after the job clears).
     pub rpm_job: Option<RpmJob>,
+    /// Background library indexing (importing files from the store folder). Runs
+    /// off-thread so a big folder can't freeze the UI.
+    pub index_job: Option<IndexJob>,
+    /// Startup check for a newer release (runs once, in the background).
+    update_check: Option<UpdateCheckJob>,
+    /// A newer release than the running one, once the check confirms it.
+    pub update_info: Option<gwm_core::update::UpdateInfo>,
+    /// A running download+install of the update.
+    update_apply: Option<UpdateApplyJob>,
+    /// Set once an update has been installed: the user must restart to apply it.
+    pub update_restart_pending: bool,
     pub rpm_result: Option<String>,
     /// The live drive diagnostic: the running session, the options it will be
     /// (or was) started with, and the selected row on the options screen.
@@ -490,6 +503,11 @@ impl App {
             ti99_job: None,
             ti99_outcome: None,
             rpm_job: None,
+            index_job: None,
+            update_check: Some(UpdateCheckJob::start()),
+            update_info: None,
+            update_apply: None,
+            update_restart_pending: false,
             rpm_result: None,
             diag_job: None,
             diag_opts: gwm_core::diag::DiagOptions {
@@ -671,6 +689,58 @@ impl App {
                 }
             }
 
+            // Library indexing runs in the background regardless of screen, so a
+            // big storage folder never freezes the UI. Reload the view when it
+            // finishes so the imported files appear.
+            if let Some(mut job) = self.index_job.take() {
+                job.pump();
+                if job.done {
+                    if job.error.is_none() {
+                        let _ = self.reload_library();
+                        if job.added > 0 {
+                            self.notice = Some(format!("Indexed {} file(s).", job.added));
+                        }
+                    }
+                    // else: leave `index_job` cleared; a failed scan is silent.
+                } else {
+                    self.index_job = Some(job);
+                }
+            }
+
+            // The startup update-check lands in the background; stash the result
+            // so the menu can show an "update available" badge.
+            if let Some(mut job) = self.update_check.take() {
+                if job.pump() {
+                    self.update_info = job.result.take().flatten();
+                } else {
+                    self.update_check = Some(job);
+                }
+            }
+
+            // A running self-update: on completion, drop the badge and ask for a
+            // restart (or report why it failed).
+            if let Some(mut job) = self.update_apply.take() {
+                if job.pump() {
+                    match job.result.take() {
+                        Some(Ok(())) => {
+                            let v = self
+                                .update_info
+                                .as_ref()
+                                .map(|u| u.version.clone())
+                                .unwrap_or_default();
+                            self.update_info = None;
+                            self.update_restart_pending = true;
+                            self.notice =
+                                Some(format!("Updated to {v} — restart lubeshop to apply."));
+                        }
+                        Some(Err(e)) => self.notice = Some(format!("Update failed: {e}")),
+                        None => {}
+                    }
+                } else {
+                    self.update_apply = Some(job);
+                }
+            }
+
             // A drive-RPM measurement completes in the background so the menu
             // stays responsive; fold its result into the menu note when it lands.
             if let Some(mut job) = self.rpm_job.take() {
@@ -768,20 +838,34 @@ impl App {
         }
     }
 
-    /// Open the Library, first importing any new files dropped into the storage
-    /// folder so hand-placed images show up.
+    /// Open the Library, kicking off a background import of any new files dropped
+    /// into the storage folder so hand-placed images show up — without blocking on
+    /// a big folder (see [`start_indexing`](Self::start_indexing)).
     fn enter_library(&mut self) {
-        match gwm_core::library::scan_import(&self.core.catalog, &self.core.paths.library_dir) {
-            Ok(n) if n > 0 => {
-                self.notice = Some(format!("Imported {n} new file(s) from the storage folder."))
-            }
-            Err(err) => self.notice = Some(format!("Storage-folder scan failed: {err}")),
-            _ => {}
-        }
+        self.start_indexing();
         self.lib_filter.clear();
         self.lib_filtering = false;
         let _ = self.reload_library();
         self.screen = Screen::Library;
+    }
+
+    /// Begin a background scan of the store folder for new files, unless one is
+    /// already running. The UI stays responsive; the library refreshes when it
+    /// finishes. Cheap after the first run (already-catalogued paths are skipped).
+    fn start_indexing(&mut self) {
+        if self.index_job.is_none() {
+            self.index_job = Some(IndexJob::start(
+                self.core.paths.db_path.clone(),
+                self.core.paths.library_dir.clone(),
+            ));
+        }
+    }
+
+    /// A one-line "indexing…" status while a background scan runs (else `None`).
+    pub fn indexing_note(&self) -> Option<String> {
+        self.index_job
+            .as_ref()
+            .map(|j| format!("indexing… {} file(s)", j.added))
     }
 
     /// The effective label for a format: the user's override if set, else the
@@ -1870,8 +1954,12 @@ impl App {
                         Ok(()) => {
                             let _ = self.reload_library();
                             self.theme = theme::by_name(&self.core.settings.theme);
+                            // Import the new store's existing files in the
+                            // background (drop any scan of the old store first).
+                            self.index_job = None;
+                            self.start_indexing();
                             self.notice =
-                                Some("Store directory updated — catalog reloaded.".to_string());
+                                Some("Store directory updated — indexing in the background.".to_string());
                         }
                         Err(err) => {
                             self.notice = Some(format!("Could not set store dir: {err}"))
@@ -2052,7 +2140,11 @@ impl App {
             Ok(()) => {
                 let _ = self.reload_library();
                 self.theme = theme::by_name(&self.core.settings.theme);
-                self.notice = Some("Store directory updated — catalog reloaded.".to_string());
+                // Import the new store's existing files in the background.
+                self.index_job = None;
+                self.start_indexing();
+                self.notice =
+                    Some("Store directory updated — indexing in the background.".to_string());
             }
             Err(err) => self.notice = Some(format!("Could not set store dir: {err}")),
         }
@@ -2453,7 +2545,42 @@ impl App {
                 11 => self.should_quit = true,
                 _ => {}
             },
+            // Install an available update (only meaningful when the badge shows).
+            KeyCode::Char('u') | KeyCode::Char('U') => self.start_self_update(),
             _ => {}
+        }
+    }
+
+    /// Act on the "update available" badge: download + replace the binary if this
+    /// install is user-owned, otherwise point the user at the release page (a
+    /// package-managed binary must be updated by the package manager).
+    fn start_self_update(&mut self) {
+        let Some(info) = self.update_info.clone() else {
+            return;
+        };
+        if self.update_apply.is_some() {
+            return; // already updating
+        }
+        if !gwm_core::update::self_updatable() {
+            self.notice = Some(format!(
+                "Update {} is available — this install isn't user-writable; get it from {}",
+                info.version,
+                gwm_core::update::releases_page()
+            ));
+            return;
+        }
+        match info.asset_url {
+            Some(url) => {
+                self.notice = Some(format!("Downloading update {}…", info.version));
+                self.update_apply = Some(UpdateApplyJob::start(url));
+            }
+            None => {
+                self.notice = Some(format!(
+                    "Update {} is available, but no download for this platform — get it from {}",
+                    info.version,
+                    gwm_core::update::releases_page()
+                ));
+            }
         }
     }
 
@@ -2753,11 +2880,13 @@ impl App {
             return;
         }
         // Import any files dropped into the store (or present after a relocation)
-        // so the write picker never shows an empty library just because the user
-        // hasn't opened the Library screen since. Mirrors `enter_library`.
-        let _ = gwm_core::library::scan_import(&self.core.catalog, &self.core.paths.library_dir);
+        // so the write picker isn't empty just because the Library screen hasn't
+        // been opened since — but do it in the background, never blocking here.
+        self.start_indexing();
         let _ = self.reload_library();
-        if self.library.is_empty() {
+        // Only bail out when the library is genuinely empty *and* nothing is being
+        // indexed; otherwise open the picker, which fills in as the scan lands.
+        if self.library.is_empty() && self.index_job.is_none() {
             self.notice = Some("No images in your library to write.".to_string());
             return;
         }
@@ -2810,11 +2939,11 @@ impl App {
         }
 
         let at_root = subpath.as_os_str().is_empty();
-        // Directories that (recursively) contain a catalogued image, so we can
-        // hide foreign folders — unpacked tools, source trees, etc. — that the
-        // user happens to keep inside the store. Built from the catalog, which
-        // scan_import has already refreshed by the time we render.
-        let image_dirs = self.catalogued_dirs();
+        // Show every real sub-folder (not just ones that already contain
+        // catalogued images) so nothing is ever hidden — e.g. a folder whose
+        // images haven't been indexed yet, or one holding formats we don't
+        // recognise. We still skip hidden dotfolders (`.git`, `.venv`, …) and the
+        // app's own `originals/` backup folder at the store root.
         let mut folders: Vec<String> = Vec::new();
         if let Ok(read) = std::fs::read_dir(&base) {
             for entry in read.flatten() {
@@ -2823,16 +2952,7 @@ impl App {
                     if name.starts_with('.') {
                         continue;
                     }
-                    // The app's own backup folder sits at the store root; don't
-                    // show it as a browsable library folder.
                     if at_root && name == "originals" {
-                        continue;
-                    }
-                    // Show a folder only if it leads to catalogued images or is
-                    // still empty (a freshly made organising folder). This keeps
-                    // tool/junk folders (full of non-image files) out of view.
-                    let path = base.join(&name);
-                    if !image_dirs.contains(&path) && !dir_is_empty(&path) {
                         continue;
                     }
                     folders.push(name);

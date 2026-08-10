@@ -24,6 +24,7 @@ pub mod settings;
 pub mod textedit;
 pub mod tools;
 pub mod trs_disk;
+pub mod update;
 pub mod usb;
 pub mod util;
 pub mod write;
@@ -119,10 +120,9 @@ impl Core {
             // Re-apply tuning from the newly-loaded settings.
             let _ = device::apply_delays(&self.settings.tuning);
         }
-        // Point lubeshop at a folder of disk images and they should just show up:
-        // import any recognised files already sitting in the new store. Best-
-        // effort — a scan hiccup shouldn't block the relocation itself.
-        let _ = crate::library::scan_import(&self.catalog, &self.paths.library_dir);
+        // NB: importing the new store's existing files is done by the caller in
+        // the *background* (a big folder's hashing must not block the UI) — see
+        // the TUI's IndexJob. Relocation itself only re-points and re-opens.
         self.save_settings()
     }
 }

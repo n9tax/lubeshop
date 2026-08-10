@@ -158,6 +158,27 @@ echo "Installed atr to ~/.local/bin"
 "#,
 };
 
+// xDMS (Amiga DMS unpacker) — public domain, but only packaged on some distros
+// (Debian has it; Arch does not). Build the classic 1.3.2 source from Heikki
+// Orsila's FOSS mirror. Modern gcc drops the old GNU inline functions unless we
+// force gnu89 inline semantics (else `decode_c`/`decode_p` fail to link); we do
+// that via CC so the Makefile's own -I/CFLAGS survive.
+const XDMS: Recipe = Recipe {
+    prereqs: &[Prereq::Build, Prereq::Curl],
+    steps: r#"
+d=$(mktemp -d)
+curl -fsSL -o "$d/xdms.tar.bz2" http://zakalwe.fi/~shd/foss/xdms/xdms-1.3.2.tar.bz2
+tar -xjf "$d/xdms.tar.bz2" -C "$d"
+cd "$d"/xdms-*/
+./configure >/dev/null
+make CC="cc -fgnu89-inline"
+mkdir -p "$HOME/.local/bin"
+cp src/xdms "$HOME/.local/bin/"
+cd "$HOME" && rm -rf "$d"
+echo "Installed xdms to ~/.local/bin"
+"#,
+};
+
 /// xdt99 (xdm99 + xhm99): the TI-99 disk manager and HFE tool are co-located
 /// Python scripts, not a pip package. Clone the repo and drop launchers that run
 /// them from there, so their `from xcommon import …` sibling resolves (Python
@@ -267,6 +288,7 @@ pub const TOOLS: &[Tool] = &[
     Tool { cmd: "mdir", label: "mtools", purpose: "FAT · MS-DOS · Atari ST · MSX", source: Source::System("mtools"), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/mtools-win64.zip"), homepage: "https://www.gnu.org/software/mtools/" , version: Some("4.0.49"), probe: Some(VersionProbe { args: &["--version"], marker: "mtools" }) },
     Tool { cmd: "c1541", label: "VICE (c1541)", purpose: "Commodore D64/D71/D81 images", source: Source::Vice, win: WinSource::Winget("VICE-Team.VICE.GTK3"), homepage: "https://vice-emu.sourceforge.io/" , version: None, probe: None },
     Tool { cmd: "xdftool", label: "amitools (xdftool)", purpose: "Amiga ADF/HDF images", source: Source::Pip("amitools"), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/amitools-win64.zip", dir: "xdftool" }, homepage: "https://github.com/cnvogelg/amitools" , version: None, probe: None },
+    Tool { cmd: "xdms", label: "xDMS", purpose: "Unpack Amiga DMS archives → ADF", source: Source::Build(XDMS), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/xdms-win64.zip"), homepage: "https://aminet.net/package/util/arc/xDMS" , version: None, probe: None },
     Tool { cmd: "applecommander-ac", label: "AppleCommander", purpose: "Apple II images", source: Source::Build(APPLECOMMANDER), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/applecommander-win64.zip", dir: "applecommander-ac" }, homepage: "https://applecommander.github.io/" , version: Some("13.1"), probe: Some(VersionProbe { args: &[], marker: "options [" }) },
     Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), win: WinSource::Todo, homepage: "https://github.com/jhallen/atari-tools" , version: None, probe: None },
     Tool { cmd: "xdm99", label: "xdt99 (xdm99)", purpose: "TI-99/4A disk images", source: Source::Build(XDT99), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/xdt99-win64.zip", dir: "xdt99" }, homepage: "https://github.com/endlos99/xdt99" , version: None, probe: None },
