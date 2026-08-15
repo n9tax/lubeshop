@@ -107,6 +107,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::Scanning => render_scanning(app, frame, chunks[1]),
         Screen::Ti99Transfer | Screen::Ti99Done => render_ti99(app, frame, chunks[1]),
         Screen::WriteSource => render_write_source(app, frame, chunks[1]),
+        Screen::WriteFluxMode => render_write_flux_mode(app, frame, chunks[1]),
         Screen::WriteConfirm => render_write_confirm(app, frame, chunks[1]),
         Screen::Writing | Screen::WriteDone => render_writing(app, frame, chunks[1]),
         Screen::Settings => render_settings(app, frame, chunks[1]),
@@ -819,7 +820,16 @@ fn render_read_options(app: &App, frame: &mut Frame, area: Rect) {
         row(app.read_opt_row == 1, "Start track", track(app.read_track_start)),
         row(app.read_opt_row == 2, "End track", track(app.read_track_end)),
         row(app.read_opt_row == 3, "Double-step (48→96 TPI)", check(app.read_double_step)),
+        row(app.read_opt_row == 4, "Capture raw flux (.scp)", check(app.read_raw_flux)),
         Line::from(""),
+        Line::from(Span::styled(
+            "  Raw flux: save the exact flux (.scp), not a decoded image — faithful",
+            dim(),
+        )),
+        Line::from(Span::styled(
+            "  (weak bits / copy protection). The sector report + health map still work.",
+            dim(),
+        )),
         Line::from(Span::styled(
             "  Hard-sectored: NorthStar/Micropolis disks with physical sector holes.",
             dim(),
@@ -1051,6 +1061,30 @@ fn render_write_source(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_stateful_widget(list, area, &mut app.write_state);
 }
 
+fn render_write_flux_mode(app: &App, frame: &mut Frame, area: Rect) {
+    let options = [
+        ("Write raw flux (exact, no re-encode)", "Plays the captured flux back bit-for-bit — preserves weak bits / copy protection."),
+        ("Re-encode to a disk format…", "Decode the flux to sectors and write clean flux — best for a standard disk."),
+    ];
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  Writing flux  ", dim()),
+            Span::styled(app.chosen_source_name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  How should this flux capture be written?", dim())),
+        Line::from(""),
+    ];
+    for (i, (label, help)) in options.iter().enumerate() {
+        let selected = i == app.write_flux_index;
+        let (marker, style) = if selected { ("▸ ", accented()) } else { ("  ", base()) };
+        lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
+        lines.push(Line::from(Span::styled(format!("      {help}"), dim())));
+        lines.push(Line::from(""));
+    }
+    frame.render_widget(para(lines).block(bordered("Write flux — choose mode")), area);
+}
+
 fn render_write_confirm(app: &App, frame: &mut Frame, area: Rect) {
     let danger = Style::default().fg(theme().danger).add_modifier(Modifier::BOLD);
     let erase = if app.write_erase { "[x]" } else { "[ ]" };
@@ -1065,7 +1099,14 @@ fn render_write_confirm(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("  Source: ", dim()),
             Span::styled(app.chosen_source_name.clone(), Style::default().add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(vec![Span::styled("  Format: ", dim()), Span::raw(app.chosen_format.clone())]),
+        Line::from(vec![
+            Span::styled("  Format: ", dim()),
+            Span::raw(if app.chosen_format.is_empty() {
+                "raw flux (no re-encode)".to_string()
+            } else {
+                app.chosen_format.clone()
+            }),
+        ]),
         Line::from(vec![Span::styled("  Drive:  ", dim()), Span::raw(app.chosen_drive.clone())]),
         Line::from(vec![
             Span::styled(format!("  {erase} "), Style::default().fg(theme().accent)),
@@ -2236,6 +2277,7 @@ fn status_hint(app: &App) -> &'static str {
                 "  ←/→ step · 0-9 jump ×10 · h head · r recal · m motor · s select · d density · q back"
             }
             Screen::WriteSource => "  ↑/↓ move · → open folder · ← up · Enter pick/open · Esc back",
+            Screen::WriteFluxMode => "  ↑/↓ choose · Enter continue · Esc back",
             Screen::WriteConfirm => "  y write · e toggle erase · Esc cancel",
             Screen::Writing => "  writing… please wait",
             Screen::WriteDone => "  Enter return to menu",

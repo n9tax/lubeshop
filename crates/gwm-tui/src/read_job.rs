@@ -61,6 +61,7 @@ impl ReadJob {
         format: String,
         drive: String,
         hard_sectors: bool,
+        raw: bool,
         tracks: Option<String>,
         out_path: PathBuf,
     ) -> Self {
@@ -77,6 +78,7 @@ impl ReadJob {
                 &worker_drive,
                 None,
                 hard_sectors,
+                raw,
                 tracks.as_deref(),
                 &worker_out,
             );

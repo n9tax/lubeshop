@@ -109,6 +109,7 @@ pub enum Screen {
     /// A surface scan sweeping every track, then its result.
     Scanning,
     WriteSource,
+    WriteFluxMode,
     WriteConfirm,
     Writing,
     WriteDone,
@@ -255,6 +256,8 @@ pub struct App {
     pub drive_index: usize,
     pub name_input: TextInput,
     pub read_hard_sectors: bool,
+    /// Capture the raw flux stream (`.scp`) instead of a decoded sector image.
+    pub read_raw_flux: bool,
     /// Read-options screen: selected row, start/end cylinder overrides (`None` =
     /// format default), and double-step for a 48 TPI disk in a 96 TPI drive.
     pub read_opt_row: usize,
@@ -305,6 +308,8 @@ pub struct App {
     /// Current folder within the store while picking a write source (independent
     /// of the Library screen's own `lib_subpath`).
     pub write_subpath: PathBuf,
+    /// Selected option on the flux-write-mode chooser (0 = raw, 1 = re-encode).
+    pub write_flux_index: usize,
     pub write_erase: bool,
     chosen_source: PathBuf,
     pub chosen_source_name: String,
@@ -493,6 +498,7 @@ impl App {
             drive_index: 0,
             name_input: TextInput::new(),
             read_hard_sectors: false,
+            read_raw_flux: false,
             read_opt_row: 0,
             read_track_start: None,
             read_track_end: None,
@@ -522,6 +528,7 @@ impl App {
             read_outcome: None,
             write_state: ListState::default(),
             write_subpath: PathBuf::new(),
+            write_flux_index: 0,
             write_erase: false,
             chosen_source: PathBuf::new(),
             chosen_source_name: String::new(),
@@ -951,6 +958,7 @@ impl App {
             Screen::NameInput => self.on_name_key(code, mods),
             Screen::ReadOptions => self.on_read_options_key(code),
             Screen::WriteSource => self.on_write_source_key(code),
+            Screen::WriteFluxMode => self.on_write_flux_mode_key(code),
             Screen::WriteConfirm => self.on_write_confirm_key(code),
             Screen::Reading => self.on_reading_key(code),
             Screen::DiagOptions => self.on_diag_options_key(code),
@@ -4060,7 +4068,7 @@ impl App {
     }
 
     /// Rows on the read-options screen (in display order).
-    const READ_OPT_ROWS: usize = 4; // hard-sectored, start, end, double-step
+    const READ_OPT_ROWS: usize = 5; // hard-sectored, start, end, double-step, raw flux
 
     fn on_read_options_key(&mut self, code: KeyCode) {
         match code {
@@ -4092,6 +4100,7 @@ impl App {
             1 => adjust_track(&mut self.read_track_start, code),
             2 => adjust_track(&mut self.read_track_end, code),
             3 if toggle => self.read_double_step = !self.read_double_step,
+            4 if toggle => self.read_raw_flux = !self.read_raw_flux,
             _ => {}
         }
     }
@@ -4155,30 +4164,62 @@ impl App {
     /// Commit the highlighted file as the write source and continue to the drive
     /// picker (or format picker if the image's format isn't known).
     fn pick_write_source(&mut self, id: i64) {
-        let Some((path, format)) = self
-            .library
-            .iter()
-            .find(|it| it.id == id)
-            .map(|it| (it.path.clone(), it.format.clone()))
-        else {
+        let Some(item) = self.library.iter().find(|it| it.id == id).cloned() else {
             return;
         };
-        self.chosen_source = PathBuf::from(&path);
+        self.chosen_source = PathBuf::from(&item.path);
         self.chosen_source_name = file_name(&self.chosen_source);
-        match format {
+        let ext = Path::new(&item.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        // A flux capture (.scp/.hfe/.raw) can be written two ways: raw (exact
+        // playback, no --format) or re-encoded through a disk format. Let the
+        // user choose rather than forcing a format.
+        if matches!(item.kind, MediaKind::Flux) || formats::is_flux_suffix(ext) {
+            self.write_flux_index = 0;
+            self.screen = Screen::WriteFluxMode;
+            return;
+        }
+        match item.format {
             Some(fmt) => {
                 self.chosen_format = fmt;
                 self.drive_index = 0;
                 self.screen = Screen::DrivePicker;
             }
-            None => {
-                if self.formats.is_empty() {
-                    self.formats = formats::list_formats();
-                }
-                self.format_filter.clear();
-                self.format_state.select(Some(0));
-                self.screen = Screen::FormatPicker;
+            None => self.open_write_format_picker(),
+        }
+    }
+
+    fn open_write_format_picker(&mut self) {
+        if self.formats.is_empty() {
+            self.formats = formats::list_formats();
+        }
+        self.format_filter.clear();
+        self.format_state.select(Some(0));
+        self.screen = Screen::FormatPicker;
+    }
+
+    fn on_write_flux_mode_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
+                self.screen = Screen::WriteSource
             }
+            KeyCode::Up | KeyCode::Char('k') => self.write_flux_index = 0,
+            KeyCode::Down | KeyCode::Char('j') => self.write_flux_index = 1,
+            KeyCode::Enter => {
+                if self.write_flux_index == 0 {
+                    // Raw flux: empty format → `gw write <file>` with no --format,
+                    // an exact playback (build_write_args omits --format when empty).
+                    self.chosen_format = String::new();
+                    self.drive_index = 0;
+                    self.screen = Screen::DrivePicker;
+                } else {
+                    // Re-encode: pick a gw disk format to reconstruct clean flux.
+                    self.open_write_format_picker();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4244,7 +4285,13 @@ impl App {
     // --- read lifecycle --------------------------------------------------
 
     fn default_name(&self) -> String {
-        let ext = formats::default_extension(&self.chosen_format);
+        // Raw flux capture goes to a `.scp` flux container; a decoded read uses the
+        // format's sector-image extension.
+        let ext = if self.read_raw_flux {
+            "scp"
+        } else {
+            formats::default_extension(&self.chosen_format)
+        };
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
         format!("{}-{stamp}.{ext}", self.chosen_format.replace('.', "_"))
     }
@@ -4278,6 +4325,7 @@ impl App {
             &self.chosen_drive,
             None,
             self.read_hard_sectors,
+            self.read_raw_flux,
             self.read_tracks().as_deref(),
             &out.to_string_lossy(),
         );
@@ -4308,6 +4356,7 @@ impl App {
             self.chosen_format.clone(),
             self.chosen_drive.clone(),
             self.read_hard_sectors,
+            self.read_raw_flux,
             tracks,
             out_path,
         ));
@@ -4390,8 +4439,21 @@ impl App {
                 let size = std::fs::metadata(&job.out_path)
                     .map(|m| m.len() as i64)
                     .unwrap_or(0);
+                // A raw-flux capture (.scp/.raw/.hfe) is a flux master, not a
+                // decoded sector image — catalogue it as such so browsing decodes
+                // it and it re-encodes on edit.
+                let ext = job
+                    .out_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let kind = if formats::is_flux_suffix(ext) {
+                    MediaKind::Flux
+                } else {
+                    MediaKind::Image
+                };
                 let item = NewMediaItem {
-                    kind: MediaKind::Image,
+                    kind,
                     path: job.out_path.to_string_lossy().into_owned(),
                     format: Some(job.format.clone()),
                     system: Some(formats::system_for_format(&job.format).to_string()),

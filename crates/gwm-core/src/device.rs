@@ -270,6 +270,7 @@ pub fn build_read_args(
     drive: &str,
     revs: Option<u32>,
     hard_sectors: bool,
+    raw: bool,
     tracks: Option<&str>,
     out_path: &str,
 ) -> Vec<String> {
@@ -280,6 +281,13 @@ pub fn build_read_args(
         args.push(format!("--format={format}"));
     }
     args.push(format!("--drive={drive}"));
+    // Capture the raw flux stream (into a .scp/.raw output) instead of a decoded
+    // sector image. `--format` is kept for verification, so the per-track sector
+    // report (and the health map) still work — gw's `--raw` means "output raw
+    // stream, --format verifies only".
+    if raw {
+        args.push("--raw".to_string());
+    }
     // Restrict which cylinders are read. Callers pass the result of
     // `read_tracks_arg`, which supplies the per-format default (e.g. the 1541's
     // 35-track cap) or the user's start/end/double-step overrides.
@@ -335,7 +343,7 @@ mod tests {
 
     #[test]
     fn read_args_omit_revs_by_default() {
-        let args = build_read_args("amiga.amigados", "0", None, false, None, "out.adf");
+        let args = build_read_args("amiga.amigados", "0", None, false, false, None, "out.adf");
         assert_eq!(
             args,
             ["read", "--format=amiga.amigados", "--drive=0", "out.adf"]
@@ -380,7 +388,7 @@ mod tests {
 
     #[test]
     fn read_args_include_revs_when_set() {
-        let args = build_read_args("amiga.amigados", "a", Some(3), false, None, "out.adf");
+        let args = build_read_args("amiga.amigados", "a", Some(3), false, false, None, "out.adf");
         assert!(args.iter().any(|a| a == "--revs=3"));
         assert_eq!(args.last().unwrap(), "out.adf");
     }
@@ -388,7 +396,7 @@ mod tests {
     #[test]
     fn args_omit_format_when_empty() {
         // The TI-99 HFE path passes no format; gw must not get a `--format` flag.
-        let r = build_read_args("", "0", None, false, None, "out.hfe");
+        let r = build_read_args("", "0", None, false, false, None, "out.hfe");
         assert_eq!(r[0], "read");
         assert!(!r.iter().any(|a| a.starts_with("--format")));
         let w = build_write_args("", "0", false, "in.hfe");
@@ -398,18 +406,31 @@ mod tests {
 
     #[test]
     fn read_args_pass_tracks_spec() {
-        let args = build_read_args("ibm.360", "a", None, false, Some("c=0-39:step=2"), "out.img");
+        let args = build_read_args("ibm.360", "a", None, false, false, Some("c=0-39:step=2"), "out.img");
         assert!(args.iter().any(|a| a == "--tracks=c=0-39:step=2"));
     }
 
     #[test]
     fn read_args_hard_sectors_flag_toggles() {
-        let on = build_read_args("northstar.mfm.ds", "a", None, true, None, "out.nsi");
+        let on = build_read_args("northstar.mfm.ds", "a", None, true, false, None, "out.nsi");
         assert!(on.iter().any(|a| a == "--hard-sectors"));
         assert_eq!(on.last().unwrap(), "out.nsi");
 
-        let off = build_read_args("northstar.mfm.ds", "a", None, false, None, "out.nsi");
+        let off = build_read_args("northstar.mfm.ds", "a", None, false, false, None, "out.nsi");
         assert!(!off.iter().any(|a| a == "--hard-sectors"));
+    }
+
+    #[test]
+    fn read_raw_flux_adds_raw_and_keeps_format() {
+        // Raw capture: `--raw` present, and `--format` kept so gw still verifies
+        // (the per-track sector report + health map keep working).
+        let raw = build_read_args("amiga.amigados", "a", None, false, true, None, "out.scp");
+        assert!(raw.iter().any(|a| a == "--raw"));
+        assert!(raw.iter().any(|a| a == "--format=amiga.amigados"));
+        assert_eq!(raw.last().unwrap(), "out.scp");
+        // Decoded (default): no `--raw`.
+        let dec = build_read_args("amiga.amigados", "a", None, false, false, None, "out.adf");
+        assert!(!dec.iter().any(|a| a == "--raw"));
     }
 
     #[test]
