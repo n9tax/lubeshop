@@ -899,7 +899,21 @@ impl App {
             })
             .map(String::as_str)
             .collect();
-        // Float recently-used formats to the top (stable: others keep gw order).
+        // Offer the TI-99 physical path in read/write (it isn't a gw format, and
+        // can't decode a flux master, so not in the Decode flow). Insert it at its
+        // *alphabetical* spot so, when it isn't recent, it sits in order like any
+        // other format (the recency sort below still floats it up if recently
+        // used). `matches` is alphabetical here, so partition_point places it.
+        if self.flow != Flow::Decode {
+            let n = needle.as_str();
+            if n.is_empty() || "ti99".contains(n) || "ti-99".contains(n) {
+                let pos = matches.partition_point(|f| *f < formats::TI99);
+                matches.insert(pos, formats::TI99);
+            }
+        }
+        // Float recently-used formats to the top, most-recent first. Everything
+        // else keeps its alphabetical order — so a format that falls off the end
+        // of the recents returns to its place. Stable sort preserves that order.
         matches.sort_by_key(|f| {
             recent
                 .iter()
@@ -907,14 +921,6 @@ impl App {
                 .map(|i| i as i64)
                 .unwrap_or(i64::MAX)
         });
-        // Offer the TI-99 physical path in read/write (it isn't a gw format, and
-        // can't decode a flux master, so not in the Decode flow).
-        if self.flow != Flow::Decode {
-            let n = needle.as_str();
-            if n.is_empty() || "ti99".contains(n) || "ti-99".contains(n) {
-                matches.insert(0, formats::TI99);
-            }
-        }
         matches
     }
 
@@ -926,7 +932,7 @@ impl App {
         let recents = &mut self.core.settings.recent_formats;
         recents.retain(|f| f != fmt);
         recents.insert(0, fmt.to_string());
-        recents.truncate(6);
+        recents.truncate(5); // keep the last 5 used at the top of the picker
         let _ = self.core.save_settings();
     }
 
@@ -4243,6 +4249,13 @@ impl App {
             }
             // After a read: export the sector-health map and pop it open.
             KeyCode::Char('v') | KeyCode::Char('m') => self.export_disk_map(),
+            // After a write: retry the identical write (same source/format/drive/
+            // erase) — handy for a bad disk you just want to swap and re-run.
+            // `start_write` rebuilds the job from the retained selections.
+            KeyCode::Char('r') | KeyCode::Char('R') if self.screen == Screen::WriteDone => {
+                self.write_job = None;
+                self.start_write();
+            }
             _ => {}
         }
     }

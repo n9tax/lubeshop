@@ -1203,6 +1203,10 @@ fn render_write_outcome(app: &App, job: &crate::write_job::WriteJob, frame: &mut
         None => {}
     }
     lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  r retry the same write (e.g. after swapping the disk)",
+        Style::default().fg(theme().accent),
+    )));
     lines.push(Line::from(Span::styled("  Enter to return to the menu", dim())));
     frame.render_widget(para(lines).block(bordered("Done")), area);
 }
@@ -2280,7 +2284,7 @@ fn status_hint(app: &App) -> &'static str {
             Screen::WriteFluxMode => "  ↑/↓ choose · Enter continue · Esc back",
             Screen::WriteConfirm => "  y write · e toggle erase · Esc cancel",
             Screen::Writing => "  writing… please wait",
-            Screen::WriteDone => "  Enter return to menu",
+            Screen::WriteDone => "  r retry write · Enter return to menu",
             Screen::Ti99Transfer => "  TI-99 transfer… please wait",
             Screen::Ti99Done => "  Enter return to menu",
             Screen::Settings => "  ↑/↓ row · ←/→ change · Enter edit/open · Esc back",
