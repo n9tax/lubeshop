@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "gwm-core"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "chrono",
  "directories",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "gwm-tui"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "anyhow",
  "chrono",
