@@ -20,6 +20,7 @@ use gwm_core::Core;
 use crate::count_job::{CountJob, CountState};
 use crate::diag_job::DiagJob;
 use crate::scan_job::ScanJob;
+use crate::convert_job::ConvertJob;
 use crate::gotek_job::GotekJob;
 use crate::index_job::IndexJob;
 use crate::update_job::{UpdateApplyJob, UpdateCheckJob};
@@ -117,6 +118,7 @@ pub enum Screen {
     Ti99Transfer,
     Ti99Done,
     Settings,
+    Converting,
     Browse,
     BrowseInput,
     BrowseConfirmDelete,
@@ -182,6 +184,9 @@ enum Flow {
     Write,
     /// Choosing a `gw` disk format so a flux master can be decoded for browsing.
     Decode,
+    /// Choosing a `gw` disk format to decode a flux master into a *permanent*
+    /// sector image saved in the library (the "convert" action).
+    Convert,
 }
 
 /// Which pane of the two-pane image browser has focus.
@@ -278,6 +283,14 @@ pub struct App {
     /// Background library indexing (importing files from the store folder). Runs
     /// off-thread so a big folder can't freeze the UI.
     pub index_job: Option<IndexJob>,
+    /// A running flux → sector-image conversion (with progress).
+    pub convert_job: Option<ConvertJob>,
+    /// The pending output + catalog details for the running convert, applied when
+    /// it finishes.
+    pub convert_out: PathBuf,
+    convert_format: String,
+    pub convert_from: String,
+    convert_fs_driver: Option<String>,
     /// Startup check for a newer release (runs once, in the background).
     update_check: Option<UpdateCheckJob>,
     /// A newer release than the running one, once the check confirms it.
@@ -510,6 +523,11 @@ impl App {
             ti99_outcome: None,
             rpm_job: None,
             index_job: None,
+            convert_job: None,
+            convert_out: PathBuf::new(),
+            convert_format: String::new(),
+            convert_from: String::new(),
+            convert_fs_driver: None,
             update_check: Some(UpdateCheckJob::start()),
             update_info: None,
             update_apply: None,
@@ -647,6 +665,11 @@ impl App {
                 Screen::Writing => {
                     if self.write_job.as_mut().map(WriteJob::pump).unwrap_or(false) {
                         self.finalize_write();
+                    }
+                }
+                Screen::Converting => {
+                    if self.convert_job.as_mut().map(ConvertJob::pump).unwrap_or(false) {
+                        self.finalize_convert();
                     }
                 }
                 // The diagnostic streams readings for as long as the screen is
@@ -904,7 +927,7 @@ impl App {
         // *alphabetical* spot so, when it isn't recent, it sits in order like any
         // other format (the recency sort below still floats it up if recently
         // used). `matches` is alphabetical here, so partition_point places it.
-        if self.flow != Flow::Decode {
+        if !matches!(self.flow, Flow::Decode | Flow::Convert) {
             let n = needle.as_str();
             if n.is_empty() || "ti99".contains(n) || "ti-99".contains(n) {
                 let pos = matches.partition_point(|f| *f < formats::TI99);
@@ -972,6 +995,7 @@ impl App {
             Screen::CleanOptions => self.on_clean_options_key(code),
             Screen::Scanning => self.on_scanning_key(code),
             Screen::Writing => {} // destructive — runs to completion; Ctrl+C quits
+            Screen::Converting => {} // runs to completion (quick, non-destructive)
             Screen::Ti99Transfer => {} // runs to completion
             Screen::Ti99Done => {
                 if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
@@ -1176,6 +1200,127 @@ impl App {
         self.open_driver_picker(PickMode::Browse, FsKind::guess_from_ext(ext));
     }
 
+    /// Convert the highlighted flux master (`.scp`/`.hfe`/`.raw`) into a permanent
+    /// decoded sector image saved in the library (e.g. `.adf`/`.img`), catalogued
+    /// as a derived image beside the master. TRS-80 goes through HxC to `.dmk`
+    /// (gw can't); everything else through `gw convert`. Needs the target disk
+    /// format — the catalogued one if present, otherwise the user picks it.
+    fn start_convert(&mut self) {
+        let Some(it) = self.selected_file() else {
+            return;
+        };
+        let ext = Path::new(&it.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !(matches!(it.kind, MediaKind::Flux) || formats::is_flux_suffix(ext)) {
+            self.notice =
+                Some("Convert only applies to flux captures (.scp / .hfe / .raw).".to_string());
+            return;
+        }
+        self.browse_id = it.id;
+        self.browse_master = Some(PathBuf::from(&it.path));
+        self.flow = Flow::Convert;
+
+        // TRS-80 can't be decoded by gw (no format, and gw can't write DMK) — it
+        // goes through HxC. The result is a real `.dmk` in the library.
+        if matches!(it.fs_driver.as_deref().and_then(FsKind::from_id), Some(FsKind::Trs)) {
+            self.decode_trs_flux_to_library();
+            return;
+        }
+        if !self.gw_ready() {
+            self.notice = Some("gw is required to convert this flux capture.".to_string());
+            return;
+        }
+        // Use the catalogued gw format, else ask (same picker as flux-browse).
+        match self.master_item().and_then(|m| m.format).filter(|f| !f.trim().is_empty()) {
+            Some(fmt) => self.decode_to_library(&fmt),
+            None => {
+                if self.formats.is_empty() {
+                    self.formats = formats::list_formats();
+                }
+                if self.formats.is_empty() {
+                    self.notice = Some("Could not read the format list from gw.".to_string());
+                    return;
+                }
+                self.format_filter.clear();
+                self.format_state.select(Some(0));
+                self.notice =
+                    Some("Pick the disk format to convert this flux capture to.".to_string());
+                self.screen = Screen::FormatPicker;
+            }
+        }
+    }
+
+    /// Decode the current flux master with `gw_format` into a permanent sector
+    /// image saved in the library. Runs on a worker thread with a progress bar
+    /// (`Screen::Converting`); the result is catalogued in `finalize_convert`.
+    fn decode_to_library(&mut self, gw_format: &str) {
+        let Some(master) = self.browse_master.clone() else {
+            return;
+        };
+        let master_item = self.master_item();
+        // Remember the format on the master so future browses skip the picker.
+        let _ = self.core.catalog.update_format(self.browse_id, gw_format);
+
+        let ext = formats::decoded_container_ext(gw_format);
+        let out = unique_sibling(&master, ext);
+
+        // Stash what finalize_convert needs once the decode lands.
+        self.convert_out = out.clone();
+        self.convert_format = gw_format.to_string();
+        self.convert_from = file_name(&master);
+        self.convert_fs_driver = master_item
+            .as_ref()
+            .and_then(|m| m.fs_driver.clone())
+            .or_else(|| FsKind::guess_from_ext(ext).map(|k| k.id().to_string()));
+
+        self.convert_job = Some(ConvertJob::start(master, out, gw_format.to_string()));
+        self.browse_master = None;
+        self.screen = Screen::Converting;
+    }
+
+    /// A running convert finished: catalogue the new image (on success) and return
+    /// to the library.
+    fn finalize_convert(&mut self) {
+        let result = self.convert_job.take().and_then(|j| j.result);
+        self.screen = Screen::Library;
+        match result {
+            Some(Ok(())) => {
+                let out = self.convert_out.clone();
+                let size = std::fs::metadata(&out).map(|m| m.len() as i64).unwrap_or(0);
+                let sha = gwm_core::util::sha256_file(&out).ok();
+                let item = NewMediaItem {
+                    kind: MediaKind::Image,
+                    path: out.to_string_lossy().into_owned(),
+                    format: Some(self.convert_format.clone()),
+                    system: Some(formats::system_for_format(&self.convert_format).to_string()),
+                    size_bytes: size,
+                    sha256: sha,
+                    source: Source::Import,
+                    remote_id: None,
+                    tags: Vec::new(),
+                    notes: Some(format!("Decoded from flux {}", self.convert_from)),
+                    fs_format: None,
+                    fs_driver: self.convert_fs_driver.clone(),
+                };
+                match self.core.catalog.insert(&item) {
+                    Ok(_) => {
+                        let _ = self.reload_library();
+                        self.notice = Some(format!("Converted to {}", file_name(&out)));
+                    }
+                    Err(err) => {
+                        self.notice = Some(format!("Converted, but cataloguing failed: {err}"))
+                    }
+                }
+            }
+            Some(Err(err)) => {
+                self.notice = Some(format!("Could not convert {}: {err}", self.convert_from))
+            }
+            None => {}
+        }
+    }
+
     /// Browse a flux/bit-stream master (`.hfe`/`.scp`): decode it to a working
     /// sector image and open the browser on that. The master stays the source of
     /// truth — edits are folded back in `after_image_modified`.
@@ -1322,7 +1467,14 @@ impl App {
         match self.core.catalog.insert(&item) {
             Ok(id) => {
                 let _ = self.reload_library();
-                // Browse the new DMK as an ordinary library image, not a master.
+                // The "convert" action just wants the file in the library.
+                if self.flow == Flow::Convert {
+                    self.browse_master = None;
+                    self.screen = Screen::Library;
+                    self.notice = Some(format!("Converted to {}", file_name(&dmk)));
+                    return;
+                }
+                // Browse path: open the new DMK as an ordinary library image.
                 self.browse_id = id;
                 self.browse_image = dmk;
                 self.browse_master = None;
@@ -3101,6 +3253,7 @@ impl App {
             }
             KeyCode::Char('v') => self.verify_selected(),
             KeyCode::Char('b') => self.start_browse(),
+            KeyCode::Char('c') => self.start_convert(),
             KeyCode::Char('g') => self.start_gotek(),
             KeyCode::Char('f') => self.reformat_selected(),
             KeyCode::Char('d') => {
@@ -3924,9 +4077,9 @@ impl App {
                 self.screen = match self.flow {
                     Flow::Read => Screen::Menu,
                     Flow::Write => Screen::WriteSource,
-                    Flow::Decode => Screen::Library,
+                    Flow::Decode | Flow::Convert => Screen::Library,
                 };
-                if self.flow == Flow::Decode {
+                if matches!(self.flow, Flow::Decode | Flow::Convert) {
                     self.browse_master = None;
                 }
             }
@@ -3953,13 +4106,16 @@ impl App {
                     .and_then(|i| self.filtered_formats().get(i).map(|s| s.to_string()));
                 if let Some(fmt) = choice {
                     self.record_recent_format(&fmt);
-                    if self.flow == Flow::Decode {
+                    match self.flow {
                         // Decode the flux master with the chosen format and browse.
-                        self.decode_and_open(&fmt);
-                    } else {
-                        self.chosen_format = fmt;
-                        self.drive_index = self.default_drive_index();
-                        self.screen = Screen::DrivePicker;
+                        Flow::Decode => self.decode_and_open(&fmt),
+                        // Decode the flux master into a permanent library image.
+                        Flow::Convert => self.decode_to_library(&fmt),
+                        Flow::Read | Flow::Write => {
+                            self.chosen_format = fmt;
+                            self.drive_index = self.default_drive_index();
+                            self.screen = Screen::DrivePicker;
+                        }
                     }
                 }
             }
@@ -4029,7 +4185,7 @@ impl App {
                 self.screen = match self.flow {
                     Flow::Read => Screen::FormatPicker,
                     Flow::Write => Screen::WriteSource,
-                    Flow::Decode => Screen::Library,
+                    Flow::Decode | Flow::Convert => Screen::Library,
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -4055,8 +4211,8 @@ impl App {
                         self.screen = Screen::ReadOptions;
                     }
                     Flow::Write => self.screen = Screen::WriteConfirm,
-                    // Decode never reaches the drive picker.
-                    Flow::Decode => {}
+                    // Decode/Convert never reach the drive picker.
+                    Flow::Decode | Flow::Convert => {}
                 }
             }
             _ => {}

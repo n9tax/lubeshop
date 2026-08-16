@@ -76,6 +76,19 @@ use crate::proc;
 /// or image→flux) is inferred by `gw` from the file extensions, so the same call
 /// both decodes a master and re-encodes edits back into it.
 pub fn convert(input: &Path, output: &Path, format: &str) -> Result<()> {
+    convert_with_progress(input, output, format, &mut |_, _| {})
+}
+
+/// Like [`convert`], but reports progress as `on_progress(tracks_done, total)`
+/// (`total` is `None` until gw prints its plan line). `gw convert` prints a
+/// `Converting c=A-B:h=C-D` plan followed by one `T<cyl>.<head>:` line per track,
+/// so we count tracks against the plan for a real progress bar.
+pub fn convert_with_progress(
+    input: &Path,
+    output: &Path,
+    format: &str,
+    on_progress: &mut dyn FnMut(u32, Option<u32>),
+) -> Result<()> {
     if format.trim().is_empty() {
         return Err(CoreError::Tool(
             "cannot convert without a disk format".to_string(),
@@ -94,6 +107,8 @@ pub fn convert(input: &Path, output: &Path, format: &str) -> Result<()> {
 
     let mut failed = false;
     let mut last = String::new();
+    let mut done: u32 = 0;
+    let mut total: Option<u32> = None;
     proc::run_streaming(&args, |line| {
         let l = line.trim();
         if l.is_empty() {
@@ -105,6 +120,16 @@ pub fn convert(input: &Path, output: &Path, format: &str) -> Result<()> {
             || l.contains("No such file")
         {
             failed = true;
+        }
+        // Plan: "Converting c=0-79:h=0-1 -> c=0-79:h=0-1" → total track count.
+        if let Some(rest) = l.strip_prefix("Converting ") {
+            total = plan_track_count(rest);
+        }
+        // Per-track: "T0.0: IBM MFM (18/18 sectors) …" (retries reprint the same
+        // track, so this can slightly overshoot — the bar clamps to 1.0).
+        if l.starts_with('T') && l[1..].starts_with(|c: char| c.is_ascii_digit()) && l.contains(':') {
+            done += 1;
+            on_progress(done, total);
         }
         last = l.to_string();
     })
@@ -123,6 +148,45 @@ pub fn convert(input: &Path, output: &Path, format: &str) -> Result<()> {
                 format!(": {last}")
             }
         ))),
+    }
+}
+
+/// Total tracks from a `gw convert` plan tail like `c=0-79:h=0-1 -> …`.
+fn plan_track_count(s: &str) -> Option<u32> {
+    let seg = s.split_whitespace().next()?; // "c=0-79:h=0-1"
+    let mut cyls = 1u32;
+    let mut heads = 1u32;
+    for part in seg.split(':') {
+        if let Some(r) = part.strip_prefix("c=") {
+            cyls = range_count(r)?;
+        } else if let Some(r) = part.strip_prefix("h=") {
+            heads = range_count(r)?;
+        }
+    }
+    Some(cyls * heads)
+}
+
+/// Inclusive count of a `0-79` (or single `0`) range.
+fn range_count(r: &str) -> Option<u32> {
+    let mut it = r.split('-');
+    let a: u32 = it.next()?.trim().parse().ok()?;
+    let b: u32 = match it.next() {
+        Some(x) => x.trim().parse().ok()?,
+        None => a,
+    };
+    Some(b.saturating_sub(a) + 1)
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::plan_track_count;
+
+    #[test]
+    fn plan_track_count_from_convert_plan() {
+        // 80 cyls × 2 heads = 160.
+        assert_eq!(plan_track_count("c=0-79:h=0-1 -> c=0-79:h=0-1"), Some(160));
+        // single-sided 40-track = 40.
+        assert_eq!(plan_track_count("c=0-39:h=0 -> c=0-39:h=0"), Some(40));
     }
 }
 

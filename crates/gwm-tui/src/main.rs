@@ -3,6 +3,7 @@
 //! Keeps the terminal lifecycle tiny: initialise, run the app, always restore.
 
 mod app;
+mod convert_job;
 mod count_job;
 mod diag_job;
 mod download_job;

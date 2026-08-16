@@ -101,6 +101,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::NameInput => render_name_input(app, frame, chunks[1]),
         Screen::ReadOptions => render_read_options(app, frame, chunks[1]),
         Screen::Reading | Screen::ReadDone => render_reading(app, frame, chunks[1]),
+        Screen::Converting => render_converting(app, frame, chunks[1]),
         Screen::DiagOptions => render_diag_options(app, frame, chunks[1]),
         Screen::Diag => render_diag(app, frame, chunks[1]),
         Screen::CleanOptions => render_clean_options(app, frame, chunks[1]),
@@ -853,6 +854,50 @@ fn render_read_options(app: &App, frame: &mut Frame, area: Rect) {
         )),
     ];
     frame.render_widget(para(lines).block(bordered("Read options")), area);
+}
+
+fn render_converting(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(job) = app.convert_job.as_ref() else {
+        return;
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    let out_name = app
+        .convert_out
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image");
+    frame.render_widget(
+        para(vec![Line::from(vec![
+            Span::styled("  Converting ", dim()),
+            Span::styled(app.convert_from.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("  →  ", dim()),
+            Span::styled(out_name.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+        ])]),
+        rows[0],
+    );
+
+    let label = match job.total {
+        Some(total) => format!(
+            "{}/{} tracks — {}%",
+            job.done,
+            total,
+            (job.ratio() * 100.0) as u16
+        ),
+        None => "decoding…".to_string(),
+    };
+    frame.render_widget(gauge(job.ratio(), label), rows[1]);
+
+    frame.render_widget(
+        para(vec![Line::from(Span::styled(
+            "  Decoding the flux capture to a sector image — this can take a moment.",
+            dim(),
+        ))]),
+        rows[2],
+    );
 }
 
 fn render_reading(app: &App, frame: &mut Frame, area: Rect) {
@@ -2210,7 +2255,7 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
 fn status_hint(app: &App) -> &'static str {
     match app.screen {
             Screen::Menu => "  ↑/↓ move · Enter select · q quit",
-            Screen::Library => "  ↑/↓ · Enter open · b browse · g →Gotek · f format · h hex · n notes · r rename · M move · d del",
+            Screen::Library => "  ↑/↓ · Enter open · b browse · c convert flux · g →Gotek · f format · h hex · n notes · r rename · M move · d del",
             Screen::GotekFormat => "  ↑/↓ choose format · Enter continue · Esc cancel",
             Screen::GotekDrive => {
                 if app.gotek_drives.is_empty() {
@@ -2284,6 +2329,7 @@ fn status_hint(app: &App) -> &'static str {
             Screen::WriteFluxMode => "  ↑/↓ choose · Enter continue · Esc back",
             Screen::WriteConfirm => "  y write · e toggle erase · Esc cancel",
             Screen::Writing => "  writing… please wait",
+            Screen::Converting => "  converting… please wait",
             Screen::WriteDone => "  r retry write · Enter return to menu",
             Screen::Ti99Transfer => "  TI-99 transfer… please wait",
             Screen::Ti99Done => "  Enter return to menu",
