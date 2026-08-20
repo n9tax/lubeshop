@@ -1,10 +1,15 @@
-//! Detecting removable, FAT-formatted drives — the USB stick a Gotek reads from.
+//! Detecting removable, currently-mounted drives — the USB stick a Gotek reads
+//! from, and the thumb drive we sense being plugged in to offer its images to the
+//! library.
 //!
-//! Deliberately conservative: we only ever surface **removable** volumes with a
-//! **FAT/exFAT** filesystem that are **currently mounted**, so "Send to Gotek" can
-//! never target an internal disk. Like the rest of the app we shell out and parse
-//! (`lsblk` on Linux, PowerShell `Get-Volume` on Windows) rather than pulling in a
-//! platform crate.
+//! Deliberately conservative about *removable*: we only ever surface volumes on
+//! removable/hotplug/USB media that are **currently mounted**, so neither use can
+//! ever touch an internal disk. [`removable_drives`] additionally requires a
+//! **FAT/exFAT** filesystem (a Gotek target must be FAT); [`all_removable_drives`]
+//! accepts any filesystem (sensing a thumb drive shouldn't depend on its format).
+//! Like the rest of the app we shell out and parse (`lsblk` on Linux, `diskutil`
+//! on macOS, PowerShell `Get-Volume` on Windows) rather than pulling in a platform
+//! crate.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -42,20 +47,33 @@ fn is_fat(fs: &str) -> bool {
     )
 }
 
-/// Removable FAT/exFAT drives currently mounted. Empty on any error (the tool
-/// missing, nothing plugged in, …) — callers show "no drives found".
+/// Removable **FAT/exFAT** drives currently mounted — the "Send to Gotek" target,
+/// which must be a FAT stick. Empty on any error (the tool missing, nothing
+/// plugged in, …) — callers show "no drives found".
 pub fn removable_drives() -> Vec<UsbDrive> {
+    enumerate(true)
+}
+
+/// **Every** removable drive currently mounted, regardless of filesystem — used to
+/// *sense* a thumb drive being plugged in so its disk images can be offered to the
+/// library. A retro-image stick is usually FAT/exFAT but needn't be.
+pub fn all_removable_drives() -> Vec<UsbDrive> {
+    enumerate(false)
+}
+
+/// `fat_only` keeps just FAT/exFAT volumes (Gotek); otherwise any filesystem.
+fn enumerate(fat_only: bool) -> Vec<UsbDrive> {
     #[cfg(windows)]
     {
-        windows_drives()
+        windows_drives(fat_only)
     }
     #[cfg(target_os = "macos")]
     {
-        macos_drives()
+        macos_drives(fat_only)
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
-        linux_drives()
+        linux_drives(fat_only)
     }
 }
 
@@ -64,21 +82,22 @@ pub fn removable_drives() -> Vec<UsbDrive> {
 /// External/removable FAT volumes via `diskutil info -all` (one call dumps every
 /// disk, blocks separated by a `**********` line).
 #[cfg(target_os = "macos")]
-fn macos_drives() -> Vec<UsbDrive> {
+fn macos_drives(fat_only: bool) -> Vec<UsbDrive> {
     let out = match Command::new("diskutil").args(["info", "-all"]).output() {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
     String::from_utf8_lossy(&out.stdout)
         .split("**********")
-        .filter_map(parse_diskutil_block)
+        .filter_map(|b| parse_diskutil_block(b, fat_only))
         .collect()
 }
 
-/// Parse one `diskutil info` block into a drive, keeping only *mounted, removable,
-/// FAT* volumes. Not cfg-gated to macOS so it can be unit-tested anywhere.
+/// Parse one `diskutil info` block into a drive, keeping only *mounted, removable*
+/// volumes (and *FAT* when `fat_only`). Not cfg-gated to macOS so it can be
+/// unit-tested anywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn parse_diskutil_block(block: &str) -> Option<UsbDrive> {
+fn parse_diskutil_block(block: &str, fat_only: bool) -> Option<UsbDrive> {
     let mut fields = std::collections::HashMap::new();
     for line in block.lines() {
         if let Some((k, v)) = line.split_once(':') {
@@ -94,7 +113,9 @@ fn parse_diskutil_block(block: &str) -> Option<UsbDrive> {
     // FAT filesystem? (bundle type `msdos`/`exfat`, or the friendly personality.)
     let bundle = get("Type (Bundle)");
     let personality = get("File System Personality").to_ascii_lowercase();
-    if !(is_fat(bundle) || personality.contains("fat") || personality.contains("ms-dos")) {
+    let is_fat_vol =
+        is_fat(bundle) || personality.contains("fat") || personality.contains("ms-dos");
+    if fat_only && !is_fat_vol {
         return None;
     }
     // Removable/external? Several signals across macOS versions.
@@ -132,7 +153,7 @@ fn parse_diskutil_block(block: &str) -> Option<UsbDrive> {
 }
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
-fn linux_drives() -> Vec<UsbDrive> {
+fn linux_drives(fat_only: bool) -> Vec<UsbDrive> {
     let out = match Command::new("lsblk")
         .args(["-J", "-o", "NAME,RM,HOTPLUG,TRAN,FSTYPE,MOUNTPOINT,LABEL,SIZE"])
         .output()
@@ -147,7 +168,7 @@ fn linux_drives() -> Vec<UsbDrive> {
     let mut drives = Vec::new();
     if let Some(devs) = json.get("blockdevices").and_then(|v| v.as_array()) {
         for dev in devs {
-            collect_linux(dev, node_is_removable(dev), &mut drives);
+            collect_linux(dev, node_is_removable(dev), fat_only, &mut drives);
         }
     }
     drives
@@ -168,14 +189,15 @@ fn node_is_removable(node: &serde_json::Value) -> bool {
         || node.get("tran").and_then(|v| v.as_str()) == Some("usb")
 }
 
-/// Add any mounted FAT partition under `node` (a disk and its children); `removable`
-/// is inherited from the parent disk.
+/// Add any mounted partition under `node` (a disk and its children) that is on
+/// removable media (and FAT, when `fat_only`); `removable` is inherited from the
+/// parent disk.
 #[cfg(all(not(windows), not(target_os = "macos")))]
-fn collect_linux(node: &serde_json::Value, removable: bool, out: &mut Vec<UsbDrive>) {
+fn collect_linux(node: &serde_json::Value, removable: bool, fat_only: bool, out: &mut Vec<UsbDrive>) {
     let removable = removable || node_is_removable(node);
     let fs = node.get("fstype").and_then(|v| v.as_str()).unwrap_or("");
     let mount = node.get("mountpoint").and_then(|v| v.as_str()).unwrap_or("");
-    if removable && !mount.is_empty() && is_fat(fs) {
+    if removable && !mount.is_empty() && (!fat_only || is_fat(fs)) {
         out.push(UsbDrive {
             mount: PathBuf::from(mount),
             label: node
@@ -193,14 +215,14 @@ fn collect_linux(node: &serde_json::Value, removable: bool, out: &mut Vec<UsbDri
     }
     if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
         for child in children {
-            collect_linux(child, removable, out);
+            collect_linux(child, removable, fat_only, out);
         }
     }
 }
 
 #[cfg(windows)]
-fn windows_drives() -> Vec<UsbDrive> {
-    // Get-Volume exposes DriveType/FileSystem/label/size; keep removable FAT ones.
+fn windows_drives(fat_only: bool) -> Vec<UsbDrive> {
+    // Get-Volume exposes DriveType/FileSystem/label/size; keep removable ones.
     let script = "Get-Volume | Where-Object { $_.DriveType -eq 'Removable' -and $_.DriveLetter } | \
                   Select-Object DriveLetter,FileSystemLabel,FileSystem,Size | ConvertTo-Json -Compress";
     let out = match Command::new("powershell")
@@ -215,14 +237,14 @@ fn windows_drives() -> Vec<UsbDrive> {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    parse_windows_volumes(&json)
+    parse_windows_volumes(&json, fat_only)
 }
 
 /// Turn the `Get-Volume | … | ConvertTo-Json` payload into removable FAT drives.
 /// `ConvertTo-Json` yields a single object for one volume and an array for several.
 /// Pure (no process spawning) so it can be unit-tested against real payload shapes.
 #[cfg(windows)]
-fn parse_windows_volumes(json: &serde_json::Value) -> Vec<UsbDrive> {
+fn parse_windows_volumes(json: &serde_json::Value, fat_only: bool) -> Vec<UsbDrive> {
     let items: Vec<&serde_json::Value> = match json {
         serde_json::Value::Array(a) => a.iter().collect(),
         v => vec![v],
@@ -230,7 +252,7 @@ fn parse_windows_volumes(json: &serde_json::Value) -> Vec<UsbDrive> {
     let mut drives = Vec::new();
     for it in items {
         let fs = it.get("FileSystem").and_then(|v| v.as_str()).unwrap_or("");
-        if !is_fat(fs) {
+        if fat_only && !is_fat(fs) {
             continue;
         }
         let Some(letter) = it.get("DriveLetter").and_then(letter_str) else {
@@ -303,7 +325,7 @@ mod tests {
             r#"{"DriveLetter":"E","FileSystemLabel":"GOTEK","FileSystem":"FAT32","Size":4000000000}"#,
         )
         .unwrap();
-        let drives = parse_windows_volumes(&json);
+        let drives = parse_windows_volumes(&json, true);
         assert_eq!(drives.len(), 1);
         assert_eq!(drives[0].mount, PathBuf::from("E:\\"));
         assert_eq!(drives[0].label, "GOTEK");
@@ -324,7 +346,7 @@ mod tests {
             ]"#,
         )
         .unwrap();
-        let drives = parse_windows_volumes(&json);
+        let drives = parse_windows_volumes(&json, true);
         // 'F' (char 70) exFAT kept; NTFS dropped; letterless dropped.
         assert_eq!(drives.len(), 1);
         assert_eq!(drives[0].mount, PathBuf::from("F:\\"));
@@ -347,12 +369,38 @@ mod tests {
         .unwrap();
         let mut drives = Vec::new();
         for dev in json["blockdevices"].as_array().unwrap() {
-            collect_linux(dev, node_is_removable(dev), &mut drives);
+            collect_linux(dev, node_is_removable(dev), true, &mut drives);
         }
         assert_eq!(drives.len(), 1);
         assert_eq!(drives[0].mount, PathBuf::from("/run/media/joe/GOTEK"));
         assert_eq!(drives[0].label, "GOTEK");
         assert_eq!(drives[0].fs, "vfat");
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn all_fs_mode_keeps_non_fat_removable_but_still_skips_internal() {
+        // A USB stick formatted ext4 (rm=true) next to an internal NVMe root. With
+        // fat_only=false the ext4 stick is sensed; the internal disk never is.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"blockdevices":[
+                {"name":"nvme0n1","rm":false,"tran":"nvme","fstype":null,"mountpoint":null,"label":null,"size":"1.8T",
+                 "children":[{"name":"nvme0n1p2","rm":false,"fstype":"ext4","mountpoint":"/","label":null,"size":"1.8T"}]},
+                {"name":"sdb","rm":true,"tran":"usb","fstype":null,"mountpoint":null,"label":null,"size":"3.7G",
+                 "children":[{"name":"sdb1","rm":true,"fstype":"ext4","mountpoint":"/run/media/joe/STICK","label":"STICK","size":"3.7G"}]}
+            ]}"#,
+        )
+        .unwrap();
+        let mut all = Vec::new();
+        let mut fat = Vec::new();
+        for dev in json["blockdevices"].as_array().unwrap() {
+            collect_linux(dev, node_is_removable(dev), false, &mut all);
+            collect_linux(dev, node_is_removable(dev), true, &mut fat);
+        }
+        // Any-fs sees the ext4 stick; FAT-only rejects it. Neither sees the root.
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].mount, PathBuf::from("/run/media/joe/STICK"));
+        assert!(fat.is_empty());
     }
 
     // `parse_diskutil_block` isn't macOS-gated, so it unit-tests on any host. The
@@ -376,7 +424,7 @@ mod tests {
    Device Location:           External
    Volume Total Space:        3.9 GB (3901579264 Bytes) (exactly 7620272 512-Byte-Units)
 ";
-        let d = parse_diskutil_block(stick).expect("removable FAT stick");
+        let d = parse_diskutil_block(stick, true).expect("removable FAT stick");
         assert_eq!(d.mount, PathBuf::from("/Volumes/GOTEK"));
         assert_eq!(d.label, "GOTEK");
         assert_eq!(d.size, "3.9 GB");
@@ -395,7 +443,7 @@ mod tests {
    Device Location:           Internal
    Volume Total Space:        494.4 GB (494384795648 Bytes)
 ";
-        assert!(parse_diskutil_block(internal).is_none());
+        assert!(parse_diskutil_block(internal, true).is_none());
 
         // An unmounted FAT partition (Mount Point "Not applicable") is skipped.
         let unmounted = "\
@@ -406,6 +454,6 @@ mod tests {
    Removable Media:           Removable
    Protocol:                  USB
 ";
-        assert!(parse_diskutil_block(unmounted).is_none());
+        assert!(parse_diskutil_block(unmounted, true).is_none());
     }
 }

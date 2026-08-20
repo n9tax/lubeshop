@@ -24,6 +24,7 @@ use crate::convert_job::ConvertJob;
 use crate::gotek_job::GotekJob;
 use crate::index_job::IndexJob;
 use crate::update_job::{UpdateApplyJob, UpdateCheckJob};
+use crate::usb_job::{UsbArrival, UsbImportJob, UsbWatchJob};
 use crate::version_job::{VersionJob, VersionState};
 use gwm_core::convert::GotekFormat;
 use gwm_core::usb::UsbDrive;
@@ -119,6 +120,12 @@ pub enum Screen {
     Ti99Done,
     Settings,
     Converting,
+    /// Import an IPF: choose flux master (.hfe) vs decoded image (.adf).
+    IpfChoice,
+    /// A thumb drive was plugged in: offer to import its images.
+    UsbDetected,
+    /// Copying a plugged-in drive's images into the library (with progress).
+    UsbImporting,
     Browse,
     BrowseInput,
     BrowseConfirmDelete,
@@ -283,6 +290,18 @@ pub struct App {
     /// Background library indexing (importing files from the store folder). Runs
     /// off-thread so a big folder can't freeze the UI.
     pub index_job: Option<IndexJob>,
+    /// Background poller that senses a thumb drive being plugged in. Started once
+    /// and polled every tick; drives present at launch are the baseline.
+    usb_watch: Option<UsbWatchJob>,
+    /// Newly-arrived removable drives waiting for the "add to library?" prompt
+    /// (queued so several plugged in at once are handled one at a time).
+    usb_queue: Vec<UsbArrival>,
+    /// The arrival currently shown on the `UsbDetected` prompt.
+    pub usb_pending: Option<UsbArrival>,
+    /// A running copy-a-drive's-images-into-the-library operation (with progress).
+    pub usb_import: Option<UsbImportJob>,
+    /// The screen to return to after the USB prompt is dismissed.
+    usb_return: Screen,
     /// A running flux → sector-image conversion (with progress).
     pub convert_job: Option<ConvertJob>,
     /// The pending output + catalog details for the running convert, applied when
@@ -291,6 +310,8 @@ pub struct App {
     convert_format: String,
     pub convert_from: String,
     convert_fs_driver: Option<String>,
+    /// IPF import chooser selection (0 = flux master .hfe, 1 = decoded .adf).
+    pub ipf_index: usize,
     /// Startup check for a newer release (runs once, in the background).
     update_check: Option<UpdateCheckJob>,
     /// A newer release than the running one, once the check confirms it.
@@ -523,11 +544,17 @@ impl App {
             ti99_outcome: None,
             rpm_job: None,
             index_job: None,
+            usb_watch: None,
+            usb_queue: Vec::new(),
+            usb_pending: None,
+            usb_import: None,
+            usb_return: Screen::Menu,
             convert_job: None,
             convert_out: PathBuf::new(),
             convert_format: String::new(),
             convert_from: String::new(),
             convert_fs_driver: None,
+            ipf_index: 0,
             update_check: Some(UpdateCheckJob::start()),
             update_info: None,
             update_apply: None,
@@ -647,6 +674,8 @@ impl App {
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         self.reload_library()?;
+        // Start sensing thumb drives (drives already mounted are the baseline).
+        self.usb_watch = Some(UsbWatchJob::start());
         let tick = Duration::from_millis(80);
         while !self.should_quit {
             terminal.draw(|frame| crate::ui::render(&mut self, frame))?;
@@ -799,6 +828,23 @@ impl App {
                 }
             }
 
+            // Sense thumb drives being plugged in: queue any new arrivals, and
+            // raise the "add to library?" prompt when we're on a safe screen.
+            if let Some(mut watch) = self.usb_watch.take() {
+                self.usb_queue.extend(watch.pump());
+                self.usb_watch = Some(watch);
+            }
+            self.maybe_prompt_usb();
+
+            // A running copy-a-drive's-images-into-the-library operation.
+            if let Some(mut job) = self.usb_import.take() {
+                if job.pump() {
+                    self.finalize_usb_import(&job);
+                } else {
+                    self.usb_import = Some(job);
+                }
+            }
+
             // An interactive install command suspends the TUI, runs in the real
             // terminal (so the package manager can prompt), then resumes.
             if let Some(cmd) = self.run_interactive.take() {
@@ -822,6 +868,86 @@ impl App {
         self.lib_state
             .select(if self.library.is_empty() { None } else { Some(0) });
         Ok(())
+    }
+
+    /// Raise the "add this drive to your library?" prompt for the next queued
+    /// arrival — but only on a safe, idle screen (never mid-read/write/convert/…)
+    /// and only when nothing else is already prompting or importing.
+    fn maybe_prompt_usb(&mut self) {
+        if self.usb_pending.is_some() || self.usb_import.is_some() {
+            return;
+        }
+        if !matches!(self.screen, Screen::Menu | Screen::Library) {
+            return;
+        }
+        let lib = self.core.paths.library_dir.clone();
+        while !self.usb_queue.is_empty() {
+            let arrival = self.usb_queue.remove(0);
+            // Skip a drive already unplugged before we got here, or one that IS the
+            // library store (nothing to import in either case).
+            if !arrival.drive.mount.exists() || lib.starts_with(&arrival.drive.mount) {
+                continue;
+            }
+            self.usb_return = self.screen;
+            self.usb_pending = Some(arrival);
+            self.screen = Screen::UsbDetected;
+            return;
+        }
+    }
+
+    fn on_usb_detected_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.start_usb_import(),
+            KeyCode::Char('n')
+            | KeyCode::Char('N')
+            | KeyCode::Esc
+            | KeyCode::Backspace
+            | KeyCode::Char('q') => {
+                self.usb_pending = None;
+                self.screen = self.usb_return;
+            }
+            _ => {}
+        }
+    }
+
+    /// Copy the pending drive's images into a store subfolder named after the drive,
+    /// then catalogue them — off-thread with a progress bar (`UsbImporting`).
+    fn start_usb_import(&mut self) {
+        let Some(arrival) = self.usb_pending.take() else {
+            return;
+        };
+        let src = arrival.drive.mount.clone();
+        // A subfolder named after the drive keeps its images grouped and makes
+        // re-importing the same stick idempotent (same destination paths).
+        let raw = if !arrival.drive.label.is_empty() {
+            arrival.drive.label.clone()
+        } else {
+            src.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "USB Import".to_string())
+        };
+        let dest = self.core.paths.library_dir.join(safe_host_name(&raw));
+        self.usb_import = Some(UsbImportJob::start(
+            self.core.paths.db_path.clone(),
+            src,
+            dest,
+        ));
+        self.screen = Screen::UsbImporting;
+    }
+
+    /// A finished USB import: refresh the library and report the outcome.
+    fn finalize_usb_import(&mut self, job: &UsbImportJob) {
+        self.screen = Screen::Library;
+        if let Some(err) = &job.error {
+            self.notice = Some(format!("Could not import from the drive: {err}"));
+            return;
+        }
+        let _ = self.reload_library();
+        self.notice = Some(if job.added > 0 {
+            format!("Imported {} image(s) from the drive.", job.added)
+        } else {
+            "Those images are already in your library.".to_string()
+        });
     }
 
     /// Leave the TUI, run a command in the real terminal (so it can prompt for
@@ -996,6 +1122,9 @@ impl App {
             Screen::Scanning => self.on_scanning_key(code),
             Screen::Writing => {} // destructive — runs to completion; Ctrl+C quits
             Screen::Converting => {} // runs to completion (quick, non-destructive)
+            Screen::IpfChoice => self.on_ipf_choice_key(code),
+            Screen::UsbDetected => self.on_usb_detected_key(code),
+            Screen::UsbImporting => {} // runs to completion (copy + catalogue)
             Screen::Ti99Transfer => {} // runs to completion
             Screen::Ti99Done => {
                 if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
@@ -1161,6 +1290,12 @@ impl App {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
+        // IPF is a flux master `gw` can't read (hxcfe + capsimage only) — offer the
+        // import chooser rather than the gw flux-browse path.
+        if ext.eq_ignore_ascii_case("ipf") {
+            self.start_ipf(&it);
+            return;
+        }
         // A flux/bit-stream master can't be read by the filesystem tools; decode
         // it to a sector image first (edits are re-encoded back on save).
         if matches!(it.kind, MediaKind::Flux) || formats::is_flux_suffix(ext) {
@@ -1213,6 +1348,11 @@ impl App {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
+        // IPF has its own chooser (flux master vs decoded image), via hxcfe.
+        if ext.eq_ignore_ascii_case("ipf") {
+            self.start_ipf(&it);
+            return;
+        }
         if !(matches!(it.kind, MediaKind::Flux) || formats::is_flux_suffix(ext)) {
             self.notice =
                 Some("Convert only applies to flux captures (.scp / .hfe / .raw).".to_string());
@@ -1318,6 +1458,103 @@ impl App {
                 self.notice = Some(format!("Could not convert {}: {err}", self.convert_from))
             }
             None => {}
+        }
+    }
+
+    /// Start importing an IPF: check the tools, then show the flux-master-vs-ADF
+    /// chooser. IPF decodes only through hxcfe + the SPS capsimage library; if
+    /// either is missing, send the user to Tools (preselected) rather than failing.
+    fn start_ipf(&mut self, it: &MediaItem) {
+        if !convert::hxcfe_available() {
+            self.notice = Some(
+                "IPF files need HxC (hxcfe) — press Enter in Tools to install it.".to_string(),
+            );
+            self.enter_tools();
+            self.preselect_tool("hxcfe");
+            return;
+        }
+        if !gwm_core::tools::capsimg_installed() {
+            self.notice = Some(
+                "IPF files need the SPS CAPSImage library — press Enter in Tools to install it."
+                    .to_string(),
+            );
+            self.enter_tools();
+            self.preselect_tool("capsimg");
+            return;
+        }
+        self.browse_id = it.id;
+        self.browse_master = Some(PathBuf::from(&it.path));
+        self.convert_from = item_file_name(it);
+        self.ipf_index = 0;
+        self.screen = Screen::IpfChoice;
+    }
+
+    /// Point the Tools menu at a specific tool (used when an action needs one that
+    /// isn't installed yet).
+    fn preselect_tool(&mut self, cmd: &str) {
+        if let Some(i) = gwm_core::tools::TOOLS.iter().position(|t| t.cmd == cmd) {
+            self.tools_index = i;
+        }
+    }
+
+    fn on_ipf_choice_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
+                self.browse_master = None;
+                self.screen = Screen::Library;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.ipf_index = 0,
+            KeyCode::Down | KeyCode::Char('j') => self.ipf_index = 1,
+            KeyCode::Enter => self.decode_ipf(self.ipf_index),
+            _ => {}
+        }
+    }
+
+    /// Decode the chosen IPF into the library: `mode` 0 → an `.hfe` flux master
+    /// (preserves protection, browsable + writable), 1 → a browsable `.adf` sector
+    /// image. hxcfe is fast enough to run inline (like the TRS-80 path).
+    fn decode_ipf(&mut self, mode: usize) {
+        let Some(master) = self.browse_master.clone() else {
+            return;
+        };
+        let flux = mode == 0;
+        let ext = if flux { "hfe" } else { "adf" };
+        let out = unique_sibling(&master, ext);
+        let res = if flux {
+            convert::ipf_to_hfe(&master, &out)
+        } else {
+            convert::ipf_to_adf(&master, &out)
+        };
+        self.browse_master = None;
+        self.screen = Screen::Library;
+        if let Err(err) = res {
+            self.notice = Some(format!("Could not convert {}: {err}", self.convert_from));
+            return;
+        }
+        let size = std::fs::metadata(&out).map(|m| m.len() as i64).unwrap_or(0);
+        let sha = gwm_core::util::sha256_file(&out).ok();
+        let item = NewMediaItem {
+            // A flux master (.hfe) is catalogued as Flux so it browses/writes via the
+            // flux path; a decoded .adf is an ordinary Amiga image.
+            kind: if flux { MediaKind::Flux } else { MediaKind::Image },
+            path: out.to_string_lossy().into_owned(),
+            format: if flux { None } else { Some("amiga.amigados".to_string()) },
+            system: Some("Amiga".to_string()),
+            size_bytes: size,
+            sha256: sha,
+            source: Source::Import,
+            remote_id: None,
+            tags: Vec::new(),
+            notes: Some(format!("Converted from IPF {}", self.convert_from)),
+            fs_format: None,
+            fs_driver: Some(FsKind::Amiga.id().to_string()),
+        };
+        match self.core.catalog.insert(&item) {
+            Ok(_) => {
+                let _ = self.reload_library();
+                self.notice = Some(format!("Converted IPF to {}", file_name(&out)));
+            }
+            Err(err) => self.notice = Some(format!("Converted, but cataloguing failed: {err}")),
         }
     }
 

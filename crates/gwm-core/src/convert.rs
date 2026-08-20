@@ -17,6 +17,43 @@ use std::process::Command;
 
 use crate::error::{CoreError, Result};
 
+/// Point `hxcfe` at a `libcapsimage` we may have built into `~/.local/lib` (the
+/// SPS IPF/CTR decode library, which hxcfe `dlopen`s at runtime — it is not
+/// linked in). Harmless for non-IPF conversions: the extra search path just goes
+/// unused. On Windows the DLL loads from our per-user bin dir, added to PATH.
+#[cfg(not(windows))]
+fn inject_caps_libpath(cmd: &mut Command) {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let lib = std::path::PathBuf::from(home).join(".local/lib");
+    // Linux honours LD_LIBRARY_PATH; macOS DYLD_LIBRARY_PATH. Set both — the one
+    // the platform ignores does no harm.
+    for var in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+        let mut paths = vec![lib.clone()];
+        if let Some(existing) = std::env::var_os(var) {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env(var, joined);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn inject_caps_libpath(cmd: &mut Command) {
+    let Some(bin) = crate::tools::windows_bin_dir() else {
+        return;
+    };
+    let mut paths = vec![bin];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        cmd.env("PATH", joined);
+    }
+}
+
 // ---- TI-99: V9T9 .dsk <-> HFE via xhm99 ----------------------------------
 //
 // gw reads/writes HFE bitstreams directly (no `--format` needed), but can't turn
@@ -212,6 +249,42 @@ pub fn flux_to_dmk(input: &Path, output: &Path) -> Result<()> {
     hxcfe_convert(input, output, "TRS80_DMK")
 }
 
+/// Whether we can decode Amiga/Atari **IPF** files: both `hxcfe` and the SPS
+/// `capsimage` library it `dlopen`s must be present. IPF is a closed preservation
+/// format; `gw` can't read it, and hxcfe only lists an `SPS_IPF` loader that fails
+/// at runtime without the library. Callers gate on this before offering IPF import.
+pub fn ipf_available() -> bool {
+    hxcfe_available() && crate::tools::capsimg_installed()
+}
+
+/// Decode an Amiga **IPF** into an `.hfe` **flux master** — a faithful bit-stream
+/// copy that keeps copy-protection intact, browses via the normal flux path, and
+/// can be written back to a real floppy. Needs `hxcfe` + `capsimage`
+/// ([`ipf_available`]); returns a clear error if the library is missing rather
+/// than letting hxcfe emit an empty file.
+pub fn ipf_to_hfe(input: &Path, output: &Path) -> Result<()> {
+    ensure_caps()?;
+    hxcfe_convert(input, output, "HXC_HFE")
+}
+
+/// Decode an Amiga **IPF** straight into a browsable/editable `.adf` sector image.
+/// Simplest for plain AmigaDOS disks; low-level protection detail is not retained
+/// (use [`ipf_to_hfe`] for that). Needs `hxcfe` + `capsimage`.
+pub fn ipf_to_adf(input: &Path, output: &Path) -> Result<()> {
+    ensure_caps()?;
+    hxcfe_convert(input, output, "AMIGA_ADF")
+}
+
+fn ensure_caps() -> Result<()> {
+    if crate::tools::capsimg_installed() {
+        return Ok(());
+    }
+    Err(CoreError::Tool(
+        "IPF files need the SPS CAPSImage library — install it from the Tools menu."
+            .to_string(),
+    ))
+}
+
 /// Run `hxcfe -finput:IN -conv:MODULE -foutput:OUT`. hxcfe auto-detects the input
 /// container and its exit code is reliable (0 = ok), but confirm a non-empty output
 /// too. `module` is an hxcfe converter id (`TRS80_DMK`, `HXC_HFE`, `HXC_HFEV3`, …).
@@ -233,11 +306,18 @@ fn hxcfe_convert(input: &Path, output: &Path, module: &str) -> Result<()> {
             let msg = e.to_string();
             let unloadable =
                 msg.contains("No loader support") || msg.contains("Can't open/load");
-            let is_img = input
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("img"));
-            if unloadable && !is_img {
+            let ext_is = |want: &str| {
+                input
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case(want))
+            };
+            // Never re-stage an `.ipf` as `.img`: with capsimage missing hxcfe
+            // reports it unloadable, and the raw loader would then happily read the
+            // 1 MB IPF bytes as a garbage sector image and "succeed". IPF failures
+            // must surface as failures (the caller gates on `ipf_available`).
+            let is_img = ext_is("img");
+            if unloadable && !is_img && !ext_is("ipf") {
                 let staged = output.with_extension("src.img");
                 let _ = std::fs::remove_file(&staged);
                 std::fs::copy(input, &staged).map_err(|e| {
@@ -255,10 +335,12 @@ fn hxcfe_convert(input: &Path, output: &Path, module: &str) -> Result<()> {
 
 fn run_hxcfe(input: &Path, output: &Path, module: &str) -> Result<()> {
     let _ = std::fs::remove_file(output);
-    let out = Command::new("hxcfe")
-        .arg(format!("-finput:{}", input.display()))
+    let mut cmd = Command::new("hxcfe");
+    cmd.arg(format!("-finput:{}", input.display()))
         .arg(format!("-conv:{module}"))
-        .arg(format!("-foutput:{}", output.display()))
+        .arg(format!("-foutput:{}", output.display()));
+    inject_caps_libpath(&mut cmd);
+    let out = cmd
         .output()
         .map_err(|e| CoreError::Tool(format!("hxcfe could not run: {e}")))?;
 

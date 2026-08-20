@@ -223,6 +223,38 @@ echo "Installed hxcfe to ~/.local/bin"
 "#,
 };
 
+/// SPS **capsimage** — the library hxcfe `dlopen`s to decode Amiga/Atari **IPF**
+/// preservation images. Not a command and not redistributable (custom SPS
+/// licence), so we can't bundle it — we build it from SPS's own source zip on the
+/// user's machine, on request, and drop the shared library into `~/.local/lib`
+/// where `convert.rs` points hxcfe at it. Python (already required for `gw`)
+/// unpacks the nested zips so we need no unzip/bsdtar. Builds with the same
+/// gcc/make the other C recipes use; the macOS build of the same source emits a
+/// `.dylib`, handled by the glob + symlinks.
+const CAPSIMG: Recipe = Recipe {
+    prereqs: &[Prereq::Build, Prereq::Curl],
+    steps: r#"
+d=$(mktemp -d)
+curl -fsSL -o "$d/sps.zip" https://www.kryoflux.com/download/spsdeclib_5.1_source.zip
+python3 -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$d/sps.zip" "$d"
+python3 -c "import zipfile,sys;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$d/capsimg_source_linux_macosx.zip" "$d"
+cd "$d/capsimg_source_linux_macosx/CAPSImg"
+chmod +x configure
+./configure >/dev/null
+make
+lib="$HOME/.local/lib"; mkdir -p "$lib"
+for f in libcapsimage.so.5.1 libcapsimage.*.dylib libcapsimage.dylib; do
+  [ -e "$f" ] && cp "$f" "$lib/"
+done
+cd "$lib"
+# Linux: give hxcfe the sonames it dlopens (.so.5 / .so). macOS: the bare .dylib.
+[ -e libcapsimage.so.5.1 ] && ln -sf libcapsimage.so.5.1 libcapsimage.so.5 && ln -sf libcapsimage.so.5.1 libcapsimage.so
+for dy in libcapsimage.*.dylib; do [ -e "$dy" ] && ln -sf "$dy" libcapsimage.dylib; done
+cd "$HOME" && rm -rf "$d"
+echo "Installed libcapsimage to ~/.local/lib"
+"#,
+};
+
 /// AppleCommander: a Java jar. Recent releases need Java 21, which many distros
 /// (e.g. Debian 12) don't ship, so we bundle a portable Temurin 21 JRE and point
 /// a launcher script at it — making it work regardless of the system Java.
@@ -293,6 +325,7 @@ pub const TOOLS: &[Tool] = &[
     Tool { cmd: "atr", label: "atari-tools", purpose: "Atari 8-bit ATR images", source: Source::Build(ATARI_TOOLS), win: WinSource::Todo, homepage: "https://github.com/jhallen/atari-tools" , version: None, probe: None },
     Tool { cmd: "xdm99", label: "xdt99 (xdm99)", purpose: "TI-99/4A disk images", source: Source::Build(XDT99), win: WinSource::BundleFolder { url: "https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/xdt99-win64.zip", dir: "xdt99" }, homepage: "https://github.com/endlos99/xdt99" , version: None, probe: None },
     Tool { cmd: "hxcfe", label: "HxC Floppy Emulator (hxcfe)", purpose: "Flux → DMK etc. (e.g. TRS-80 captures)", source: Source::Build(HXC), win: WinSource::FromAuthor("https://hxc2001.com/download/floppy_drive_emulator/"), homepage: "https://hxc2001.com/floppy_drive_emulator/" , version: Some("2.16.13.1"), probe: Some(VersionProbe { args: &[], marker: "converter v" }) },
+    Tool { cmd: "capsimg", label: "SPS CAPSImage (IPF)", purpose: "Amiga/Atari IPF disk images (with hxcfe)", source: Source::Build(CAPSIMG), win: WinSource::Bundle("https://github.com/n9tax/lubeshop-windows-tools/releases/download/windows-tools/capsimg-win64.zip"), homepage: "http://www.softpres.org/" , version: None, probe: None },
 ];
 
 /// A system package manager we know how to drive.
@@ -738,7 +771,53 @@ pub fn refresh_path_from_registry() {
 pub fn refresh_path_from_registry() {}
 
 /// Is a tool's command available on PATH?
+/// capsimage is a shared library hxcfe `dlopen`s, not a command on `$PATH`, so
+/// detect it by file: our own `~/.local/lib` build, the standard loader dirs, the
+/// AUR package's `/usr/lib/caps`, and any dir on `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH`.
+#[cfg(not(windows))]
+pub fn capsimg_installed() -> bool {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(std::path::PathBuf::from(home).join(".local/lib"));
+    }
+    for d in [
+        "/usr/lib",
+        "/usr/lib/caps",
+        "/usr/local/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/opt/homebrew/lib",
+    ] {
+        dirs.push(std::path::PathBuf::from(d));
+    }
+    for var in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"] {
+        if let Some(v) = std::env::var_os(var) {
+            dirs.extend(std::env::split_paths(&v));
+        }
+    }
+    const NAMES: &[&str] = &[
+        "libcapsimage.so.5",
+        "libcapsimage.so.5.1",
+        "libcapsimage.so",
+        "libcapsimage.dylib",
+        "libcapsimage.5.dylib",
+        "libcapsimage.5.1.dylib",
+    ];
+    dirs.iter().any(|d| NAMES.iter().any(|n| d.join(n).exists()))
+}
+
+/// Windows: `CAPSImg.dll` shipped into our per-user bin dir (on PATH).
+#[cfg(windows)]
+pub fn capsimg_installed() -> bool {
+    windows_bin_dir()
+        .map(|b| b.join("CAPSImg.dll").exists())
+        .unwrap_or(false)
+}
+
 pub fn installed(cmd: &str) -> bool {
+    // capsimage has no command — probe the shared library instead.
+    if cmd == "capsimg" {
+        return capsimg_installed();
+    }
     #[cfg(windows)]
     let mut probe = {
         let mut c = Command::new("where");

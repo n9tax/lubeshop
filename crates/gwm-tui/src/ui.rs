@@ -102,6 +102,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::ReadOptions => render_read_options(app, frame, chunks[1]),
         Screen::Reading | Screen::ReadDone => render_reading(app, frame, chunks[1]),
         Screen::Converting => render_converting(app, frame, chunks[1]),
+        Screen::IpfChoice => render_ipf_choice(app, frame, chunks[1]),
+        Screen::UsbDetected => render_usb_detected(app, frame, chunks[1]),
+        Screen::UsbImporting => render_usb_importing(app, frame, chunks[1]),
         Screen::DiagOptions => render_diag_options(app, frame, chunks[1]),
         Screen::Diag => render_diag(app, frame, chunks[1]),
         Screen::CleanOptions => render_clean_options(app, frame, chunks[1]),
@@ -900,6 +903,77 @@ fn render_converting(app: &App, frame: &mut Frame, area: Rect) {
     );
 }
 
+fn render_usb_detected(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(arrival) = app.usb_pending.as_ref() else {
+        return;
+    };
+    let d = &arrival.drive;
+    let name = if d.label.is_empty() {
+        d.mount.display().to_string()
+    } else {
+        d.label.clone()
+    };
+    let plural = if arrival.image_count == 1 { "" } else { "s" };
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  USB drive detected:  ", dim()),
+            Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(Span::styled(format!("      {}", d.describe()), dim())),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  It holds {} disk image{plural}.", arrival.image_count),
+            base(),
+        )),
+        Line::from(Span::styled(
+            "  Copy them into your library?",
+            dim(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Press 'y' to import", accented()),
+            Span::styled("    ·    'n' / Esc to ignore", dim()),
+        ]),
+    ];
+    frame.render_widget(para(lines).block(bordered("Add drive to library?")), area);
+}
+
+fn render_usb_importing(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(job) = app.usb_import.as_ref() else {
+        return;
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(
+        para(vec![Line::from(Span::styled(
+            "  Importing disk images from the drive…",
+            dim(),
+        ))]),
+        rows[0],
+    );
+    let label = if job.total > 0 {
+        format!(
+            "{}/{} files — {}%",
+            job.copied,
+            job.total,
+            (job.ratio() * 100.0) as u16
+        )
+    } else {
+        "scanning…".to_string()
+    };
+    frame.render_widget(gauge(job.ratio(), label), rows[1]);
+    frame.render_widget(
+        para(vec![Line::from(Span::styled(
+            "  Copying each image into your library and cataloguing it.",
+            dim(),
+        ))]),
+        rows[2],
+    );
+}
+
 fn render_reading(app: &App, frame: &mut Frame, area: Rect) {
     let Some(job) = app.read_job.as_ref() else {
         return;
@@ -1104,6 +1178,30 @@ fn render_write_source(app: &mut App, frame: &mut Frame, area: Rect) {
         .highlight_style(hl())
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(list, area, &mut app.write_state);
+}
+
+fn render_ipf_choice(app: &App, frame: &mut Frame, area: Rect) {
+    let options = [
+        ("Flux master (.hfe)", "Faithful bit-stream copy: keeps copy-protection, browses, and can be written back to a real floppy. 'c' still makes an ADF later."),
+        ("Decoded image (.adf)", "Convert straight to a browsable/editable Amiga disk image. Simplest for plain AmigaDOS disks; drops low-level protection detail."),
+    ];
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  Importing IPF  ", dim()),
+            Span::styled(app.convert_from.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  How should this IPF land in your library?", dim())),
+        Line::from(""),
+    ];
+    for (i, (label, help)) in options.iter().enumerate() {
+        let selected = i == app.ipf_index;
+        let (marker, style) = if selected { ("▸ ", accented()) } else { ("  ", base()) };
+        lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
+        lines.push(Line::from(Span::styled(format!("      {help}"), dim())));
+        lines.push(Line::from(""));
+    }
+    frame.render_widget(para(lines).block(bordered("Import IPF — choose form")), area);
 }
 
 fn render_write_flux_mode(app: &App, frame: &mut Frame, area: Rect) {
@@ -2327,6 +2425,9 @@ fn status_hint(app: &App) -> &'static str {
             }
             Screen::WriteSource => "  ↑/↓ move · → open folder · ← up · Enter pick/open · Esc back",
             Screen::WriteFluxMode => "  ↑/↓ choose · Enter continue · Esc back",
+            Screen::IpfChoice => "  ↑/↓ choose · Enter import · Esc cancel",
+            Screen::UsbDetected => "  y import into library · n / Esc ignore",
+            Screen::UsbImporting => "  importing… please wait",
             Screen::WriteConfirm => "  y write · e toggle erase · Esc cancel",
             Screen::Writing => "  writing… please wait",
             Screen::Converting => "  converting… please wait",

@@ -20,6 +20,7 @@ mod text_input;
 mod theme;
 mod ui;
 mod update_job;
+mod usb_job;
 mod version_job;
 mod write_job;
 

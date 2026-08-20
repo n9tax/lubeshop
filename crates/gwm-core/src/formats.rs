@@ -370,7 +370,7 @@ pub fn image_suffixes() -> &'static [String] {
 
 const DEFAULT_SUFFIXES: &[&str] = &[
     "adf", "img", "ima", "st", "msa", "scp", "hfe", "raw", "a2r", "d64", "d71", "d81", "d88",
-    "dsk", "dsd", "ssd", "imd", "td0", "xdf", "po", "do", "fdi", "mgt", "dcp", "cpm",
+    "dsk", "dsd", "ssd", "imd", "td0", "xdf", "po", "do", "fdi", "mgt", "dcp", "cpm", "ipf",
 ];
 
 fn gw_suffixes() -> Vec<String> {
@@ -410,7 +410,10 @@ fn parse_suffixes(help: &str) -> Vec<String> {
 pub fn is_flux_suffix(ext: &str) -> bool {
     matches!(
         ext.to_lowercase().as_str(),
-        "scp" | "hfe" | "raw" | "a2r" | "kf" | "flux"
+        // `.ipf` is a closed preservation master (SPS): a bit-stream capture like
+        // the others, but decodable only via hxcfe + capsimage, not `gw`. It is
+        // caught before the `gw` flux path in the browse/convert entry points.
+        "scp" | "hfe" | "raw" | "a2r" | "kf" | "flux" | "ipf"
     )
 }
 

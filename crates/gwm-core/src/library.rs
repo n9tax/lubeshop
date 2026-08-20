@@ -206,6 +206,110 @@ pub fn unpack_dms(dms: &Path) -> Option<PathBuf> {
     adf.exists().then_some(adf)
 }
 
+/// Recognised disk-image / flux / DMS files under `dir`, found with the same
+/// bounded, symlink-free walk as [`scan_import`] (depth/entry caps, skips hidden
+/// files and a root `originals/`). Used to *count* what a plugged-in drive holds
+/// and to *list* what to copy in — it neither copies nor catalogues.
+pub fn find_disk_images(dir: &Path) -> Vec<PathBuf> {
+    let suffixes = crate::formats::image_suffixes();
+    let mut out = Vec::new();
+    let mut budget: usize = 50_000;
+    collect_image_files(dir, suffixes, &mut out, &mut budget, 0);
+    out
+}
+
+/// The path-collecting twin of [`scan_dir`]: same caps and skips, but it gathers
+/// candidate files instead of cataloguing them. A `.dms` archive counts (it becomes
+/// an `.adf` once imported), so it's included here too.
+fn collect_image_files(
+    dir: &Path,
+    suffixes: &[String],
+    out: &mut Vec<PathBuf>,
+    budget: &mut usize,
+    depth: u32,
+) {
+    if depth > 12 {
+        return;
+    }
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(_) => return,
+    };
+    for entry in read.flatten() {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if depth == 0 && name == "originals" {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_image_files(&path, suffixes, out, budget, depth + 1);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let ext = match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) => ext.to_lowercase(),
+            None => continue,
+        };
+        if ext == "dms" || suffixes.iter().any(|s| *s == ext) {
+            out.push(path);
+        }
+    }
+}
+
+/// Copy every recognised disk image found under `src` (a plugged-in thumb drive)
+/// into `dest` (a folder inside the store), preserving the drive's sub-folder
+/// layout, then catalogue them via [`scan_import`]. `on_progress(copied, total)`
+/// fires per file copied (the slow part). Returns how many NEW catalog entries
+/// resulted.
+///
+/// Idempotent: a file already present at its destination isn't re-copied, and
+/// `scan_import` skips paths already catalogued — re-inserting the same stick is a
+/// no-op. Never follows symlinks; bounded exactly like `scan_import`.
+pub fn import_external(
+    catalog: &Catalog,
+    src: &Path,
+    dest: &Path,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<usize> {
+    let files = find_disk_images(src);
+    let total = files.len();
+    std::fs::create_dir_all(dest)?;
+    for (i, file) in files.iter().enumerate() {
+        // Mirror the drive's layout under dest; fall back to the bare filename.
+        let target = match file.strip_prefix(src) {
+            Ok(rel) => dest.join(rel),
+            Err(_) => dest.join(file.file_name().unwrap_or(std::ffi::OsStr::new("image"))),
+        };
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Skip if we already have it (idempotent re-insert of the same stick).
+        if !target.exists() {
+            let _ = std::fs::copy(file, &target);
+        }
+        on_progress(i + 1, total);
+    }
+    // Catalogue everything now sitting under dest (in place; dedup by path).
+    scan_import(catalog, dest)
+}
+
 /// Human-friendly byte size, e.g. `1.4 MB`.
 pub fn human_size(bytes: i64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -250,6 +354,37 @@ mod tests {
         assert_eq!(catalog.count().unwrap(), 2);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn import_external_copies_into_store_and_catalogues_once() {
+        // A "thumb drive" holding two images (one in a sub-folder) plus a noise
+        // file. Importing copies the images under the store dest, preserving layout,
+        // catalogues them, and a second import adds nothing.
+        let root = std::env::temp_dir().join(format!("gwm-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("stick");
+        let store = root.join("store");
+        std::fs::create_dir_all(src.join("games")).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(src.join("boot.adf"), b"a").unwrap();
+        std::fs::write(src.join("games").join("game.img"), b"b").unwrap();
+        std::fs::write(src.join("readme.txt"), b"ignore").unwrap();
+
+        let catalog = Catalog::open(&store.join("catalog.db")).unwrap();
+        let dest = store.join("STICK");
+        let mut seen = 0usize;
+        let added = import_external(&catalog, &src, &dest, &mut |_, t| seen = t).unwrap();
+
+        assert_eq!(added, 2, "two images imported");
+        assert_eq!(seen, 2, "progress total reflects two files copied");
+        assert!(dest.join("boot.adf").exists());
+        assert!(dest.join("games").join("game.img").exists(), "layout preserved");
+        assert!(!dest.join("readme.txt").exists(), "non-images not copied");
+        // Idempotent: a second import of the same stick adds nothing.
+        assert_eq!(import_external(&catalog, &src, &dest, &mut |_, _| {}).unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
