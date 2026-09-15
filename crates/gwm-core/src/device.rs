@@ -280,6 +280,10 @@ pub fn build_read_args(
     if !format.is_empty() {
         args.push(format!("--format={format}"));
     }
+    // A user-defined format needs gw pointed at the file that defines it.
+    if let Some(diskdefs) = crate::formats::diskdefs_arg(format) {
+        args.push(diskdefs);
+    }
     args.push(format!("--drive={drive}"));
     // Capture the raw flux stream (into a .scp/.raw output) instead of a decoded
     // sector image. `--format` is kept for verification, so the per-track sector
@@ -311,6 +315,9 @@ pub fn build_write_args(format: &str, drive: &str, erase: bool, in_path: &str) -
     // writes the bits directly and needs no `--format`.
     if !format.is_empty() {
         args.push(format!("--format={format}"));
+    }
+    if let Some(diskdefs) = crate::formats::diskdefs_arg(format) {
+        args.push(diskdefs);
     }
     args.push(format!("--drive={drive}"));
     if erase {

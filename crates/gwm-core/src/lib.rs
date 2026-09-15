@@ -25,6 +25,8 @@ pub mod textedit;
 pub mod tools;
 pub mod trs_disk;
 pub mod update;
+pub mod custom_formats;
+pub mod identify;
 pub mod usb;
 pub mod util;
 pub mod write;
@@ -76,6 +78,10 @@ impl Core {
             }
         }
 
+        // The user's own gw formats live in the store; register them so every
+        // format picker offers them and gw is handed `--diskdefs` when one is
+        // chosen (see formats::diskdefs_arg).
+        formats::load_user_diskdefs(&paths.user_diskdefs());
         let settings = Settings::load(&paths.store_dir);
         let catalog = Catalog::open(&paths.db_path)?;
         let gw = device::probe();
@@ -111,6 +117,8 @@ impl Core {
         self.paths.write_locator(dir.as_deref().map(Path::new))?;
         self.paths.set_store_dir(root);
         std::fs::create_dir_all(&self.paths.library_dir)?;
+        // Custom formats travel with the store: re-register the new location's.
+        formats::load_user_diskdefs(&self.paths.user_diskdefs());
 
         // Re-open the catalog at the new location and adopt its settings if it
         // already has some; otherwise seed it with the settings we carried over.

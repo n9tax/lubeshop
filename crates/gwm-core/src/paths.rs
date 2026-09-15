@@ -71,6 +71,12 @@ impl AppPaths {
     }
 
     /// The user-settings file (`store_dir/settings.toml`).
+    /// The user's own gw disk-format definitions (`custom_formats`), kept in the
+    /// store so they travel with it.
+    pub fn user_diskdefs(&self) -> PathBuf {
+        self.store_dir.join("diskdefs.cfg")
+    }
+
     pub fn settings_file(&self) -> PathBuf {
         self.store_dir.join("settings.toml")
     }

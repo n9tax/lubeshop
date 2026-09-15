@@ -18,7 +18,14 @@ pub fn list_formats() -> Vec<String> {
     // argparse prints help to stdout, but combine both streams defensively.
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
-    parse_formats(&text)
+    let mut formats = parse_formats(&text);
+    // The user's own formats belong in every picker alongside gw's built-ins.
+    for custom in custom_formats() {
+        if !formats.contains(&custom.name) {
+            formats.push(custom.name);
+        }
+    }
+    formats
 }
 
 /// Extract the format tokens from `gw read --help` output. The `FORMAT options:`
@@ -59,6 +66,7 @@ pub fn system_for_format(format: &str) -> &'static str {
         "coco" | "dragon" => "Tandy/Dragon",
         "thomson" => "Thomson",
         "dec" => "DEC",
+        "custom" => "Custom",
         _ => "Other",
     }
 }
@@ -71,6 +79,70 @@ pub fn system_for_format(format: &str) -> &'static str {
 /// Sentinel "format" for the TI-99 physical read/write path. Not a real gw
 /// format — it routes read/write through the HFE + xhm99 pipeline instead.
 pub const TI99: &str = "ti99";
+
+// ---- user-defined formats (see `custom_formats`) --------------------------
+
+/// The registered user diskdefs file and the formats parsed from it. Set once at
+/// `Core::init` (and again after a save/delete or a store relocation) so the
+/// pure arg builders in `device.rs`/`convert.rs` can ask "is this a custom
+/// format?" without threading the store path through every call.
+static USER_DISKDEFS: std::sync::RwLock<
+    Option<(std::path::PathBuf, Vec<crate::custom_formats::CustomFormat>)>,
+> = std::sync::RwLock::new(None);
+
+/// Register (or re-read) the user's diskdefs file. A missing file registers as
+/// "no custom formats", which is fine.
+pub fn load_user_diskdefs(path: &std::path::Path) {
+    let defs = crate::custom_formats::load(path);
+    if let Ok(mut g) = USER_DISKDEFS.write() {
+        *g = Some((path.to_path_buf(), defs));
+    }
+}
+
+/// Forget the registered file (tests; a store with no custom formats).
+pub fn clear_user_diskdefs() {
+    if let Ok(mut g) = USER_DISKDEFS.write() {
+        *g = None;
+    }
+}
+
+/// Where the user's custom formats live, once registered.
+pub fn user_diskdefs_path() -> Option<std::path::PathBuf> {
+    USER_DISKDEFS
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(p, _)| p.clone()))
+}
+
+/// The user's custom formats (empty until registered).
+pub fn custom_formats() -> Vec<crate::custom_formats::CustomFormat> {
+    USER_DISKDEFS
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(_, d)| d.clone()))
+        .unwrap_or_default()
+}
+
+pub fn is_custom_format(name: &str) -> bool {
+    USER_DISKDEFS
+        .read()
+        .ok()
+        .map(|g| {
+            g.as_ref()
+                .is_some_and(|(_, d)| d.iter().any(|f| f.name == name))
+        })
+        .unwrap_or(false)
+}
+
+/// The `--diskdefs=FILE` argument gw needs to know a *custom* format, or `None`
+/// for a built-in. Passed only for custom names because the flag **replaces**
+/// gw's built-in list — always passing it would make `ibm.360` "Unknown".
+pub fn diskdefs_arg(format: &str) -> Option<String> {
+    if !is_custom_format(format) {
+        return None;
+    }
+    user_diskdefs_path().map(|p| format!("--diskdefs={}", p.display()))
+}
 
 pub fn describe_format(format: &str) -> String {
     if format == TI99 {
@@ -326,6 +398,10 @@ pub fn gw_format_for_cpm_diskdef(diskdef: &str) -> Option<&'static str> {
 /// standard 1541 disk is 35 tracks. `None` for formats we don't have a curated
 /// figure for — those fall back to gw's own default track set.
 pub fn format_cylinders(format: &str) -> Option<u32> {
+    // A user-defined format says exactly how many cylinders it has.
+    if let Some(custom) = custom_formats().into_iter().find(|c| c.name == format) {
+        return Some(custom.cyls);
+    }
     let n = match format {
         "ti99" => 40, // standard TI-99 disks are 40 tracks
         "commodore.1541" => 35, // diskdef says 40; real disks are 35 tracks
@@ -417,6 +493,33 @@ pub fn is_flux_suffix(ext: &str) -> bool {
     )
 }
 
+/// Whether a suffix is a **sector container** that `gw` reads natively but no
+/// `ImageFs` tool can: Teledisk `.td0` and ImageDisk `.imd` keep their sectors
+/// inside a compressed, annotated archive rather than as a flat dump. Handing one
+/// straight to cpmtools/mtools yields garbage. Like a flux master it must first be
+/// decoded (`gw convert --format …`) to a raw image — but unlike a flux master it
+/// is *not* raw flux, so raw playback never applies and it stays an ordinary
+/// `MediaKind::Image` in the catalog.
+pub fn is_sector_container(ext: &str) -> bool {
+    matches!(ext.to_lowercase().as_str(), "td0" | "imd")
+}
+
+/// Whether a file must be decoded to a raw sector image before a filesystem
+/// driver can read it: raw flux **or** a sector container.
+pub fn needs_decode(ext: &str) -> bool {
+    is_flux_suffix(ext) || is_sector_container(ext)
+}
+
+/// A sector container `gw` can *read* but not *write*: Teledisk `.td0` — gw
+/// refuses outright ("Cannot create TD0 image files"). Edits can't be re-encoded
+/// back into such a master, so browsing it decodes **one-way** to a permanent
+/// image in the library (the TRS-80 model) rather than to a temp image that
+/// folds edits back on save. ImageDisk `.imd` is deliberately *not* here: gw
+/// writes IMD fine, so it keeps the normal round-trip model.
+pub fn is_read_only_container(ext: &str) -> bool {
+    matches!(ext.to_lowercase().as_str(), "td0")
+}
+
 /// The sector-image container `gw convert` should emit when *decoding* a flux
 /// master of this `gw` format, chosen so the matching `ImageFs` driver can then
 /// read it (`.adf` → Amiga, `.d64` → Commodore, …). Falls back to raw `.img`,
@@ -449,6 +552,73 @@ mod tests {
         assert_eq!(format_cylinders("ibm.360"), Some(40));
         assert_eq!(format_cylinders("atarist.720"), Some(80)); // prefix match
         assert_eq!(format_cylinders("some.unknown.format"), None);
+    }
+
+    #[test]
+    fn sector_containers_need_decode_but_are_not_flux() {
+        // Teledisk / ImageDisk archives must be decoded before browsing (like
+        // flux), yet they are NOT raw flux — so raw playback must never apply.
+        for c in ["td0", "TD0", "imd"] {
+            assert!(is_sector_container(c), "{c} is a sector container");
+            assert!(needs_decode(c), "{c} needs decoding");
+            assert!(!is_flux_suffix(c), "{c} must not count as raw flux");
+        }
+        // Raw flux still decodes; a plain sector image does neither.
+        assert!(needs_decode("scp"));
+        assert!(!is_sector_container("scp"));
+        assert!(!needs_decode("adf"));
+        assert!(!is_sector_container("img"));
+    }
+
+    #[test]
+    fn custom_formats_register_and_get_diskdefs_only_for_their_own_names() {
+        // A registered user file makes its formats known, gives them their own
+        // cylinder count, and produces a --diskdefs arg for THEM ALONE — a
+        // built-in must never get the flag (it would replace gw's list).
+        let dir = std::env::temp_dir().join(format!("gwm-udd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("diskdefs.cfg");
+        let f = crate::custom_formats::CustomFormat {
+            name: "custom.kaypro-ii".into(),
+            cyls: 40,
+            heads: 1,
+            mfm: true,
+            secs: 10,
+            bps: 512,
+            interleave: 3,
+            id: 0,
+            rate: 250,
+        };
+        crate::custom_formats::add(&path, &f).unwrap();
+
+        load_user_diskdefs(&path);
+        assert!(is_custom_format("custom.kaypro-ii"));
+        assert!(!is_custom_format("ibm.360"));
+        assert_eq!(format_cylinders("custom.kaypro-ii"), Some(40));
+        let arg = diskdefs_arg("custom.kaypro-ii").expect("custom gets --diskdefs");
+        assert!(arg.starts_with("--diskdefs="));
+        assert!(arg.ends_with("diskdefs.cfg"));
+        assert_eq!(diskdefs_arg("ibm.360"), None, "built-ins never get the flag");
+        assert_eq!(system_for_format("custom.kaypro-ii"), "Custom");
+
+        clear_user_diskdefs();
+        assert!(!is_custom_format("custom.kaypro-ii"));
+        assert_eq!(diskdefs_arg("custom.kaypro-ii"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn td0_is_read_only_so_it_decodes_one_way() {
+        // gw refuses to create TD0 files ("Cannot create TD0 image files"), so a
+        // .td0 master can't take re-encoded edits and must decode one-way. IMD
+        // (which gw writes) and raw flux keep the normal round-trip model.
+        assert!(is_read_only_container("td0"));
+        assert!(is_read_only_container("TD0"));
+        assert!(!is_read_only_container("imd"));
+        assert!(!is_read_only_container("scp"));
+        assert!(!is_read_only_container("img"));
+        // Every read-only container is still a sector container that needs decoding.
+        assert!(is_sector_container("td0") && needs_decode("td0"));
     }
 
     #[test]

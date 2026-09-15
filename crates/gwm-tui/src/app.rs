@@ -39,9 +39,11 @@ use crate::text_input::TextInput;
 use crate::theme::{self, Theme};
 use crate::write_job::WriteJob;
 
-pub const MENU_ITEMS: [&str; 12] = [
+pub const MENU_ITEMS: [&str; 14] = [
     "Read a disk",
     "Write a disk",
+    "Identify disk format",
+    "Custom disk formats",
     "Reset the device",
     "Test drive RPM",
     "Drive diagnostic",
@@ -126,6 +128,12 @@ pub enum Screen {
     UsbDetected,
     /// Copying a plugged-in drive's images into the library (with progress).
     UsbImporting,
+    /// "Identify disk format" result: observed geometry + matching formats.
+    IdentifyDone,
+    /// The user's own gw disk formats: list, add, delete.
+    CustomFormats,
+    /// The new-custom-format form.
+    CustomFormatForm,
     Browse,
     BrowseInput,
     BrowseConfirmDelete,
@@ -194,6 +202,9 @@ enum Flow {
     /// Choosing a `gw` disk format to decode a flux master into a *permanent*
     /// sector image saved in the library (the "convert" action).
     Convert,
+    /// "Identify disk format": a scan read (`ibm.scan`) whose result is the
+    /// disk's geometry + matching formats, not a catalogued image.
+    Identify,
 }
 
 /// Which pane of the two-pane image browser has focus.
@@ -312,6 +323,34 @@ pub struct App {
     convert_fs_driver: Option<String>,
     /// IPF import chooser selection (0 = flux master .hfe, 1 = decoded .adf).
     pub ipf_index: usize,
+    /// "Identify disk format" result: the geometry the scan observed, the gw
+    /// formats matching it (exact first), the highlighted one, and gw's
+    /// found/total/percent summary for display.
+    pub identify_obs: Option<gwm_core::identify::Observed>,
+    pub identify_cands: Vec<gwm_core::identify::Candidate>,
+    pub identify_index: usize,
+    pub identify_summary: Option<(u32, u32, u32)>,
+    /// "Custom disk formats": the user's formats as listed, the highlighted row,
+    /// and a name armed for a two-press delete.
+    pub custom_formats: Vec<gwm_core::custom_formats::CustomFormat>,
+    pub custom_index: usize,
+    custom_pending_delete: Option<String>,
+    /// The new-format form: highlighted row, the two text fields, the geometry
+    /// numbers, where Esc returns to, and whether saving should go straight into
+    /// a read (the Identify → custom segue).
+    pub cf_row: usize,
+    pub cf_name: TextInput,
+    pub cf_desc: TextInput,
+    pub cf_cyls: u32,
+    pub cf_heads: u32,
+    pub cf_mfm: bool,
+    pub cf_secs: u32,
+    pub cf_bps: u32,
+    pub cf_interleave: u32,
+    pub cf_id: u32,
+    pub cf_rate: u32,
+    cf_return: Screen,
+    cf_then_read: bool,
     /// Startup check for a newer release (runs once, in the background).
     update_check: Option<UpdateCheckJob>,
     /// A newer release than the running one, once the check confirms it.
@@ -555,6 +594,26 @@ impl App {
             convert_from: String::new(),
             convert_fs_driver: None,
             ipf_index: 0,
+            identify_obs: None,
+            identify_cands: Vec::new(),
+            identify_index: 0,
+            identify_summary: None,
+            custom_formats: Vec::new(),
+            custom_index: 0,
+            custom_pending_delete: None,
+            cf_row: 0,
+            cf_name: TextInput::new(),
+            cf_desc: TextInput::new(),
+            cf_cyls: 40,
+            cf_heads: 1,
+            cf_mfm: true,
+            cf_secs: 9,
+            cf_bps: 512,
+            cf_interleave: 1,
+            cf_id: 1,
+            cf_rate: 250,
+            cf_return: Screen::Menu,
+            cf_then_read: false,
             update_check: Some(UpdateCheckJob::start()),
             update_info: None,
             update_apply: None,
@@ -1125,6 +1184,9 @@ impl App {
             Screen::IpfChoice => self.on_ipf_choice_key(code),
             Screen::UsbDetected => self.on_usb_detected_key(code),
             Screen::UsbImporting => {} // runs to completion (copy + catalogue)
+            Screen::IdentifyDone => self.on_identify_done_key(code),
+            Screen::CustomFormats => self.on_custom_formats_key(code),
+            Screen::CustomFormatForm => self.on_custom_form_key(code, mods),
             Screen::Ti99Transfer => {} // runs to completion
             Screen::Ti99Done => {
                 if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
@@ -1296,9 +1358,10 @@ impl App {
             self.start_ipf(&it);
             return;
         }
-        // A flux/bit-stream master can't be read by the filesystem tools; decode
-        // it to a sector image first (edits are re-encoded back on save).
-        if matches!(it.kind, MediaKind::Flux) || formats::is_flux_suffix(ext) {
+        // A flux/bit-stream master — or a sector container like Teledisk `.td0` /
+        // ImageDisk `.imd` — can't be read by the filesystem tools; decode it to a
+        // raw sector image first (edits are re-encoded back on save).
+        if matches!(it.kind, MediaKind::Flux) || formats::needs_decode(ext) {
             self.begin_flux_browse(&it);
             return;
         }
@@ -1353,9 +1416,12 @@ impl App {
             self.start_ipf(&it);
             return;
         }
-        if !(matches!(it.kind, MediaKind::Flux) || formats::is_flux_suffix(ext)) {
-            self.notice =
-                Some("Convert only applies to flux captures (.scp / .hfe / .raw).".to_string());
+        if !(matches!(it.kind, MediaKind::Flux) || formats::needs_decode(ext)) {
+            self.notice = Some(
+                "Convert only applies to flux captures (.scp / .hfe / .raw) and sector \
+                 containers (.td0 / .imd)."
+                    .to_string(),
+            );
             return;
         }
         self.browse_id = it.id;
@@ -1644,11 +1710,63 @@ impl App {
         let _ = self.core.catalog.update_format(self.browse_id, gw_format);
 
         let ext = formats::decoded_container_ext(gw_format);
-        let work = self.flux_work_path(ext);
+        let master_ext = master
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string();
+        // A container gw can read but not write back (Teledisk .td0) can't take
+        // re-encoded edits, so decode it ONE-WAY to a permanent image saved beside
+        // it in the library and browse that — the image, not the .td0, becomes the
+        // thing you keep and edit (the TRS-80 model). Everything else decodes to a
+        // temp work image whose edits fold back into the master on save.
+        let one_way = formats::is_read_only_container(&master_ext);
+        let work = if one_way {
+            unique_sibling(&master, ext)
+        } else {
+            self.flux_work_path(ext)
+        };
         if let Err(err) = convert::convert(&master, &work, gw_format) {
             self.notice = Some(format!("Could not decode {}: {err}", master.display()));
             self.screen = Screen::Library;
             return;
+        }
+        if one_way {
+            // The decoded file is permanent, so from here on treat it as an
+            // ordinary library image: edits save in place (with the usual
+            // originals/ backup) and never try to re-encode into the master.
+            self.browse_master = None;
+            self.browse_master_format.clear();
+            let size = std::fs::metadata(&work).map(|m| m.len() as i64).unwrap_or(0);
+            let sha = gwm_core::util::sha256_file(&work).ok();
+            let item = NewMediaItem {
+                kind: MediaKind::Image,
+                path: work.to_string_lossy().into_owned(),
+                format: Some(gw_format.to_string()),
+                system: Some(formats::system_for_format(gw_format).to_string()),
+                size_bytes: size,
+                sha256: sha,
+                source: Source::Import,
+                remote_id: None,
+                tags: Vec::new(),
+                notes: Some(format!("Decoded from {}", file_name(&master))),
+                fs_format: None,
+                fs_driver: Some(self.browse_driver.id().to_string()),
+            };
+            match self.core.catalog.insert(&item) {
+                Ok(id) => {
+                    let _ = self.reload_library();
+                    self.browse_id = id;
+                    self.notice = Some(format!(
+                        "Decoded to {} — edits are saved there; the {} stays untouched.",
+                        file_name(&work),
+                        master_ext.to_uppercase()
+                    ));
+                }
+                Err(err) => {
+                    self.notice = Some(format!("Decoded, but cataloguing failed: {err}"));
+                }
+            }
         }
         self.browse_image = work;
         // CP/M still needs a diskdef; other drivers self-describe.
@@ -2932,20 +3050,22 @@ impl App {
             KeyCode::Enter => match self.menu_index {
                 0 => self.enter_read_flow(),
                 1 => self.enter_write_flow(),
-                2 => self.reset_device(),
-                3 => self.test_rpm(),
-                4 => self.enter_diag(),
-                5 => self.start_clean(),
-                6 => self.enter_library(),
-                7 => self.enter_create_flow(),
-                8 => self.enter_archive(),
-                9 => self.enter_tools(),
-                10 => {
+                2 => self.enter_identify_flow(),
+                3 => self.enter_custom_formats(),
+                4 => self.reset_device(),
+                5 => self.test_rpm(),
+                6 => self.enter_diag(),
+                7 => self.start_clean(),
+                8 => self.enter_library(),
+                9 => self.enter_create_flow(),
+                10 => self.enter_archive(),
+                11 => self.enter_tools(),
+                12 => {
                     self.settings_index = 0;
                     self.settings_editing = false;
                     self.screen = Screen::Settings;
                 }
-                11 => self.should_quit = true,
+                13 => self.should_quit = true,
                 _ => {}
             },
             // Install an available update (only meaningful when the badge shows).
@@ -3259,6 +3379,318 @@ impl App {
             return false;
         }
         true
+    }
+
+    /// "Identify disk format": scan the disk in the drive with gw's
+    /// auto-detecting `ibm.scan` format and report its geometry plus the gw
+    /// formats that match. Reuses the read machinery (drive picker → `ReadJob` →
+    /// progress screen); there is no format to choose first.
+    fn enter_identify_flow(&mut self) {
+        if !self.gw_ready() {
+            return;
+        }
+        self.flow = Flow::Identify;
+        self.drive_index = 0;
+        self.screen = Screen::DrivePicker;
+    }
+
+    /// Run the scan as an ordinary read into a throwaway image; `finalize_read`
+    /// diverts to [`finalize_identify`](Self::finalize_identify) for this flow.
+    fn start_identify(&mut self) {
+        let _ = gwm_core::device::apply_delays(&self.core.settings.tuning);
+        let out = std::env::temp_dir().join("lubeshop-identify.img");
+        let _ = std::fs::remove_file(&out);
+        // `ibm.scan` decodes every track with whatever IBM encoding it finds and
+        // reports per-track geometry — exactly what identification needs.
+        self.read_job = Some(ReadJob::start(
+            "ibm.scan".to_string(),
+            self.chosen_drive.clone(),
+            false,
+            false,
+            None,
+            out,
+        ));
+        self.screen = Screen::Reading;
+    }
+
+    /// The scan finished: turn what gw saw into a geometry + format suggestions.
+    fn finalize_identify(&mut self) {
+        let Some(job) = self.read_job.take() else {
+            return;
+        };
+        let out = job.out_path.clone();
+        if job.cancelled {
+            let _ = std::fs::remove_file(&out);
+            self.notice = Some("Identify cancelled.".to_string());
+            self.screen = Screen::Menu;
+            return;
+        }
+        if let Some(err) = &job.failed {
+            let _ = std::fs::remove_file(&out);
+            self.notice = Some(format!("Could not read the disk: {err}"));
+            self.screen = Screen::Menu;
+            return;
+        }
+        // The image size gives the sector size; the file itself is not kept.
+        let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        let _ = std::fs::remove_file(&out);
+        self.identify_summary = job.summary;
+        match gwm_core::identify::observe(&job.track_records(), bytes) {
+            Some(obs) => {
+                self.identify_cands = gwm_core::identify::candidates(&obs);
+                self.identify_obs = Some(obs);
+                self.identify_index = 0;
+                self.screen = Screen::IdentifyDone;
+            }
+            None => {
+                self.notice = Some(
+                    "No readable IBM-style tracks found — the disk may be blank, \
+                     unformatted, or a non-IBM format (GCR, hard-sectored…)."
+                        .to_string(),
+                );
+                self.screen = Screen::Menu;
+            }
+        }
+    }
+
+    fn on_identify_done_key(&mut self, code: KeyCode) {
+        let n = self.identify_cands.len();
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.identify_obs = None;
+                self.screen = Screen::Menu;
+            }
+            // Nothing (or nothing right) matched: make a format from the geometry.
+            KeyCode::Char('c') => self.open_custom_form_from_identify(),
+            KeyCode::Up | KeyCode::Char('k') if n > 0 => {
+                self.identify_index = self.identify_index.checked_sub(1).unwrap_or(n - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                self.identify_index = (self.identify_index + 1) % n;
+            }
+            KeyCode::Enter => {
+                // One keystroke from "identified" to "reading it": hand the chosen
+                // format to the normal read flow (the drive is already chosen).
+                if let Some(c) = self.identify_cands.get(self.identify_index) {
+                    self.chosen_format = c.format.clone();
+                    self.flow = Flow::Read;
+                    self.identify_obs = None;
+                    self.screen = Screen::DrivePicker;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- custom disk formats -----------------------------------------------
+
+    /// "Custom disk formats": list the user's own gw formats (kept in the store's
+    /// diskdefs.cfg and offered in every format picker), add one, or delete one.
+    fn enter_custom_formats(&mut self) {
+        self.custom_formats = formats::custom_formats();
+        self.custom_index = self
+            .custom_index
+            .min(self.custom_formats.len().saturating_sub(1));
+        self.custom_pending_delete = None;
+        self.screen = Screen::CustomFormats;
+    }
+
+    fn on_custom_formats_key(&mut self, code: KeyCode) {
+        let n = self.custom_formats.len();
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Menu,
+            KeyCode::Up | KeyCode::Char('k') if n > 0 => {
+                self.custom_index = self.custom_index.checked_sub(1).unwrap_or(n - 1);
+                self.custom_pending_delete = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                self.custom_index = (self.custom_index + 1) % n;
+                self.custom_pending_delete = None;
+            }
+            KeyCode::Char('n') | KeyCode::Enter => self.open_custom_form(None, false),
+            // Deleting takes two presses of `d` on the same row — cheap insurance.
+            KeyCode::Char('d') if n > 0 => {
+                let name = self.custom_formats[self.custom_index].name.clone();
+                if self.custom_pending_delete.as_deref() == Some(name.as_str()) {
+                    self.delete_custom_format(&name);
+                } else {
+                    self.notice = Some(format!("Press d again to delete {name}."));
+                    self.custom_pending_delete = Some(name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the new-format form, optionally pre-filled from a scanned geometry.
+    /// `then_read`: after saving, go straight into reading a disk with it.
+    fn open_custom_form(
+        &mut self,
+        prefill: Option<&gwm_core::identify::Observed>,
+        then_read: bool,
+    ) {
+        let d = gwm_core::custom_formats::CustomFormat::default();
+        let (cyls, heads, mfm, secs, bps) = match prefill {
+            Some(o) => (o.cyls, o.heads, o.encoding != "fm", o.spt, o.bps),
+            None => (d.cyls, d.heads, d.mfm, d.secs, d.bps),
+        };
+        let name = match prefill {
+            Some(_) => format!(
+                "custom.{}-{}s-{}t-{}x{}",
+                if mfm { "mfm" } else { "fm" },
+                if heads == 1 { "s" } else { "d" },
+                cyls,
+                secs,
+                bps
+            ),
+            None => "custom.mydisk".to_string(),
+        };
+        self.cf_name.set(name);
+        self.cf_desc.set(String::new());
+        self.cf_cyls = cyls;
+        self.cf_heads = heads;
+        self.cf_mfm = mfm;
+        self.cf_secs = secs;
+        self.cf_bps = bps;
+        self.cf_interleave = d.interleave;
+        self.cf_id = d.id;
+        self.cf_rate = d.rate;
+        self.cf_row = 0;
+        self.cf_then_read = then_read;
+        self.cf_return = self.screen;
+        self.screen = Screen::CustomFormatForm;
+    }
+
+    /// Identify found no (or not the right) format: make one from what it saw.
+    fn open_custom_form_from_identify(&mut self) {
+        let obs = self.identify_obs.clone();
+        self.open_custom_form(obs.as_ref(), true);
+    }
+
+    /// Rows on the custom-format form (in display order).
+    const CF_ROWS: usize = 10;
+
+    fn on_custom_form_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        match code {
+            KeyCode::Esc => self.screen = self.cf_return,
+            KeyCode::Up => {
+                self.cf_row = self.cf_row.checked_sub(1).unwrap_or(Self::CF_ROWS - 1)
+            }
+            KeyCode::Down | KeyCode::Tab => self.cf_row = (self.cf_row + 1) % Self::CF_ROWS,
+            KeyCode::Enter => self.save_custom_form(),
+            _ => match self.cf_row {
+                0 => edit_input(&mut self.cf_name, code, mods),
+                1 => edit_input(&mut self.cf_desc, code, mods),
+                2 => Self::adjust_num(&mut self.cf_cyls, code, 255),
+                3 => Self::adjust_num(&mut self.cf_heads, code, 2),
+                4 => {
+                    if matches!(
+                        code,
+                        KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right | KeyCode::Char('x')
+                    ) {
+                        self.cf_mfm = !self.cf_mfm;
+                    }
+                }
+                5 => Self::adjust_num(&mut self.cf_secs, code, 64),
+                6 => Self::adjust_bps(&mut self.cf_bps, code),
+                7 => Self::adjust_num(&mut self.cf_interleave, code, 64),
+                8 => Self::adjust_num(&mut self.cf_id, code, 255),
+                9 => Self::adjust_num(&mut self.cf_rate, code, 2000),
+                _ => {}
+            },
+        }
+    }
+
+    /// ←/→ nudge, digits type (capped), Backspace clears — the `adjust_track` idiom.
+    fn adjust_num(value: &mut u32, code: KeyCode, max: u32) {
+        match code {
+            KeyCode::Right => *value = (*value + 1).min(max),
+            KeyCode::Left => *value = value.saturating_sub(1),
+            KeyCode::Backspace | KeyCode::Delete => *value = 0,
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                let d = c as u32 - '0' as u32;
+                *value = (*value * 10 + d).min(max);
+            }
+            _ => {}
+        }
+    }
+
+    /// Bytes per sector steps through the sizes gw accepts; digits still type.
+    fn adjust_bps(value: &mut u32, code: KeyCode) {
+        use gwm_core::custom_formats::SECTOR_SIZES;
+        let pos = SECTOR_SIZES.iter().position(|s| s == value);
+        match code {
+            KeyCode::Right => {
+                let i = pos.map(|i| (i + 1).min(SECTOR_SIZES.len() - 1)).unwrap_or(2);
+                *value = SECTOR_SIZES[i];
+            }
+            KeyCode::Left => {
+                let i = pos.map(|i| i.saturating_sub(1)).unwrap_or(2);
+                *value = SECTOR_SIZES[i];
+            }
+            _ => Self::adjust_num(value, code, 8192),
+        }
+    }
+
+    fn save_custom_form(&mut self) {
+        let f = gwm_core::custom_formats::CustomFormat {
+            name: self.cf_name.text().trim().to_string(),
+            cyls: self.cf_cyls,
+            heads: self.cf_heads,
+            mfm: self.cf_mfm,
+            secs: self.cf_secs,
+            bps: self.cf_bps,
+            interleave: self.cf_interleave,
+            id: self.cf_id,
+            rate: self.cf_rate,
+        };
+        // Built-in names are off limits too: gw would silently use ours in their
+        // place (`--diskdefs` replaces its list) and the user wouldn't know.
+        if self.formats.is_empty() {
+            self.formats = formats::list_formats();
+        }
+        let taken = self.formats.clone();
+        if let Err(e) = f.validate(&taken) {
+            self.notice = Some(e);
+            return;
+        }
+        let path = self.core.paths.user_diskdefs();
+        if let Err(e) = gwm_core::custom_formats::add(&path, &f) {
+            self.notice = Some(format!("Could not save the format: {e}"));
+            return;
+        }
+        formats::load_user_diskdefs(&path);
+        self.formats.clear(); // pickers rebuild with the new name in them
+        let desc = self.cf_desc.text().trim().to_string();
+        let label = if desc.is_empty() { f.describe() } else { desc };
+        self.core.settings.format_labels.insert(f.name.clone(), label);
+        let _ = self.core.save_settings();
+        self.notice = Some(format!("Saved custom format {}.", f.name));
+        if self.cf_then_read {
+            // Straight from "identified" to "reading it".
+            self.chosen_format = f.name;
+            self.flow = Flow::Read;
+            self.identify_obs = None;
+            self.screen = Screen::DrivePicker;
+        } else {
+            self.enter_custom_formats();
+        }
+    }
+
+    fn delete_custom_format(&mut self, name: &str) {
+        let path = self.core.paths.user_diskdefs();
+        match gwm_core::custom_formats::remove(&path, name) {
+            Ok(true) => {
+                formats::load_user_diskdefs(&path);
+                self.formats.clear();
+                self.core.settings.format_labels.remove(name);
+                let _ = self.core.save_settings();
+                self.notice = Some(format!("Deleted custom format {name}."));
+            }
+            Ok(false) => self.notice = Some(format!("{name} is not a custom format.")),
+            Err(e) => self.notice = Some(format!("Could not delete {name}: {e}")),
+        }
+        self.enter_custom_formats();
     }
 
     fn enter_read_flow(&mut self) {
@@ -4315,6 +4747,7 @@ impl App {
                     Flow::Read => Screen::Menu,
                     Flow::Write => Screen::WriteSource,
                     Flow::Decode | Flow::Convert => Screen::Library,
+                    Flow::Identify => Screen::Menu,
                 };
                 if matches!(self.flow, Flow::Decode | Flow::Convert) {
                     self.browse_master = None;
@@ -4348,6 +4781,8 @@ impl App {
                         Flow::Decode => self.decode_and_open(&fmt),
                         // Decode the flux master into a permanent library image.
                         Flow::Convert => self.decode_to_library(&fmt),
+                        // A scan never reaches the format picker.
+                        Flow::Identify => {}
                         Flow::Read | Flow::Write => {
                             self.chosen_format = fmt;
                             self.drive_index = self.default_drive_index();
@@ -4423,6 +4858,7 @@ impl App {
                     Flow::Read => Screen::FormatPicker,
                     Flow::Write => Screen::WriteSource,
                     Flow::Decode | Flow::Convert => Screen::Library,
+                    Flow::Identify => Screen::Menu,
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -4448,6 +4884,8 @@ impl App {
                         self.screen = Screen::ReadOptions;
                     }
                     Flow::Write => self.screen = Screen::WriteConfirm,
+                    // No format to choose for a scan: straight to reading.
+                    Flow::Identify => self.start_identify(),
                     // Decode/Convert never reach the drive picker.
                     Flow::Decode | Flow::Convert => {}
                 }
@@ -4832,6 +5270,12 @@ impl App {
     }
 
     fn finalize_read(&mut self) {
+        // The identify scan reuses the read machinery but wants the disk's
+        // geometry, not a catalogued image.
+        if self.flow == Flow::Identify {
+            self.finalize_identify();
+            return;
+        }
         let outcome = {
             let job = match self.read_job.as_ref() {
                 Some(job) => job,

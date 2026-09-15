@@ -35,6 +35,9 @@ pub struct ReadJob {
     /// keep the best `good`; a "gave up" sets `good = total - missing`. Feeds the
     /// exported disk-health map.
     track_health: HashMap<(u32, u32), (u32, u32)>,
+    /// What gw decoded each track as (`IBM MFM` / `IBM FM` / …), keyed like
+    /// `track_health`. Feeds the "Identify disk format" geometry inference.
+    track_encoding: HashMap<(u32, u32), String>,
     /// `gw`'s end-of-read sector grid, accumulated as its rows arrive. This is
     /// the only place `gw` says *which* sectors failed rather than how many, so
     /// it is preferred over `track_health` when building the map.
@@ -121,6 +124,7 @@ impl ReadJob {
             done_tracks: 0,
             bad_tracks: 0,
             track_health: HashMap::new(),
+            track_encoding: HashMap::new(),
             grid_tens: None,
             grid_units: None,
             grid_rows: Vec::new(),
@@ -160,6 +164,28 @@ impl ReadJob {
         just_finished
     }
 
+    /// Every track the read reported, with its recovery and encoding — what the
+    /// "Identify disk format" scan feeds to `gwm_core::identify::observe`.
+    pub fn track_records(&self) -> Vec<gwm_core::identify::TrackRecord> {
+        let mut out: Vec<_> = self
+            .track_health
+            .iter()
+            .map(|(&(cyl, head), &(got, total))| gwm_core::identify::TrackRecord {
+                cyl,
+                head,
+                got,
+                total,
+                encoding: self
+                    .track_encoding
+                    .get(&(cyl, head))
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        out.sort_by_key(|r| (r.cyl, r.head));
+        out
+    }
+
     fn apply(&mut self, event: ReadEvent) {
         if let Some(total) = event.total_tracks() {
             self.total_tracks = Some(total);
@@ -172,6 +198,7 @@ impl ReadJob {
                 got,
                 total,
                 retry,
+                encoding,
             } => {
                 if retry.is_none() {
                     self.done_tracks += 1;
@@ -180,6 +207,7 @@ impl ReadJob {
                 let e = self.track_health.entry((cyl, head)).or_insert((got, total));
                 e.0 = e.0.max(got);
                 e.1 = total;
+                self.track_encoding.insert((cyl, head), encoding);
                 let tag = retry.map(|r| format!("  ({r})")).unwrap_or_default();
                 self.current = format!("T{cyl}.{head}: {got}/{total} sectors{tag}");
             }

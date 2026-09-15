@@ -41,6 +41,7 @@ fn main() {
             got,
             total: sec,
             retry,
+            ..
         } => {
             if retry.is_none() {
                 done += 1;

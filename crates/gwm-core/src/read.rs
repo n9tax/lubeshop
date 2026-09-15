@@ -36,12 +36,15 @@ pub enum ReadEvent {
     Format(String),
     /// A track was processed. `got`/`total` is its sector recovery, and `retry`
     /// is `Some("Retry #1.2")` when this is a re-read of a weak track.
+    /// `encoding` is what gw decoded it as (`IBM MFM`, `IBM FM`, `Commodore
+    /// GCR`, …) — the "Identify disk format" scan keys its geometry off it.
     Track {
         cyl: u32,
         head: u32,
         got: u32,
         total: u32,
         retry: Option<String>,
+        encoding: String,
     },
     /// A track was abandoned with `missing` sectors unrecovered.
     GaveUp { cyl: u32, head: u32, missing: u32 },
@@ -274,6 +277,8 @@ fn parse_track(line: &str) -> Option<ReadEvent> {
     }
 
     let (got, total) = parse_sectors(tail)?;
+    // The encoding is everything before the first `(…)` group: `IBM MFM`.
+    let encoding = tail.split('(').next().unwrap_or("").trim().to_string();
     let retry = tail
         .rfind("(Retry #")
         .map(|i| tail[i..].trim_matches(|c| c == '(' || c == ')').to_string());
@@ -283,6 +288,7 @@ fn parse_track(line: &str) -> Option<ReadEvent> {
         got,
         total,
         retry,
+        encoding,
     })
 }
 
@@ -363,7 +369,8 @@ mod tests {
                 head: 0,
                 got: 18,
                 total: 18,
-                retry: None
+                retry: None,
+                encoding: "IBM MFM".to_string()
             })
         );
     }
@@ -381,7 +388,8 @@ mod tests {
                 head: 0,
                 got: 17,
                 total: 17,
-                retry: None
+                retry: None,
+                encoding: "Commodore GCR".to_string()
             })
         );
     }
@@ -398,7 +406,8 @@ mod tests {
                 head: 1,
                 got: 17,
                 total: 18,
-                retry: Some("Retry #1.2".to_string())
+                retry: Some("Retry #1.2".to_string()),
+                encoding: "IBM MFM".to_string()
             })
         );
     }

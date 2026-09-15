@@ -135,12 +135,13 @@ pub fn convert_with_progress(
     // clear it first and require a fresh, non-empty file afterwards.
     let _ = std::fs::remove_file(output);
 
-    let args = vec![
-        "convert".to_string(),
-        format!("--format={format}"),
-        input.to_string_lossy().into_owned(),
-        output.to_string_lossy().into_owned(),
-    ];
+    let mut args = vec!["convert".to_string(), format!("--format={format}")];
+    // A user-defined format needs gw pointed at the file that defines it.
+    if let Some(diskdefs) = crate::formats::diskdefs_arg(format) {
+        args.push(diskdefs);
+    }
+    args.push(input.to_string_lossy().into_owned());
+    args.push(output.to_string_lossy().into_owned());
 
     let mut failed = false;
     let mut last = String::new();

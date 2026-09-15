@@ -105,6 +105,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::IpfChoice => render_ipf_choice(app, frame, chunks[1]),
         Screen::UsbDetected => render_usb_detected(app, frame, chunks[1]),
         Screen::UsbImporting => render_usb_importing(app, frame, chunks[1]),
+        Screen::IdentifyDone => render_identify_done(app, frame, chunks[1]),
+        Screen::CustomFormats => render_custom_formats(app, frame, chunks[1]),
+        Screen::CustomFormatForm => render_custom_format_form(app, frame, chunks[1]),
         Screen::DiagOptions => render_diag_options(app, frame, chunks[1]),
         Screen::Diag => render_diag(app, frame, chunks[1]),
         Screen::CleanOptions => render_clean_options(app, frame, chunks[1]),
@@ -901,6 +904,154 @@ fn render_converting(app: &App, frame: &mut Frame, area: Rect) {
         ))]),
         rows[2],
     );
+}
+
+fn render_custom_formats(app: &App, frame: &mut Frame, area: Rect) {
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Your own gw disk formats — kept in the store's diskdefs.cfg and offered in every format picker.",
+            dim(),
+        )),
+        Line::from(""),
+    ];
+    if app.custom_formats.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (none yet)  —  press n to create one, or run Identify disk format and press c.",
+            dim(),
+        )));
+    } else {
+        for (i, f) in app.custom_formats.iter().enumerate() {
+            let selected = i == app.custom_index;
+            let (marker, style) = if selected { ("▸ ", accented()) } else { ("  ", base()) };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker}{:<28}", f.name), style),
+                Span::styled(f.describe(), dim()),
+            ]));
+        }
+    }
+    frame.render_widget(para(lines).block(bordered("Custom disk formats")), area);
+}
+
+fn render_custom_format_form(app: &App, frame: &mut Frame, area: Rect) {
+    let mark = |sel: bool, text: &str| {
+        Span::styled(
+            format!("{}{text:<22}", if sel { "▸ " } else { "  " }),
+            if sel { accented() } else { base() },
+        )
+    };
+    let bold = |s: String| Span::styled(s, Style::default().add_modifier(Modifier::BOLD));
+
+    let mut name_spans = vec![mark(app.cf_row == 0, "Name")];
+    if app.cf_row == 0 {
+        name_spans.extend(input_spans(&app.cf_name));
+    } else {
+        name_spans.push(Span::raw(app.cf_name.text().to_string()));
+    }
+    let mut desc_spans = vec![mark(app.cf_row == 1, "Description")];
+    if app.cf_row == 1 {
+        desc_spans.extend(input_spans(&app.cf_desc));
+    } else {
+        desc_spans.push(Span::raw(app.cf_desc.text().to_string()));
+    }
+    let capacity =
+        app.cf_heads as u64 * app.cf_cyls as u64 * app.cf_secs as u64 * app.cf_bps as u64 / 1024;
+    let encoding = if app.cf_mfm {
+        "MFM (double density)".to_string()
+    } else {
+        "FM (single density)".to_string()
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  A gw disk format of your own (IBM-style FM/MFM, soft-sectored).",
+            dim(),
+        )),
+        Line::from(""),
+        Line::from(name_spans),
+        Line::from(desc_spans),
+        Line::from(vec![mark(app.cf_row == 2, "Cylinders"), bold(app.cf_cyls.to_string())]),
+        Line::from(vec![mark(app.cf_row == 3, "Heads (sides)"), bold(app.cf_heads.to_string())]),
+        Line::from(vec![mark(app.cf_row == 4, "Encoding"), bold(encoding)]),
+        Line::from(vec![
+            mark(app.cf_row == 5, "Sectors per track"),
+            bold(app.cf_secs.to_string()),
+        ]),
+        Line::from(vec![mark(app.cf_row == 6, "Bytes per sector"), bold(app.cf_bps.to_string())]),
+        Line::from(vec![mark(app.cf_row == 7, "Interleave"), bold(app.cf_interleave.to_string())]),
+        Line::from(vec![mark(app.cf_row == 8, "First sector id"), bold(app.cf_id.to_string())]),
+        Line::from(vec![
+            mark(app.cf_row == 9, "Data rate (kbit/s)"),
+            bold(app.cf_rate.to_string()),
+            Span::styled("   250 = DD · 500 = HD", dim()),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Capacity: ", dim()), bold(format!("{capacity} KB"))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Enter save", accented()),
+            Span::styled(
+                "   ·   ↑/↓ move   ·   ←/→ or digits change   ·   Esc cancel",
+                dim(),
+            ),
+        ]),
+    ];
+    frame.render_widget(para(lines).block(bordered("New custom disk format")), area);
+}
+
+fn render_identify_done(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(obs) = app.identify_obs.as_ref() else {
+        return;
+    };
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Drive ", dim()),
+            Span::styled(app.chosen_drive.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(" — disk identified", dim()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Geometry: ", dim()),
+            Span::styled(obs.describe(), base()),
+        ]),
+    ];
+    if let Some((found, total, pct)) = app.identify_summary {
+        lines.push(Line::from(vec![
+            Span::styled("  Sectors:  ", dim()),
+            Span::raw(format!("{found}/{total} read ({pct}%)")),
+        ]));
+    }
+    lines.push(Line::from(""));
+    if app.identify_cands.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No gw format matches this geometry — press c to create one from it.",
+            dim(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled("  Matching gw formats:", dim())));
+        for (i, c) in app.identify_cands.iter().enumerate() {
+            let selected = i == app.identify_index;
+            let (marker, style) = if selected { ("▸ ", accented()) } else { ("  ", base()) };
+            let tag = if c.exact { "" } else { "   (track count differs)" };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker}{:<22}", c.format), style),
+                Span::styled(gwm_core::formats::describe_format(&c.format), dim()),
+                Span::styled(tag.to_string(), dim()),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Enter read this disk with the highlighted format", accented()),
+        Span::styled("    ·    Esc menu", dim()),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "  c  make a custom format from this geometry (if none above is right)",
+        dim(),
+    )));
+    frame.render_widget(para(lines).block(bordered("Identify disk format")), area);
 }
 
 fn render_usb_detected(app: &App, frame: &mut Frame, area: Rect) {
@@ -2428,6 +2579,9 @@ fn status_hint(app: &App) -> &'static str {
             Screen::IpfChoice => "  ↑/↓ choose · Enter import · Esc cancel",
             Screen::UsbDetected => "  y import into library · n / Esc ignore",
             Screen::UsbImporting => "  importing… please wait",
+            Screen::IdentifyDone => "  ↑/↓ choose format · Enter read this disk · c custom format · Esc menu",
+            Screen::CustomFormats => "  n new · d delete (press twice) · Esc menu",
+            Screen::CustomFormatForm => "  Enter save · ↑/↓ move · ←/→ or digits change · Esc cancel",
             Screen::WriteConfirm => "  y write · e toggle erase · Esc cancel",
             Screen::Writing => "  writing… please wait",
             Screen::Converting => "  converting… please wait",
