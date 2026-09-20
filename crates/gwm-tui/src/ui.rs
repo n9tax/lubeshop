@@ -1356,17 +1356,30 @@ fn render_ipf_choice(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_write_flux_mode(app: &App, frame: &mut Frame, area: Rect) {
-    let options = [
-        ("Write raw flux (exact, no re-encode)", "Plays the captured flux back bit-for-bit — preserves weak bits / copy protection."),
-        ("Re-encode to a disk format…", "Decode the flux to sectors and write clean flux — best for a standard disk."),
-    ];
+    let container = app.write_source_is_container();
+    let options = if container {
+        [
+            ("Write an exact copy (via HFE)", "hxcfe rebuilds every track exactly as recorded — odd sector sizes, real sector IDs — then it plays back bit-for-bit."),
+            ("Re-encode to a disk format…", "Lay the sectors out per a gw format and write clean flux — only for layouts a format can express."),
+        ]
+    } else {
+        [
+            ("Write raw flux (exact, no re-encode)", "Plays the captured flux back bit-for-bit — preserves weak bits / copy protection."),
+            ("Re-encode to a disk format…", "Decode the flux to sectors and write clean flux — best for a standard disk."),
+        ]
+    };
+    let (what, question) = if container {
+        ("  Writing image  ", "  How should this disk container be written?")
+    } else {
+        ("  Writing flux  ", "  How should this flux capture be written?")
+    };
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("  Writing flux  ", dim()),
+            Span::styled(what, dim()),
             Span::styled(app.chosen_source_name.clone(), Style::default().add_modifier(Modifier::BOLD)),
         ]),
         Line::from(""),
-        Line::from(Span::styled("  How should this flux capture be written?", dim())),
+        Line::from(Span::styled(question, dim())),
         Line::from(""),
     ];
     for (i, (label, help)) in options.iter().enumerate() {
@@ -1666,7 +1679,7 @@ fn render_library_move(app: &mut App, frame: &mut Frame, area: Rect) {
         rows[0],
     );
 
-    let items: Vec<ListItem> = app
+    let mut items: Vec<ListItem> = app
         .move_targets
         .iter()
         .map(|dir| {
@@ -1676,6 +1689,11 @@ fn render_library_move(app: &mut App, frame: &mut Frame, area: Rect) {
             )))
         })
         .collect();
+    // Always offer to make the destination on the spot.
+    items.push(ListItem::new(Line::from(Span::styled(
+        "+  new folder…",
+        accented(),
+    ))));
     let list = List::new(items)
         .block(bordered("Move to folder"))
         .highlight_style(hl())
@@ -2504,7 +2522,7 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
 fn status_hint(app: &App) -> &'static str {
     match app.screen {
             Screen::Menu => "  ↑/↓ move · Enter select · q quit",
-            Screen::Library => "  ↑/↓ · Enter open · b browse · c convert flux · g →Gotek · f format · h hex · n notes · r rename · M move · d del",
+            Screen::Library => "  ↑/↓ · Enter open · b browse · c convert flux · g →Gotek · f format · h hex · n notes · r rename · m move · a new folder · d del",
             Screen::GotekFormat => "  ↑/↓ choose format · Enter continue · Esc cancel",
             Screen::GotekDrive => {
                 if app.gotek_drives.is_empty() {
@@ -2536,7 +2554,7 @@ fn status_hint(app: &App) -> &'static str {
             }
             Screen::LibraryConfirmDelete => "  y confirm · f toggle file · Esc cancel",
             Screen::LibraryRename => "  type name · Enter rename · Esc cancel",
-            Screen::LibraryMove => "  ↑/↓ pick folder · Enter move · Esc cancel",
+            Screen::LibraryMove => "  ↑/↓ pick folder · Enter move · last row makes a new folder · Esc cancel",
             Screen::EditNotes => "  type notes · Enter save · Esc cancel",
             Screen::FormatPicker => {
                 "  type to filter · ↑/↓ · Enter pick · Ctrl+E edit label · Esc back"

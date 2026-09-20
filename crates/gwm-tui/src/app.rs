@@ -261,6 +261,9 @@ pub struct App {
     /// Folder-move picker state: candidate destination folders, the (scrolling)
     /// cursor, and the (id, old path, file name) of the item being moved.
     pub move_targets: Vec<PathBuf>,
+    /// The new-folder prompt was opened from the move picker's "new folder…"
+    /// row: on create, move the pending file into it; on Esc, return there.
+    move_then_create: bool,
     pub move_state: ListState,
     move_item: Option<(i64, String, String)>,
     pub notes_input: TextInput,
@@ -557,6 +560,7 @@ impl App {
             lib_subpath: PathBuf::new(),
             rename_input: TextInput::new(),
             move_targets: Vec::new(),
+            move_then_create: false,
             move_state: ListState::default(),
             move_item: None,
             notes_input: TextInput::new(),
@@ -3903,13 +3907,13 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Right => self.library_open_selected(),
             KeyCode::Char('/') => self.lib_filtering = true,
-            // Shift+M moves the selected file into a folder. Terminals encode it
-            // as either `Char('M')` or `Char('m')`+SHIFT, so accept both before
-            // the bare `m` (new folder) arm below.
-            KeyCode::Char('M') => self.enter_library_move(),
-            KeyCode::Char('m') if mods.contains(KeyModifiers::SHIFT) => self.enter_library_move(),
-            KeyCode::Char('m') => {
+            // `m` moves the selected file into a folder (the picker also offers
+            // "new folder…"); `a` adds a folder here. Shift+M still moves too, for
+            // anyone used to the old binding (terminals send `M` or `m`+SHIFT).
+            KeyCode::Char('M') | KeyCode::Char('m') => self.enter_library_move(),
+            KeyCode::Char('a') => {
                 self.folder_input.set(String::new());
+                self.move_then_create = false;
                 self.screen = Screen::NewFolder;
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -3956,7 +3960,14 @@ impl App {
 
     fn on_new_folder_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         match code {
-            KeyCode::Esc => self.screen = Screen::Library,
+            KeyCode::Esc => {
+                // Back to where we came from: the move picker, or the library.
+                self.screen = if std::mem::take(&mut self.move_then_create) {
+                    Screen::LibraryMove
+                } else {
+                    Screen::Library
+                };
+            }
             KeyCode::Enter => self.do_create_folder(),
             _ => edit_input(&mut self.folder_input, code, mods),
         }
@@ -3964,14 +3975,31 @@ impl App {
 
     fn do_create_folder(&mut self) {
         let name = self.folder_input.text().trim().replace(['/', '\\'], "_");
+        // Came from the move picker's "new folder…" row? Then the point of the
+        // folder is to receive the file being moved.
+        let from_move = std::mem::take(&mut self.move_then_create);
         if name.is_empty() {
-            self.screen = Screen::Library;
+            self.screen = if from_move { Screen::LibraryMove } else { Screen::Library };
             return;
         }
         let path = self.lib_base().join(&name);
         match std::fs::create_dir_all(&path) {
-            Ok(()) => self.notice = Some(format!("Created folder “{name}”")),
-            Err(err) => self.notice = Some(format!("Could not create folder: {err}")),
+            Ok(()) => {
+                self.notice = Some(format!("Created folder “{name}”"));
+                if from_move {
+                    self.move_targets = vec![path];
+                    self.move_state.select(Some(0));
+                    self.do_move();
+                    return;
+                }
+            }
+            Err(err) => {
+                self.notice = Some(format!("Could not create folder: {err}"));
+                if from_move {
+                    self.screen = Screen::LibraryMove;
+                    return;
+                }
+            }
         }
         self.screen = Screen::Library;
     }
@@ -4670,12 +4698,8 @@ impl App {
             return;
         };
         let current = Path::new(&path).parent().map(Path::to_path_buf);
+        // Even with no other folder yet, the picker offers "new folder…".
         let targets = self.move_target_dirs(current.as_deref());
-        if targets.is_empty() {
-            self.notice =
-                Some("No other folder to move into — make one with “m” first.".to_string());
-            return;
-        }
         self.move_item = Some((id, path, name));
         self.move_targets = targets;
         self.move_state.select(Some(0));
@@ -4683,7 +4707,8 @@ impl App {
     }
 
     fn on_library_move_key(&mut self, code: KeyCode) {
-        let count = self.move_targets.len();
+        // One extra row at the bottom of the picker: "+ new folder…".
+        let count = self.move_targets.len() + 1;
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.move_item = None;
@@ -4691,7 +4716,16 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => move_list(&mut self.move_state, count, -1),
             KeyCode::Down | KeyCode::Char('j') => move_list(&mut self.move_state, count, 1),
-            KeyCode::Enter => self.do_move(),
+            KeyCode::Enter => {
+                if self.move_state.selected() == Some(self.move_targets.len()) {
+                    // Make the destination right here, then move into it.
+                    self.folder_input.set(String::new());
+                    self.move_then_create = true;
+                    self.screen = Screen::NewFolder;
+                } else {
+                    self.do_move();
+                }
+            }
             _ => {}
         }
     }
@@ -5012,8 +5046,12 @@ impl App {
             .unwrap_or("");
         // A flux capture (.scp/.hfe/.raw) can be written two ways: raw (exact
         // playback, no --format) or re-encoded through a disk format. Let the
-        // user choose rather than forcing a format.
-        if matches!(item.kind, MediaKind::Flux) || formats::is_flux_suffix(ext) {
+        // user choose rather than forcing a format. A sector container
+        // (.td0/.imd) gets the same choice: "exact" there means hxcfe turns it
+        // into an HFE first, keeping every sector as recorded — the only way to
+        // write layouts no uniform format expresses (the HP-150's 17-sector
+        // tracks) or to preserve the real sector IDs.
+        if matches!(item.kind, MediaKind::Flux) || formats::needs_decode(ext) {
             self.write_flux_index = 0;
             self.screen = Screen::WriteFluxMode;
             return;
@@ -5026,6 +5064,40 @@ impl App {
             }
             None => self.open_write_format_picker(),
         }
+    }
+
+    /// Whether the chosen write source is a sector container (.td0/.imd) rather
+    /// than raw flux or a plain image — the chooser words itself accordingly.
+    pub fn write_source_is_container(&self) -> bool {
+        self.chosen_source
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(formats::is_sector_container)
+    }
+
+    /// Exact copy of a container: convert it to a temporary HFE with hxcfe and
+    /// make THAT the write source (the display name stays the original's). Returns
+    /// false — with the user pointed at Tools or told why — if it can't.
+    fn stage_container_as_hfe(&mut self) -> bool {
+        if !convert::hxcfe_available() {
+            self.notice = Some(
+                "An exact copy of a .td0/.imd needs HxC (hxcfe) — press Enter in Tools to install it."
+                    .to_string(),
+            );
+            self.enter_tools();
+            self.preselect_tool("hxcfe");
+            return false;
+        }
+        let hfe = std::env::temp_dir().join(format!(
+            "lubeshop-write-{}.hfe",
+            safe_host_name(&self.chosen_source_name)
+        ));
+        if let Err(err) = convert::container_to_hfe(&self.chosen_source, &hfe) {
+            self.notice = Some(format!("Could not convert {}: {err}", self.chosen_source_name));
+            return false;
+        }
+        self.chosen_source = hfe;
+        true
     }
 
     fn open_write_format_picker(&mut self) {
@@ -5046,6 +5118,9 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.write_flux_index = 1,
             KeyCode::Enter => {
                 if self.write_flux_index == 0 {
+                    if self.write_source_is_container() && !self.stage_container_as_hfe() {
+                        return;
+                    }
                     // Raw flux: empty format → `gw write <file>` with no --format,
                     // an exact playback (build_write_args omits --format when empty).
                     self.chosen_format = String::new();

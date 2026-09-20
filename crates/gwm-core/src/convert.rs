@@ -263,6 +263,15 @@ pub fn ipf_available() -> bool {
 /// can be written back to a real floppy. Needs `hxcfe` + `capsimage`
 /// ([`ipf_available`]); returns a clear error if the library is missing rather
 /// than letting hxcfe emit an empty file.
+/// Turn a sector **container** (Teledisk `.td0`, ImageDisk `.imd`) into an `.hfe`
+/// bit-stream via `hxcfe`, faithfully — every sector as recorded, including
+/// odd layouts no uniform gw format can express (the original HP-150's
+/// 16×256 + 1×128 tracks) and the real sector IDs. Written back with `gw write`
+/// as raw playback (no `--format`), that is the exact disk. Needs `hxcfe`.
+pub fn container_to_hfe(input: &Path, output: &Path) -> Result<()> {
+    hxcfe_convert(input, output, "HXC_HFE")
+}
+
 pub fn ipf_to_hfe(input: &Path, output: &Path) -> Result<()> {
     ensure_caps()?;
     hxcfe_convert(input, output, "HXC_HFE")
