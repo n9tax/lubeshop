@@ -321,6 +321,12 @@ pub struct App {
     pub verify_job: Option<VerifyJob>,
     /// Its result for the Done screen: (all good?, plain-English line).
     pub verify_result: Option<(bool, String)>,
+    /// An exact copy of a sector container written through a definition gw
+    /// synthesized for it (the file passed as `--diskdefs`); `None` = normal.
+    write_diskdefs: Option<PathBuf>,
+    /// Something the user should know about this write, shown on Done (e.g.
+    /// sectors the HFE fallback could not reproduce).
+    pub write_note: Option<String>,
     /// The screen to return to after the USB prompt is dismissed.
     usb_return: Screen,
     /// A running flux → sector-image conversion (with progress).
@@ -600,6 +606,8 @@ impl App {
             usb_import: None,
             verify_job: None,
             verify_result: None,
+            write_diskdefs: None,
+            write_note: None,
             usb_return: Screen::Menu,
             convert_job: None,
             convert_out: PathBuf::new(),
@@ -5055,6 +5063,8 @@ impl App {
         };
         self.chosen_source = PathBuf::from(&item.path);
         self.chosen_source_name = file_name(&self.chosen_source);
+        self.write_diskdefs = None;
+        self.write_note = None;
         let ext = Path::new(&item.path)
             .extension()
             .and_then(|e| e.to_str())
@@ -5090,10 +5100,15 @@ impl App {
             .is_some_and(formats::is_sector_container)
     }
 
-    /// Exact copy of a container: convert it to a temporary HFE with hxcfe and
-    /// make THAT the write source (the display name stays the original's). Returns
-    /// false — with the user pointed at Tools or told why — if it can't.
-    fn stage_container_as_hfe(&mut self) -> bool {
+    /// Exact copy of a container (.td0/.imd): hxcfe encodes it to an HFE, the
+    /// HFE is probed for the real sector layout, and — when gw can express that
+    /// layout — the container itself is written through a definition synthesized
+    /// for it (every sector with a good CRC, gw verifying each track). Otherwise
+    /// the HFE is played back, and any sectors that didn't survive the encode are
+    /// reported on Done rather than hidden (hxcfe clips a long track 0, which on
+    /// an HP-150 disk is the drive's track table). Returns false — with the user
+    /// pointed at Tools or told why — if it can't proceed.
+    fn stage_container_exact_copy(&mut self) -> bool {
         if !convert::hxcfe_available() {
             self.notice = Some(
                 "An exact copy of a .td0/.imd needs HxC (hxcfe) — press Enter in Tools to install it."
@@ -5111,7 +5126,28 @@ impl App {
             self.notice = Some(format!("Could not convert {}: {err}", self.chosen_source_name));
             return false;
         }
-        self.chosen_source = hfe;
+        match gwm_core::layout::plan_exact_copy(&self.chosen_source, &hfe) {
+            Ok(gwm_core::layout::ExactCopy::GwDefinition { diskdefs, format }) => {
+                self.chosen_format = format;
+                self.write_diskdefs = Some(diskdefs);
+                self.write_note = None;
+            }
+            Ok(gwm_core::layout::ExactCopy::HfePlayback { hfe, lost }) => {
+                self.chosen_source = hfe;
+                self.chosen_format = String::new();
+                self.write_diskdefs = None;
+                self.write_note = (lost > 0).then(|| {
+                    format!(
+                        "{lost} sector{} of the image could not be reproduced (a long track 0 — on an HP-150 disk that is the drive's track table). This copy may not run.",
+                        if lost == 1 { "" } else { "s" }
+                    )
+                });
+            }
+            Err(err) => {
+                self.notice = Some(format!("Could not work out how to write {}: {err}", self.chosen_source_name));
+                return false;
+            }
+        }
         true
     }
 
@@ -5133,12 +5169,17 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.write_flux_index = 1,
             KeyCode::Enter => {
                 if self.write_flux_index == 0 {
-                    if self.write_source_is_container() && !self.stage_container_as_hfe() {
-                        return;
+                    if self.write_source_is_container() {
+                        // Sets chosen_format/diskdefs itself: gw with a matched
+                        // definition when possible, else HFE playback.
+                        if !self.stage_container_exact_copy() {
+                            return;
+                        }
+                    } else {
+                        // Raw flux: empty format → `gw write <file>` with no
+                        // --format, an exact playback.
+                        self.chosen_format = String::new();
                     }
-                    // Raw flux: empty format → `gw write <file>` with no --format,
-                    // an exact playback (build_write_args omits --format when empty).
-                    self.chosen_format = String::new();
                     self.drive_index = 0;
                     self.screen = Screen::DrivePicker;
                 } else {
@@ -5455,6 +5496,7 @@ impl App {
             self.write_erase,
             in_path,
             self.chosen_source_name.clone(),
+            self.write_diskdefs.clone(),
         ));
         self.write_outcome = None;
         self.screen = Screen::Writing;

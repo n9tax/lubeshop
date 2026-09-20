@@ -327,7 +327,23 @@ pub fn build_read_args(
 
 /// Build the argument vector for `gw write`.
 pub fn build_write_args(format: &str, drive: &str, erase: bool, in_path: &str) -> Vec<String> {
+    build_write_args_with(format, drive, erase, in_path, None)
+}
+
+/// [`build_write_args`] with an explicit `--diskdefs` file — for a definition
+/// synthesized for one write (an exact copy of a sector container) rather than
+/// one registered in the user's custom formats.
+pub fn build_write_args_with(
+    format: &str,
+    drive: &str,
+    erase: bool,
+    in_path: &str,
+    diskdefs: Option<&std::path::Path>,
+) -> Vec<String> {
     let mut args = vec!["write".to_string()];
+    if let Some(d) = diskdefs {
+        args.push(format!("--diskdefs={}", d.display()));
+    }
     // Empty format = a self-describing bitstream container (HFE for TI-99): gw
     // writes the bits directly and needs no `--format`.
     if !format.is_empty() {

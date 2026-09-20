@@ -1369,9 +1369,9 @@ fn render_write_flux_mode(app: &App, frame: &mut Frame, area: Rect) {
     let container = app.write_source_is_container();
     let options: [(&str, &[&str]); 2] = if container {
         [
-            ("Write an exact copy (via HFE)", &[
-                "hxcfe rebuilds every track exactly as recorded — odd sector sizes,",
-                "real sector IDs — then it plays back bit-for-bit.",
+            ("Write an exact copy", &[
+                "Every sector as recorded — odd sizes, real IDs, HP track tables.",
+                "gw writes it through a matched definition and verifies each track.",
             ]),
             ("Re-encode to a disk format…", &[
                 "Lay the sectors out per a gw format and write clean flux —",
@@ -1555,6 +1555,12 @@ fn render_write_outcome(app: &App, job: &crate::write_job::WriteJob, frame: &mut
             } else if let (Some((verified, not_verified, reason)), None) = (&job.verify, &app.verify_result) {
                 lines.push(Line::from(Span::styled(
                     format!("  {verified} verified, {not_verified} not verified ({reason})"),
+                    Style::default().fg(theme().warning),
+                )));
+            }
+            if let Some(note) = &app.write_note {
+                lines.push(Line::from(Span::styled(
+                    format!("  ! {note}"),
                     Style::default().fg(theme().warning),
                 )));
             }

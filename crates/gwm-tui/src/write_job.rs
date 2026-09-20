@@ -4,7 +4,7 @@
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use gwm_core::device::{build_write_args, is_track0_error, recalibrate};
+use gwm_core::device::{build_write_args_with, is_track0_error, recalibrate};
 use gwm_core::write::{run_write, WriteEvent};
 
 enum WriteMsg {
@@ -39,6 +39,7 @@ impl WriteJob {
         erase: bool,
         in_path: String,
         source: String,
+        diskdefs: Option<std::path::PathBuf>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         // Raw write: the image header knows the real track count; gw's plan
@@ -52,7 +53,7 @@ impl WriteJob {
         let worker_format = format.clone();
         let worker_drive = drive.clone();
         thread::spawn(move || {
-            let args = build_write_args(&worker_format, &worker_drive, erase, &in_path);
+            let args = build_write_args_with(&worker_format, &worker_drive, erase, &in_path, diskdefs.as_deref());
 
             let mut saw_track = false;
             let mut track0_fail = false;
