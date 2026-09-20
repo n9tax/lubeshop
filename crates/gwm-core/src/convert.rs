@@ -392,6 +392,10 @@ pub fn reencode_into_master(work: &Path, master: &Path, format: &str) -> Result<
 /// `hxcfe -finput:EDITS -reffile:MASTER -conv:HXC_HFE -foutput:OUT`: the
 /// master's tracks with each sector's contents taken from `edits` (matched by
 /// sector ID). Success = exit 0 and a non-empty output, like [`run_hxcfe`].
+pub fn relay_into_reference(sectors: &Path, reference: &Path, output: &Path) -> Result<()> {
+    hxcfe_reffile(sectors, reference, output)
+}
+
 fn hxcfe_reffile(edits: &Path, master: &Path, output: &Path) -> Result<()> {
     // hxcfe applies its flags in order: `-reffile` must FOLLOW `-conv`/`-foutput`
     // or it is silently ignored and a plain (layout-flattening) conversion runs.

@@ -106,6 +106,11 @@ pub fn parse_probe(text: &str) -> Vec<TrackLayout> {
 
 /// Probe a bit-stream image (HFE/SCP) for its per-track layout, via gw.
 pub fn probe(bitstream: &Path) -> Result<Vec<TrackLayout>> {
+    probe_tracks(bitstream, "")
+}
+
+/// [`probe`] restricted to a gw `--tracks` spec (empty = all).
+pub fn probe_tracks(bitstream: &Path, tracks: &str) -> Result<Vec<TrackLayout>> {
     let dir = std::env::temp_dir();
     let cfg = dir.join("lubeshop-probe.cfg");
     let out = dir.join("lubeshop-probe.img");
@@ -115,14 +120,18 @@ pub fn probe(bitstream: &Path) -> Result<Vec<TrackLayout>> {
     )
     .map_err(|e| CoreError::Tool(format!("could not write the probe definition: {e}")))?;
     let _ = std::fs::remove_file(&out);
+    let mut args = vec![
+        "convert".to_string(),
+        format!("--diskdefs={}", cfg.display()),
+        "--format=probe".to_string(),
+    ];
+    if !tracks.is_empty() {
+        args.push(format!("--tracks={tracks}"));
+    }
+    args.push(bitstream.to_string_lossy().into_owned());
+    args.push(out.to_string_lossy().into_owned());
     let o = std::process::Command::new("gw")
-        .args([
-            "convert",
-            &format!("--diskdefs={}", cfg.display()),
-            "--format=probe",
-            &bitstream.to_string_lossy(),
-            &out.to_string_lossy(),
-        ])
+        .args(&args)
         .output()
         .map_err(|e| CoreError::Tool(format!("gw could not run: {e}")))?;
     let _ = std::fs::remove_file(&out);
@@ -132,6 +141,96 @@ pub fn probe(bitstream: &Path) -> Result<Vec<TrackLayout>> {
         String::from_utf8_lossy(&o.stderr)
     );
     Ok(parse_probe(&text))
+}
+
+/// Whether any track's sector IDs have a hole (the HP-150's 0–15 then 17): a
+/// gw definition must pad holes with placeholder sectors.
+pub fn has_id_gaps(tracks: &[TrackLayout]) -> bool {
+    tracks.iter().any(|t| {
+        let mut ids: Vec<u32> = t.sectors.iter().map(|s| s.0).collect();
+        ids.sort_unstable();
+        ids.windows(2).any(|w| w[1] != w[0] + 1)
+    })
+}
+
+/// Heads on which some track's IDs have a hole — the ones a reference must
+/// match; other heads (an imager's placeholder junk on a single-sided disk's
+/// back) are irrelevant to the layout that matters.
+pub fn gapped_heads(tracks: &[TrackLayout]) -> Vec<u32> {
+    let mut heads: Vec<u32> = tracks
+        .iter()
+        .filter(|t| {
+            let mut ids: Vec<u32> = t.sectors.iter().map(|s| s.0).collect();
+            ids.sort_unstable();
+            ids.windows(2).any(|w| w[1] != w[0] + 1)
+        })
+        .map(|t| t.head)
+        .collect();
+    heads.sort_unstable();
+    heads.dedup();
+    heads
+}
+
+/// A disk's defining layout: per head, its encoding and the sorted `(id, size)`
+/// set of its commonest track.
+pub type Signature = Vec<(u32, String, Vec<(u32, u32)>)>;
+
+/// The per-head layout that defines a disk: the commonest `(id, size)` set on
+/// each head. Two disks with the same signature share a physical track layout,
+/// so one can serve as the other's reference.
+pub fn signature(tracks: &[TrackLayout]) -> Signature {
+    type LayoutKey = (String, Vec<(u32, u32)>);
+    let mut heads: BTreeMap<u32, BTreeMap<LayoutKey, usize>> = BTreeMap::new();
+    for t in tracks.iter().filter(|t| !t.sectors.is_empty()) {
+        let mut s = t.sectors.clone();
+        s.sort_unstable();
+        *heads.entry(t.head).or_default().entry((t.encoding.clone(), s)).or_insert(0) += 1;
+    }
+    heads
+        .into_iter()
+        .filter_map(|(h, m)| m.into_iter().max_by_key(|(_, n)| *n).map(|((e, s), _)| (h, e, s)))
+        .collect()
+}
+
+/// The first of `candidates` (raw flux/bit-stream captures) whose layout
+/// signature matches `tracks` and which spans at least as many cylinders.
+/// Each candidate is probed on cylinders 1–2 only — enough to read its
+/// signature without decoding a whole disk.
+pub fn find_reference(tracks: &[TrackLayout], candidates: &[PathBuf]) -> Option<PathBuf> {
+    let heads = gapped_heads(tracks);
+    let only = |sig: Signature| -> Signature {
+        sig.into_iter().filter(|(h, _, _)| heads.contains(h)).collect()
+    };
+    let want = only(signature(tracks));
+    if want.is_empty() {
+        return None;
+    }
+    // The reference must reach every cylinder that carries the layout being
+    // matched — not leftovers of some other format further out on the disk.
+    let need_cyls = tracks
+        .iter()
+        .filter(|t| {
+            heads.contains(&t.head)
+                && want.iter().any(|(h, e, set)| *h == t.head && *e == t.encoding && *set == t.sectors)
+        })
+        .map(|t| t.cyl)
+        .max()?
+        + 1;
+    for c in candidates {
+        let Some(layout) = crate::convert::bitstream_layout(c) else {
+            continue;
+        };
+        if layout.cyl_max + 1 < need_cyls {
+            continue;
+        }
+        let Ok(sample) = probe_tracks(c, "c=1-2:h=0-1") else {
+            continue;
+        };
+        if only(signature(&sample)) == want {
+            return Some(c.clone());
+        }
+    }
+    None
 }
 
 /// A gw definition reproducing `tracks` exactly — one block per run of
@@ -212,7 +311,14 @@ pub fn synthesize(name: &str, tracks: &[TrackLayout], rate_kbps: u32) -> Option<
 pub enum ExactCopy {
     /// gw can reproduce every sector: write the container itself with this
     /// definition (file + format name). gw verifies each track as it goes.
-    GwDefinition { diskdefs: PathBuf, format: String },
+    /// `note` is set when the definition had to pad a gap in the sector IDs
+    /// with placeholder sectors — reads tolerate them, a drive's write path
+    /// may not (the HP-150 refuses to write such a disk).
+    GwDefinition { diskdefs: PathBuf, format: String, note: Option<String> },
+    /// gw produced every sector's data (good CRCs, the container's bytes even
+    /// where the dump flagged a CRC error) and hxcfe laid them by ID into a
+    /// reference capture's real track layout — no placeholders. Play back raw.
+    RelaidHfe { hfe: PathBuf },
     /// Play back hxcfe's HFE. `lost` sectors of the container didn't survive
     /// the encode (hxcfe clips a long track 0) — reported, never hidden.
     HfePlayback { hfe: PathBuf, lost: u32 },
@@ -247,7 +353,10 @@ fn found_total(text: &str) -> Option<u32> {
 /// (made by the caller; the probe source and the fallback). Synthesizes a gw
 /// definition from the probed layout and proves it by converting the container
 /// with it: the sector count must match the container's own.
-pub fn plan_exact_copy(container: &Path, hfe: &Path) -> Result<ExactCopy> {
+/// Decide how to write `container` exactly. `hfe` is hxcfe's encode of it
+/// (made by the caller; the probe source and the fallback). `references` are
+/// raw captures in the library that may share the disk's physical layout.
+pub fn plan_exact_copy(container: &Path, hfe: &Path, references: &[PathBuf]) -> Result<ExactCopy> {
     let mut tracks = probe(hfe)?;
     // The HFE's track 0 may be clipped; the container knows the true counts.
     // What a playback of the HFE *as encoded* would lose is measured before any
@@ -297,16 +406,89 @@ pub fn plan_exact_copy(container: &Path, hfe: &Path) -> Result<ExactCopy> {
         String::from_utf8_lossy(&o.stderr)
     );
     let container_total = found_total(&text);
-    // Re-probe what gw would write: every sector of the container must be there.
     match container_total {
-        Some(total) if total > 0 && total >= hfe_sectors && !text.contains("FATAL") => {
-            Ok(ExactCopy::GwDefinition {
-                diskdefs: cfg,
-                format: name.to_string(),
-            })
-        }
-        other => Ok(fallback(other)),
+        Some(total) if total > 0 && total >= hfe_sectors && !text.contains("FATAL") => {}
+        other => return Ok(fallback(other)),
     }
+    if !has_id_gaps(&tracks) {
+        return Ok(ExactCopy::GwDefinition { diskdefs: cfg, format: name.to_string(), note: None });
+    }
+    // The definition pads a hole in the IDs with placeholder sectors. A drive's
+    // write path may reject those, so when a reference capture with the same
+    // track layout is in the library, lay gw's sectors into its real layout —
+    // but only for the tracks that HAVE that layout. Everything else (a
+    // signature track, leftovers from an earlier format) keeps gw's own track,
+    // which reproduces it faithfully and has no placeholders to worry about.
+    if let Some(reference) = find_reference(&tracks, references) {
+        let gw_hfe = dir.join("lubeshop-exact-gw.hfe");
+        let relaid = dir.join("lubeshop-exact-relaid.hfe");
+        let merged = dir.join("lubeshop-exact-merged.hfe");
+        for f in [&gw_hfe, &relaid, &merged] {
+            let _ = std::fs::remove_file(f);
+        }
+        let ok = std::process::Command::new("gw")
+            .args([
+                "convert",
+                &format!("--diskdefs={}", cfg.display()),
+                &format!("--format={name}"),
+                &container.to_string_lossy(),
+                &gw_hfe.to_string_lossy(),
+            ])
+            .output()
+            .map(|o| o.status.success() && gw_hfe.exists())
+            .unwrap_or(false)
+            && crate::convert::relay_into_reference(&gw_hfe, &reference, &relaid).is_ok();
+        if ok {
+            // Which (track, side) carry the reference's layout: those whose
+            // sorted sector set equals the head's signature.
+            let sig = signature(&tracks);
+            let heads = gapped_heads(&tracks);
+            let is_ref_layout = |t: usize, s: usize| -> bool {
+                let head = s as u32;
+                heads.contains(&head)
+                    && tracks.iter().any(|tr| {
+                        tr.cyl as usize == t
+                            && tr.head == head
+                            && sig.iter().any(|(h, e, set)| *h == head && *e == tr.encoding && *set == tr.sectors)
+                    })
+            };
+            let composed = match (crate::hfe::parse(&relaid), crate::hfe::parse(&gw_hfe)) {
+                (Ok(a), Ok(b)) => Some(crate::hfe::compose(&a, &b, is_ref_layout)),
+                _ => None,
+            };
+            let _ = std::fs::remove_file(&gw_hfe);
+            let _ = std::fs::remove_file(&relaid);
+            if let Some(c) = composed {
+                if crate::hfe::write(&merged, &c).is_ok() {
+                    // Prove it: every sector of every container track is on the
+                    // merged image (same ID and size), all with intact data.
+                    let after = probe(&merged).unwrap_or_default();
+                    let complete = tracks.iter().all(|want| {
+                        after.iter().any(|got| {
+                            got.cyl == want.cyl
+                                && got.head == want.head
+                                && want.sectors.iter().all(|s| got.sectors.contains(s))
+                        }) || want.sectors.is_empty()
+                    });
+                    if complete && hfe_data_shortfall(&merged) == 0 {
+                        return Ok(ExactCopy::RelaidHfe { hfe: merged });
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&merged);
+        } else {
+            let _ = std::fs::remove_file(&gw_hfe);
+            let _ = std::fs::remove_file(&relaid);
+        }
+    }
+    Ok(ExactCopy::GwDefinition {
+        diskdefs: cfg,
+        format: name.to_string(),
+        note: Some(
+            "This disk numbers its sectors with a gap, so the copy carries placeholder sectors. It reads fine; the machine may refuse to WRITE to it. Read a good original disk of this kind into the library (as raw flux) and the next copy will use its exact layout."
+                .to_string(),
+        ),
+    })
 }
 
 /// Per-track sector counts of the container itself, from gw's loader: it
@@ -355,12 +537,17 @@ pub fn container_track_counts(container: &Path) -> BTreeMap<(u32, u32), u32> {
 /// hxcfe keeps a clipped sector's header but not its data, so this, not a
 /// header count, is what a playback of the file would lose.
 pub fn hfe_data_shortfall(hfe: &Path) -> u32 {
+    hfe_data_shortfall_map(hfe).values().sum()
+}
+
+/// Per-track `total - got` from an ID-agnostic scan (see [`hfe_data_shortfall`]).
+pub fn hfe_data_shortfall_map(hfe: &Path) -> BTreeMap<(u32, u32), u32> {
     let out = std::env::temp_dir().join("lubeshop-shortfall.img");
     let Ok(o) = std::process::Command::new("gw")
         .args(["convert", "--format=ibm.scan", &hfe.to_string_lossy(), &out.to_string_lossy()])
         .output()
     else {
-        return 0;
+        return BTreeMap::new();
     };
     let _ = std::fs::remove_file(&out);
     let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
@@ -374,7 +561,7 @@ pub fn hfe_data_shortfall(hfe: &Path) -> u32 {
             e.1 = total;
         }
     }
-    best.values().map(|(got, total)| total.saturating_sub(*got)).sum()
+    best.into_iter().map(|(k, (got, total))| (k, total.saturating_sub(got))).collect()
 }
 
 /// Mend tracks the HFE encode clipped: where the container holds more sectors
@@ -552,6 +739,25 @@ T1.0: Ignoring unexpected sector C:1 H:0 R:3 N:2
         let mut lone = vec![hp_track(0)];
         lone[0].sectors.retain(|s| s.0 != 17);
         assert_eq!(repair_clipped(&mut lone, &counts), 1);
+    }
+
+    #[test]
+    fn gaps_and_signatures() {
+        let hp: Vec<TrackLayout> = (0..3).map(hp_track).collect();
+        assert!(has_id_gaps(&hp));
+        let mut plain = hp_track(0);
+        plain.sectors = (1..10).map(|i| (i, 512)).collect();
+        assert!(!has_id_gaps(&[plain.clone()]));
+        // Signature: commonest per-head set, order-independent.
+        let mut shuffled = hp_track(9);
+        shuffled.sectors.reverse();
+        let mut with_odd = hp.clone();
+        with_odd.push(shuffled);
+        with_odd.push(plain);
+        let sig = signature(&with_odd);
+        assert_eq!(sig.len(), 1);
+        assert_eq!(sig[0].2.len(), 17);
+        assert_eq!(signature(&hp), sig);
     }
 
     #[test]

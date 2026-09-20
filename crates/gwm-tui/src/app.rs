@@ -57,6 +57,39 @@ pub const MENU_ITEMS: [&str; 14] = [
     "Quit",
 ];
 
+/// One accelerator letter per menu item (parallel to `MENU_ITEMS`): pressing
+/// it jumps straight to that screen, no scrolling. Each letter occurs in its
+/// label, where the menu underlines it — the first letter where that's
+/// unambiguous, otherwise a later one (Reset → e, Test drive RPM → P, Clean
+/// drive → v, archive → a). `q`, `u` (update), `j`/`k` (navigation) stay free.
+pub const MENU_KEYS: [char; 14] = [
+    'r', // Read a disk
+    'w', // Write a disk
+    'i', // Identify disk format
+    'c', // Custom disk formats
+    'e', // Reset the device
+    'p', // Test drive RPM
+    'd', // Drive diagnostic
+    'v', // Clean drive
+    'l', // Library
+    'n', // New image
+    'a', // Import from archive.org
+    't', // Tools
+    's', // Settings
+    'q', // Quit
+];
+
+/// Where a menu label's accelerator letter sits, for underlining: the first
+/// case-insensitive match, preferring an exact-case one (`P` in `RPM`).
+pub fn menu_key_pos(label: &str, key: char) -> Option<usize> {
+    let up = key.to_ascii_uppercase();
+    label
+        .char_indices()
+        .find(|(_, ch)| *ch == up)
+        .or_else(|| label.char_indices().find(|(_, ch)| ch.eq_ignore_ascii_case(&key)))
+        .map(|(i, _)| i)
+}
+
 /// Rows on the settings screen.
 pub const SETTINGS_ROWS: usize = 4;
 
@@ -3074,7 +3107,24 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.menu_index = (self.menu_index + 1) % MENU_ITEMS.len();
             }
-            KeyCode::Enter => match self.menu_index {
+            KeyCode::Enter => self.activate_menu(self.menu_index),
+            // Install an available update (only meaningful when the badge shows).
+            KeyCode::Char('u') | KeyCode::Char('U') => self.start_self_update(),
+            // Accelerator letters: jump straight to the item and open it.
+            KeyCode::Char(c) => {
+                if let Some(i) = MENU_KEYS.iter().position(|k| *k == c.to_ascii_lowercase()) {
+                    self.menu_index = i;
+                    self.activate_menu(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Open menu item `i` (Enter, or its accelerator letter).
+    fn activate_menu(&mut self, i: usize) {
+        {
+            match i {
                 0 => self.enter_read_flow(),
                 1 => self.enter_write_flow(),
                 2 => self.enter_identify_flow(),
@@ -3094,10 +3144,7 @@ impl App {
                 }
                 13 => self.should_quit = true,
                 _ => {}
-            },
-            // Install an available update (only meaningful when the badge shows).
-            KeyCode::Char('u') | KeyCode::Char('U') => self.start_self_update(),
-            _ => {}
+            }
         }
     }
 
@@ -5126,10 +5173,30 @@ impl App {
             self.notice = Some(format!("Could not convert {}: {err}", self.chosen_source_name));
             return false;
         }
-        match gwm_core::layout::plan_exact_copy(&self.chosen_source, &hfe) {
-            Ok(gwm_core::layout::ExactCopy::GwDefinition { diskdefs, format }) => {
+        // Raw captures in the library can serve as layout references.
+        let references: Vec<PathBuf> = self
+            .library
+            .iter()
+            .filter(|it| {
+                matches!(it.kind, MediaKind::Flux)
+                    && Path::new(&it.path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("scp") || e.eq_ignore_ascii_case("hfe"))
+            })
+            .map(|it| PathBuf::from(&it.path))
+            .collect();
+        match gwm_core::layout::plan_exact_copy(&self.chosen_source, &hfe, &references) {
+            Ok(gwm_core::layout::ExactCopy::GwDefinition { diskdefs, format, note }) => {
                 self.chosen_format = format;
                 self.write_diskdefs = Some(diskdefs);
+                self.write_note = note;
+            }
+            Ok(gwm_core::layout::ExactCopy::RelaidHfe { hfe }) => {
+                // Raw playback of a dummy-free re-lay; our read-back verifies it.
+                self.chosen_source = hfe;
+                self.chosen_format = String::new();
+                self.write_diskdefs = None;
                 self.write_note = None;
             }
             Ok(gwm_core::layout::ExactCopy::HfePlayback { hfe, lost }) => {
@@ -6052,5 +6119,25 @@ mod archive_live {
         assert_eq!(app.screen, Screen::ArchiveFiles);
         assert!(!app.archive_files.is_empty(), "no importable image files found");
         assert!(app.archive_files.iter().any(|f| f.is_gzipped()));
+    }
+}
+
+#[cfg(test)]
+mod menu_keys {
+    use super::{menu_key_pos, MENU_ITEMS, MENU_KEYS};
+
+    #[test]
+    fn every_menu_item_has_a_unique_letter_that_is_in_its_label() {
+        let mut seen = std::collections::HashSet::new();
+        for (label, key) in MENU_ITEMS.iter().zip(MENU_KEYS.iter()) {
+            assert!(seen.insert(*key), "accelerator {key:?} used twice");
+            assert!(menu_key_pos(label, *key).is_some(), "{key:?} is not in {label:?}");
+            assert!(!matches!(key, 'u' | 'j' | 'k'), "{key:?} is reserved");
+        }
+        // The letters land where a reader expects them.
+        assert_eq!(menu_key_pos("Test drive RPM", 'p'), Some(12));
+        assert_eq!(menu_key_pos("Reset the device", 'e'), Some(1));
+        assert_eq!(menu_key_pos("Clean drive", 'v'), Some(9));
+        assert_eq!(menu_key_pos("Import from archive.org", 'a'), Some(12));
     }
 }

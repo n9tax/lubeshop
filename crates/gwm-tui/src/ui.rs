@@ -17,7 +17,7 @@ use ratatui::Frame;
 use gwm_core::library::{human_size, Integrity};
 use gwm_core::models::MediaItem;
 
-use crate::app::{App, Focus, LibRow, Screen, DRIVE_OPTIONS, MENU_ITEMS, TUNE_PARAMS};
+use crate::app::{menu_key_pos, App, Focus, LibRow, Screen, DRIVE_OPTIONS, MENU_ITEMS, MENU_KEYS, TUNE_PARAMS};
 use crate::count_job::CountState;
 use crate::version_job::VersionState;
 use crate::text_input::TextInput;
@@ -219,7 +219,20 @@ fn render_menu(app: &App, frame: &mut Frame, area: Rect) {
         .map(|(i, label)| {
             let selected = i == app.menu_index;
             let (marker, style) = if selected { ("▸ ", hl()) } else { ("  ", base()) };
-            let mut spans = vec![Span::styled(format!("{marker}{label}"), style)];
+            // Underline the accelerator letter (see MENU_KEYS).
+            let mut spans = vec![Span::styled(marker.to_string(), style)];
+            match MENU_KEYS.get(i).and_then(|k| menu_key_pos(label, *k)) {
+                Some(p) => {
+                    let (head, rest) = label.split_at(p);
+                    let mut it = rest.chars();
+                    let letter = it.next().map(|c| c.to_string()).unwrap_or_default();
+                    let tail: String = it.collect();
+                    spans.push(Span::styled(head.to_string(), style));
+                    spans.push(Span::styled(letter, style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD)));
+                    spans.push(Span::styled(tail, style));
+                }
+                None => spans.push(Span::styled(label.to_string(), style)),
+            }
             // The RPM item carries a live "testing…"/result note beside its label.
             if *label == "Test drive RPM" {
                 if let Some(note) = app.rpm_menu_note() {
@@ -1370,8 +1383,8 @@ fn render_write_flux_mode(app: &App, frame: &mut Frame, area: Rect) {
     let options: [(&str, &[&str]); 2] = if container {
         [
             ("Write an exact copy", &[
-                "Every sector as recorded — odd sizes, real IDs, HP track tables.",
-                "gw writes it through a matched definition and verifies each track.",
+                "Every sector as recorded — odd sizes, real IDs, HP track tables —",
+                "laid into a known-good disk's exact layout when the library has one.",
             ]),
             ("Re-encode to a disk format…", &[
                 "Lay the sectors out per a gw format and write clean flux —",
@@ -2594,7 +2607,7 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
 /// to (a terminal has no smaller font to shrink a long hint into).
 fn status_hint(app: &App) -> &'static str {
     match app.screen {
-            Screen::Menu => "  ↑/↓ move · Enter select · q quit",
+            Screen::Menu => "  ↑/↓ move · Enter select · underlined letter jumps straight there · q quit",
             Screen::Library => "  ↑/↓ · Enter open · b browse · c convert flux · g →Gotek · f format · h hex · n notes · r rename · m move · a new folder · d del",
             Screen::GotekFormat => "  ↑/↓ choose format · Enter continue · Esc cancel",
             Screen::GotekDrive => {

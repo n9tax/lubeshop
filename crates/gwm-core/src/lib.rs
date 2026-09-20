@@ -26,6 +26,7 @@ pub mod tools;
 pub mod trs_disk;
 pub mod update;
 pub mod custom_formats;
+pub mod hfe;
 pub mod identify;
 pub mod layout;
 pub mod usb;
