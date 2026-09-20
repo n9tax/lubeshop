@@ -209,7 +209,12 @@ pub fn run_read_cancellable<F: FnMut(ReadEvent)>(
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mut on_event: F,
 ) -> std::io::Result<Option<i32>> {
+    let mut fatal = crate::proc::FatalTracker::default();
     crate::proc::run_streaming_cancellable(args, cancel, |line| {
+        if let Some(reason) = fatal.note(line) {
+            on_event(ReadEvent::Failed(reason));
+            return;
+        }
         if let Some(event) = parse_read_line(line) {
             on_event(event);
         }

@@ -267,7 +267,7 @@ fn collect_image_files(
             Some(ext) => ext.to_lowercase(),
             None => continue,
         };
-        if ext == "dms" || suffixes.iter().any(|s| *s == ext) {
+        if ext == "dms" || suffixes.contains(&ext) {
             out.push(path);
         }
     }

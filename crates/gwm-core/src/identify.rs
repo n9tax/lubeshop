@@ -87,11 +87,7 @@ pub fn observe(records: &[TrackRecord], image_bytes: u64) -> Option<Observed> {
     let spt = mode(data.iter().map(|r| r.total))?;
     let encoding = mode(data.iter().map(|r| normalise_encoding(&r.encoding)))?;
     let planned: u64 = records.iter().map(|r| r.total as u64).sum();
-    let bps = if planned > 0 {
-        (image_bytes / planned) as u32
-    } else {
-        0
-    };
+    let bps = image_bytes.checked_div(planned).unwrap_or(0) as u32;
     Some(Observed {
         encoding,
         heads,

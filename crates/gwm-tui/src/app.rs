@@ -25,6 +25,7 @@ use crate::gotek_job::GotekJob;
 use crate::index_job::IndexJob;
 use crate::update_job::{UpdateApplyJob, UpdateCheckJob};
 use crate::usb_job::{UsbArrival, UsbImportJob, UsbWatchJob};
+use crate::verify_job::VerifyJob;
 use crate::version_job::{VersionJob, VersionState};
 use gwm_core::convert::GotekFormat;
 use gwm_core::usb::UsbDrive;
@@ -128,6 +129,8 @@ pub enum Screen {
     UsbDetected,
     /// Copying a plugged-in drive's images into the library (with progress).
     UsbImporting,
+    /// Reading a just-written exact copy back to check it landed.
+    Verifying,
     /// "Identify disk format" result: observed geometry + matching formats.
     IdentifyDone,
     /// The user's own gw disk formats: list, add, delete.
@@ -314,6 +317,10 @@ pub struct App {
     pub usb_pending: Option<UsbArrival>,
     /// A running copy-a-drive's-images-into-the-library operation (with progress).
     pub usb_import: Option<UsbImportJob>,
+    /// Read-back check after an exact-copy write (gw can't verify raw playback).
+    pub verify_job: Option<VerifyJob>,
+    /// Its result for the Done screen: (all good?, plain-English line).
+    pub verify_result: Option<(bool, String)>,
     /// The screen to return to after the USB prompt is dismissed.
     usb_return: Screen,
     /// A running flux → sector-image conversion (with progress).
@@ -591,6 +598,8 @@ impl App {
             usb_queue: Vec::new(),
             usb_pending: None,
             usb_import: None,
+            verify_job: None,
+            verify_result: None,
             usb_return: Screen::Menu,
             convert_job: None,
             convert_out: PathBuf::new(),
@@ -757,6 +766,11 @@ impl App {
                 Screen::Writing => {
                     if self.write_job.as_mut().map(WriteJob::pump).unwrap_or(false) {
                         self.finalize_write();
+                    }
+                }
+                Screen::Verifying => {
+                    if self.verify_job.as_mut().map(VerifyJob::pump).unwrap_or(false) {
+                        self.finalize_verify();
                     }
                 }
                 Screen::Converting => {
@@ -1184,6 +1198,7 @@ impl App {
             Screen::CleanOptions => self.on_clean_options_key(code),
             Screen::Scanning => self.on_scanning_key(code),
             Screen::Writing => {} // destructive — runs to completion; Ctrl+C quits
+            Screen::Verifying => self.on_verifying_key(code),
             Screen::Converting => {} // runs to completion (quick, non-destructive)
             Screen::IpfChoice => self.on_ipf_choice_key(code),
             Screen::UsbDetected => self.on_usb_detected_key(code),
@@ -5151,6 +5166,8 @@ impl App {
                 self.read_outcome = None;
                 self.write_job = None;
                 self.write_outcome = None;
+                self.verify_job = None;
+                self.verify_result = None;
                 self.screen = Screen::Menu;
             }
             // After a read: export the sector-health map and pop it open.
@@ -5160,6 +5177,7 @@ impl App {
             // `start_write` rebuilds the job from the retained selections.
             KeyCode::Char('r') | KeyCode::Char('R') if self.screen == Screen::WriteDone => {
                 self.write_job = None;
+                self.verify_result = None;
                 self.start_write();
             }
             _ => {}
@@ -5457,8 +5475,46 @@ impl App {
                     .unwrap_or_else(|| "write did not complete".to_string()))
             }
         };
+        let raw = self.chosen_format.is_empty();
+        let succeeded = outcome.is_ok();
         self.write_outcome = Some(outcome);
+        self.verify_result = None;
+        // An exact copy (raw playback) is the one write gw can't verify itself —
+        // read it back and compare with what the image holds.
+        if raw && succeeded {
+            self.verify_job = Some(VerifyJob::start(
+                self.chosen_source.clone(),
+                self.chosen_drive.clone(),
+            ));
+            self.screen = Screen::Verifying;
+        } else {
+            self.screen = Screen::WriteDone;
+        }
+    }
+
+    /// The read-back finished (or was skipped): show its verdict with the write.
+    fn finalize_verify(&mut self) {
+        let Some(job) = self.verify_job.take() else {
+            return;
+        };
+        self.verify_result = Some(if job.cancelled {
+            (false, "Read-back skipped".to_string())
+        } else {
+            match job.outcome {
+                Some(Ok(o)) => (o.ok(), o.describe()),
+                Some(Err(e)) => (false, e),
+                None => (false, "Read-back did not complete".to_string()),
+            }
+        });
         self.screen = Screen::WriteDone;
+    }
+
+    fn on_verifying_key(&mut self, code: KeyCode) {
+        if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+            if let Some(job) = self.verify_job.as_mut() {
+                job.request_cancel();
+            }
+        }
     }
 
     // --- tools installer -------------------------------------------------

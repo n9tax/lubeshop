@@ -94,7 +94,12 @@ pub fn parse_write_line(raw: &str) -> Option<WriteEvent> {
 
 /// Run `gw write` with `args`, forwarding parsed [`WriteEvent`]s to `on_event`.
 pub fn run_write<F: FnMut(WriteEvent)>(args: &[String], mut on_event: F) -> std::io::Result<Option<i32>> {
+    let mut fatal = crate::proc::FatalTracker::default();
     crate::proc::run_streaming(args, |line| {
+        if let Some(reason) = fatal.note(line) {
+            on_event(WriteEvent::Failed(reason));
+            return;
+        }
         if let Some(event) = parse_write_line(line) {
             on_event(event);
         }

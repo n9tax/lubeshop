@@ -119,10 +119,10 @@ pub fn apply_delays(overrides: &HashMap<String, u32>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Reset the Greaseweazle to its power-on state (`gw reset`). Recovers a device
-/// stuck in a bad state mid-session; also clears any delay overrides applied this
-/// session (they are re-applied before the next read, so this is harmless). It
-/// does not touch any disk. `gw`'s exit code is unreliable, so failure is judged
+/// Reset the Greaseweazle (`gw reset`). Recovers a device stuck in a bad state
+/// mid-session and re-finds track 0 on a drive that lost it. Verified against
+/// gw 1.23: it does **not** clear `gw delays` overrides (they are re-applied
+/// before every read/write anyway). It does not touch any disk. `gw`'s exit code is unreliable, so failure is judged
 /// by the documented `Command Failed` marker; `Err` carries a short reason.
 pub fn reset() -> Result<(), String> {
     let out = Command::new("gw")
@@ -210,7 +210,24 @@ fn floats(s: &str) -> impl Iterator<Item = f64> + '_ {
 
 /// Recalibrate a drive by seeking to cylinder 0. Clears the `Track 0 not found`
 /// state some drives report on the first access after sitting idle.
+/// Whether a `gw` failure is the idle-drive "lost track 0" — reported as
+/// `Seek: Track 0 not found` (Command Failed) by older versions and as
+/// `Track0 signal absent after seek to cylinder 0` (fatal) by gw 1.23+. Spacing
+/// and case differ, so compare with both stripped.
+pub fn is_track0_error(msg: &str) -> bool {
+    let m: String = msg
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    m.contains("track0")
+}
+
+/// Re-find track 0 after the drive lost it: `gw reset` (gw's own advice for
+/// the fatal above — it re-calibrates the head and, verified, keeps any
+/// `gw delays` tuning), then an explicit seek to 0.
 pub fn recalibrate(drive: &str) -> std::io::Result<()> {
+    let _ = reset();
     Command::new("gw")
         .args(["seek", &format!("--drive={drive}"), "0"])
         .stdin(Stdio::null())
@@ -332,6 +349,16 @@ pub fn build_write_args(format: &str, drive: &str, erase: bool, in_path: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn track0_error_matches_both_gw_phrasings() {
+        // Old (Command Failed) and new (fatal, gw 1.23) wordings; spacing differs.
+        assert!(is_track0_error("Seek: Track 0 not found"));
+        assert!(is_track0_error("Track0 signal absent after seek to cylinder 0"));
+        assert!(is_track0_error("TRACK 0 NOT FOUND"));
+        assert!(!is_track0_error("Failed to verify Track 5.1"));
+        assert!(!is_track0_error("Disk is write protected"));
+    }
 
     #[test]
     fn parses_rpm_across_gw_phrasings() {

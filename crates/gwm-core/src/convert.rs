@@ -268,6 +268,90 @@ pub fn ipf_available() -> bool {
 /// odd layouts no uniform gw format can express (the original HP-150's
 /// 16×256 + 1×128 tracks) and the real sector IDs. Written back with `gw write`
 /// as raw playback (no `--format`), that is the exact disk. Needs `hxcfe`.
+/// The cylinders and heads a bit-stream image holds, read off its header.
+/// HFE: byte 9 tracks × byte 10 sides. SCP: bytes 6–7 are the first/last track
+/// *index* (`cyl*2+head`), byte 10 the heads flag (0 = both, 1 = side 0 only,
+/// 2 = side 1 only; one-sided files step their indices by two).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitstreamLayout {
+    pub cyl_min: u32,
+    pub cyl_max: u32,
+    pub head_min: u32,
+    pub head_max: u32,
+}
+
+impl BitstreamLayout {
+    /// Tracks present — the real total for a raw (`--format`-less) write, where
+    /// gw's plan line only announces its default range (`c=0-81:h=0-1` = 164)
+    /// and then writes just the tracks present.
+    pub fn track_count(&self) -> u32 {
+        (self.cyl_max - self.cyl_min + 1) * (self.head_max - self.head_min + 1)
+    }
+
+    /// The `--tracks=` spec covering exactly these tracks, so a read-back of a
+    /// raw write reads what was written and nothing more (`c=0-70:h=0`).
+    pub fn tracks_arg(&self) -> String {
+        let c = if self.cyl_min == self.cyl_max {
+            format!("c={}", self.cyl_min)
+        } else {
+            format!("c={}-{}", self.cyl_min, self.cyl_max)
+        };
+        let h = if self.head_min == self.head_max {
+            format!("h={}", self.head_min)
+        } else {
+            format!("h={}-{}", self.head_min, self.head_max)
+        };
+        format!("--tracks={c}:{h}")
+    }
+}
+
+/// Read a bit-stream image's [`BitstreamLayout`] from its header; `None` for
+/// anything that isn't an HFE or SCP.
+pub fn bitstream_layout(path: &Path) -> Option<BitstreamLayout> {
+    use std::io::Read;
+    let mut h = [0u8; 16];
+    let n = std::fs::File::open(path).ok()?.read(&mut h).ok()?;
+    if n < 11 {
+        return None;
+    }
+    if h.starts_with(b"HXCPICFE") || h.starts_with(b"HXCHFEV3") {
+        let tracks = h[9] as u32;
+        let sides = h[10].max(1) as u32;
+        if tracks == 0 {
+            return None;
+        }
+        return Some(BitstreamLayout {
+            cyl_min: 0,
+            cyl_max: tracks - 1,
+            head_min: 0,
+            head_max: sides - 1,
+        });
+    }
+    if h.starts_with(b"SCP") {
+        let (start, end, heads) = (h[6] as u32, h[7] as u32, h[10]);
+        if end < start {
+            return None;
+        }
+        let (head_min, head_max) = match heads {
+            0 => (0, 1),
+            1 => (0, 0),
+            _ => (1, 1),
+        };
+        return Some(BitstreamLayout {
+            cyl_min: start / 2,
+            cyl_max: end / 2,
+            head_min,
+            head_max,
+        });
+    }
+    None
+}
+
+/// How many tracks a bit-stream image holds (see [`BitstreamLayout`]).
+pub fn bitstream_track_count(path: &Path) -> Option<u32> {
+    bitstream_layout(path).map(|l| l.track_count())
+}
+
 pub fn container_to_hfe(input: &Path, output: &Path) -> Result<()> {
     hxcfe_convert(input, output, "HXC_HFE")
 }
@@ -585,5 +669,63 @@ mod tests {
             "round-trip through HFE changed the sector data"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod bitstream_header_tests {
+    use super::bitstream_track_count;
+
+    fn tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("gwm-hdr-{}-{name}", std::process::id()));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn hfe_tracks_times_sides() {
+        // hxcfe's Zork HFE: 0x51 = 81 tracks, 2 sides -> 162 (what gw wrote).
+        let mut h = b"HXCPICFE".to_vec();
+        h.extend([0x00, 0x51, 0x02, 0, 0, 0, 0, 0]);
+        assert_eq!(bitstream_track_count(&tmp("z", &h)), Some(162));
+        // A single-sided 71-track HP disk (hxcfe pads one track).
+        let mut h = b"HXCHFEV3".to_vec();
+        h.extend([0x00, 71, 0x01, 0, 0, 0, 0, 0]);
+        assert_eq!(bitstream_track_count(&tmp("hp", &h)), Some(71));
+    }
+
+    #[test]
+    fn scp_track_index_range_and_heads_flag() {
+        // gw's capture: indices 0..=159, both heads -> 160 tracks.
+        let mut h = b"SCP".to_vec();
+        h.extend([0x00, 0x80, 0x02, 0x00, 0x9f, 0x23, 0x00, 0x00, 0, 0, 0, 0, 0]);
+        assert_eq!(bitstream_track_count(&tmp("scp", &h)), Some(160));
+        // Side-0-only file: even indices 0..=138 -> 70 tracks.
+        let mut h = b"SCP".to_vec();
+        h.extend([0x00, 0x80, 0x02, 0x00, 138, 0x23, 0x00, 0x01, 0, 0, 0, 0, 0]);
+        assert_eq!(bitstream_track_count(&tmp("scp1", &h)), Some(70));
+    }
+
+    #[test]
+    fn tracks_arg_covers_exactly_what_the_image_holds() {
+        use super::bitstream_layout;
+        // Single-sided 71-track HFE: read back side 0, cylinders 0-70 only.
+        let mut h = b"HXCPICFE".to_vec();
+        h.extend([0x00, 71, 0x01, 0, 0, 0, 0, 0]);
+        let l = bitstream_layout(&tmp("ss", &h)).unwrap();
+        assert_eq!(l.tracks_arg(), "--tracks=c=0-70:h=0");
+        assert_eq!(l.track_count(), 71);
+        // Double-sided SCP 0..=159: both heads, cylinders 0-79.
+        let mut h = b"SCP".to_vec();
+        h.extend([0x00, 0x80, 0x02, 0x00, 0x9f, 0x23, 0x00, 0x00, 0, 0, 0, 0, 0]);
+        let l = bitstream_layout(&tmp("ds", &h)).unwrap();
+        assert_eq!(l.tracks_arg(), "--tracks=c=0-79:h=0-1");
+        assert_eq!(l.track_count(), 160);
+    }
+
+    #[test]
+    fn other_files_are_none() {
+        assert_eq!(bitstream_track_count(&tmp("td0", b"TD\x00\x00 not a bitstream header...")), None);
+        assert_eq!(bitstream_track_count(std::path::Path::new("/nonexistent/x.hfe")), None);
     }
 }

@@ -117,6 +117,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::WriteFluxMode => render_write_flux_mode(app, frame, chunks[1]),
         Screen::WriteConfirm => render_write_confirm(app, frame, chunks[1]),
         Screen::Writing | Screen::WriteDone => render_writing(app, frame, chunks[1]),
+        Screen::Verifying => render_verifying(app, frame, chunks[1]),
         Screen::Settings => render_settings(app, frame, chunks[1]),
         Screen::DriveTuning => render_drive_tuning(app, frame, chunks[1]),
         Screen::TuningSaveName => render_tuning_save(app, frame, chunks[1]),
@@ -910,9 +911,10 @@ fn render_custom_formats(app: &App, frame: &mut Frame, area: Rect) {
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  Your own gw disk formats — kept in the store's diskdefs.cfg and offered in every format picker.",
+            "  Your own gw disk formats. Kept in the store's diskdefs.cfg and offered",
             dim(),
         )),
+        Line::from(Span::styled("  in every format picker.", dim())),
         Line::from(""),
     ];
     if app.custom_formats.is_empty() {
@@ -1332,9 +1334,15 @@ fn render_write_source(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_ipf_choice(app: &App, frame: &mut Frame, area: Rect) {
-    let options = [
-        ("Flux master (.hfe)", "Faithful bit-stream copy: keeps copy-protection, browses, and can be written back to a real floppy. 'c' still makes an ADF later."),
-        ("Decoded image (.adf)", "Convert straight to a browsable/editable Amiga disk image. Simplest for plain AmigaDOS disks; drops low-level protection detail."),
+    let options: [(&str, &[&str]); 2] = [
+        ("Flux master (.hfe)", &[
+            "Faithful bit-stream copy: keeps copy-protection, browses, and can be",
+            "written back to a real floppy. 'c' still makes an ADF from it later.",
+        ]),
+        ("Decoded image (.adf)", &[
+            "Convert straight to a browsable/editable Amiga disk image. Simplest for",
+            "plain AmigaDOS disks; low-level protection detail is dropped.",
+        ]),
     ];
     let mut lines = vec![
         Line::from(vec![
@@ -1349,7 +1357,9 @@ fn render_ipf_choice(app: &App, frame: &mut Frame, area: Rect) {
         let selected = i == app.ipf_index;
         let (marker, style) = if selected { ("▸ ", accented()) } else { ("  ", base()) };
         lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
-        lines.push(Line::from(Span::styled(format!("      {help}"), dim())));
+        for h in help.iter() {
+            lines.push(Line::from(Span::styled(format!("      {h}"), dim())));
+        }
         lines.push(Line::from(""));
     }
     frame.render_widget(para(lines).block(bordered("Import IPF — choose form")), area);
@@ -1357,15 +1367,26 @@ fn render_ipf_choice(app: &App, frame: &mut Frame, area: Rect) {
 
 fn render_write_flux_mode(app: &App, frame: &mut Frame, area: Rect) {
     let container = app.write_source_is_container();
-    let options = if container {
+    let options: [(&str, &[&str]); 2] = if container {
         [
-            ("Write an exact copy (via HFE)", "hxcfe rebuilds every track exactly as recorded — odd sector sizes, real sector IDs — then it plays back bit-for-bit."),
-            ("Re-encode to a disk format…", "Lay the sectors out per a gw format and write clean flux — only for layouts a format can express."),
+            ("Write an exact copy (via HFE)", &[
+                "hxcfe rebuilds every track exactly as recorded — odd sector sizes,",
+                "real sector IDs — then it plays back bit-for-bit.",
+            ]),
+            ("Re-encode to a disk format…", &[
+                "Lay the sectors out per a gw format and write clean flux —",
+                "only for layouts a format can express.",
+            ]),
         ]
     } else {
         [
-            ("Write raw flux (exact, no re-encode)", "Plays the captured flux back bit-for-bit — preserves weak bits / copy protection."),
-            ("Re-encode to a disk format…", "Decode the flux to sectors and write clean flux — best for a standard disk."),
+            ("Write raw flux (exact, no re-encode)", &[
+                "Plays the captured flux back bit-for-bit — preserves weak bits and",
+                "copy protection exactly as captured.",
+            ]),
+            ("Re-encode to a disk format…", &[
+                "Decode the flux to sectors and write clean flux — best for a standard disk.",
+            ]),
         ]
     };
     let (what, question) = if container {
@@ -1386,7 +1407,9 @@ fn render_write_flux_mode(app: &App, frame: &mut Frame, area: Rect) {
         let selected = i == app.write_flux_index;
         let (marker, style) = if selected { ("▸ ", accented()) } else { ("  ", base()) };
         lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
-        lines.push(Line::from(Span::styled(format!("      {help}"), dim())));
+        for h in help.iter() {
+            lines.push(Line::from(Span::styled(format!("      {h}"), dim())));
+        }
         lines.push(Line::from(""));
     }
     frame.render_widget(para(lines).block(bordered("Write flux — choose mode")), area);
@@ -1480,6 +1503,42 @@ fn render_writing(app: &App, frame: &mut Frame, area: Rect) {
     }
 }
 
+fn render_verifying(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(job) = app.verify_job.as_ref() else {
+        return;
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(
+        para(vec![Line::from(vec![
+            Span::styled("  Wrote ", dim()),
+            Span::styled(app.chosen_source_name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(" — now reading the disk back to check it", dim()),
+        ])]),
+        rows[0],
+    );
+    let label = match job.total {
+        Some(t) => format!("{}/{} tracks — {}%", job.done, t, (job.ratio() * 100.0) as u16),
+        None => "scanning the image, then the disk…".to_string(),
+    };
+    frame.render_widget(gauge(job.ratio(), label), rows[1]);
+    frame.render_widget(
+        para(vec![
+            Line::from(Span::styled(
+                "  gw can't verify a raw playback itself, so the disk is read straight back",
+                dim(),
+            )),
+            Line::from(Span::styled(
+                "  and every sector is counted against what the image holds.",
+                dim(),
+            )),
+        ]),
+        rows[2],
+    );
+}
+
 fn render_write_outcome(app: &App, job: &crate::write_job::WriteJob, frame: &mut Frame, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     match &app.write_outcome {
@@ -1493,10 +1552,18 @@ fn render_write_outcome(app: &App, job: &crate::write_job::WriteJob, frame: &mut
                     "  All tracks verified",
                     Style::default().fg(theme().success),
                 )));
-            } else if let Some((verified, not_verified, reason)) = &job.verify {
+            } else if let (Some((verified, not_verified, reason)), None) = (&job.verify, &app.verify_result) {
                 lines.push(Line::from(Span::styled(
                     format!("  {verified} verified, {not_verified} not verified ({reason})"),
                     Style::default().fg(theme().warning),
+                )));
+            }
+            // Our own read-back after an exact-copy write.
+            if let Some((ok, text)) = &app.verify_result {
+                let (mark, color) = if *ok { (CHECK, theme().success) } else { ("!", theme().warning) };
+                lines.push(Line::from(Span::styled(
+                    format!("  {mark} {text}"),
+                    Style::default().fg(color),
                 )));
             }
         }
@@ -2603,6 +2670,7 @@ fn status_hint(app: &App) -> &'static str {
             Screen::WriteConfirm => "  y write · e toggle erase · Esc cancel",
             Screen::Writing => "  writing… please wait",
             Screen::Converting => "  converting… please wait",
+            Screen::Verifying => "  reading the disk back to check the write… Esc skip",
             Screen::WriteDone => "  r retry write · Enter return to menu",
             Screen::Ti99Transfer => "  TI-99 transfer… please wait",
             Screen::Ti99Done => "  Enter return to menu",

@@ -23,6 +23,42 @@ use std::time::Duration;
 /// it on a worker thread. Returns the process exit code, which is unreliable for
 /// success (gw prints `Command Failed` yet exits 0), so callers must judge success
 /// from the parsed lines.
+/// Recognise `gw`'s **fatal** form, which spans two lines:
+///
+/// ```text
+/// ** FATAL ERROR:
+/// Track0 signal absent after seek to cylinder 0
+///  1. Try "gw reset" to re-calibrate the drive-head position
+/// ```
+///
+/// (`Command Failed: …` is single-line and handled by the parsers directly.)
+/// Feed every line; the reason comes back exactly once, when its line arrives —
+/// the numbered advice that follows is ignored. A reason on the same line as
+/// the marker is accepted too.
+#[derive(Debug, Default)]
+pub struct FatalTracker {
+    pending: bool,
+}
+
+impl FatalTracker {
+    pub fn note(&mut self, line: &str) -> Option<String> {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("** FATAL ERROR:").or_else(|| l.strip_prefix("FATAL ERROR:")) {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.pending = true;
+                return None;
+            }
+            return Some(rest.to_string());
+        }
+        if self.pending && !l.is_empty() {
+            self.pending = false;
+            return Some(l.to_string());
+        }
+        None
+    }
+}
+
 pub fn run_streaming<F: FnMut(&str)>(args: &[String], on_line: F) -> std::io::Result<Option<i32>> {
     run_streaming_cancellable(args, Arc::new(AtomicBool::new(false)), on_line)
 }
@@ -116,4 +152,33 @@ pub fn run_streaming_cancellable<F: FnMut(&str)>(
     let _ = watcher.join();
     let status = child.lock().expect("child mutex poisoned").wait()?;
     Ok(status.code())
+}
+
+#[cfg(test)]
+mod fatal_tests {
+    use super::FatalTracker;
+
+    #[test]
+    fn two_line_fatal_yields_the_reason_once_and_ignores_the_advice() {
+        // Exactly what gw 1.23 prints when an idle drive loses track 0.
+        let mut t = FatalTracker::default();
+        assert_eq!(t.note("** FATAL ERROR:"), None);
+        assert_eq!(
+            t.note("Track0 signal absent after seek to cylinder 0").as_deref(),
+            Some("Track0 signal absent after seek to cylinder 0")
+        );
+        assert_eq!(t.note(" 1. Try \"gw reset\" to re-calibrate the drive-head position"), None);
+        assert_eq!(t.note(" 2. If the error persists try slowing down seek operations"), None);
+    }
+
+    #[test]
+    fn same_line_fatal_and_blank_lines() {
+        let mut t = FatalTracker::default();
+        assert_eq!(t.note("** FATAL ERROR: Disk is write protected").as_deref(), Some("Disk is write protected"));
+        let mut t = FatalTracker::default();
+        assert_eq!(t.note("** FATAL ERROR:"), None);
+        assert_eq!(t.note(""), None, "a blank line is not the reason");
+        assert_eq!(t.note("Sector image requires a disk format to be specified").is_some(), true);
+        assert_eq!(t.note("T0.0: IBM MFM (9/9 sectors)"), None, "ordinary lines pass through");
+    }
 }

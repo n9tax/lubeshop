@@ -12,7 +12,7 @@ use std::thread;
 
 use std::collections::HashMap;
 
-use gwm_core::device::{build_read_args, recalibrate};
+use gwm_core::device::{build_read_args, is_track0_error, recalibrate};
 use gwm_core::diskmap::{DiskMap, TrackHealth};
 use gwm_core::read::{map_columns, run_read_cancellable, MapLine, ReadEvent};
 
@@ -93,7 +93,7 @@ impl ReadJob {
             let first = run_read_cancellable(&args, Arc::clone(&worker_cancel), |event| {
                 match &event {
                     ReadEvent::Track { .. } => saw_track = true,
-                    ReadEvent::Failed(msg) if msg.contains("Track 0") => track0_fail = true,
+                    ReadEvent::Failed(msg) if is_track0_error(msg) => track0_fail = true,
                     _ => {}
                 }
                 let _ = tx.send(ReadMsg::Event(event));

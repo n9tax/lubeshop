@@ -4,7 +4,7 @@
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use gwm_core::device::{build_write_args, recalibrate};
+use gwm_core::device::{build_write_args, is_track0_error, recalibrate};
 use gwm_core::write::{run_write, WriteEvent};
 
 enum WriteMsg {
@@ -19,6 +19,9 @@ pub struct WriteJob {
     pub format: String,
     pub drive: String,
     pub total_tracks: Option<u32>,
+    /// For a raw write, the track count read off the image header — gw's plan
+    /// line overstates it (its default range), so this wins when known.
+    expected_total: Option<u32>,
     pub done_tracks: u32,
     pub retries: u32,
     pub current: String,
@@ -38,6 +41,13 @@ impl WriteJob {
         source: String,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
+        // Raw write: the image header knows the real track count; gw's plan
+        // line won't. Read it before the strings move into the worker.
+        let expected_total = if format.is_empty() {
+            gwm_core::convert::bitstream_track_count(std::path::Path::new(&in_path))
+        } else {
+            None
+        };
 
         let worker_format = format.clone();
         let worker_drive = drive.clone();
@@ -49,7 +59,7 @@ impl WriteJob {
             let first = run_write(&args, |event| {
                 match &event {
                     WriteEvent::Track { .. } => saw_track = true,
-                    WriteEvent::Failed(msg) if msg.contains("Track 0") => track0_fail = true,
+                    WriteEvent::Failed(msg) if is_track0_error(msg) => track0_fail = true,
                     _ => {}
                 }
                 let _ = tx.send(WriteMsg::Event(event));
@@ -75,6 +85,7 @@ impl WriteJob {
             format,
             drive,
             total_tracks: None,
+            expected_total,
             done_tracks: 0,
             retries: 0,
             current: String::new(),
@@ -106,7 +117,7 @@ impl WriteJob {
 
     fn apply(&mut self, event: WriteEvent) {
         if let Some(total) = event.total_tracks() {
-            self.total_tracks = Some(total);
+            self.total_tracks = Some(self.expected_total.unwrap_or(total));
             return;
         }
         match event {
