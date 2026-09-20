@@ -2572,7 +2572,7 @@ impl App {
         // image) back into the master, which is the real library artifact whose
         // catalog metadata we then refresh.
         let meta_path = if let Some(master) = self.browse_master.clone() {
-            if let Err(err) = convert::convert(
+            if let Err(err) = convert::reencode_into_master(
                 &self.browse_image,
                 &master,
                 &self.browse_master_format,

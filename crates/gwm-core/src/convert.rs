@@ -352,6 +352,66 @@ pub fn bitstream_track_count(path: &Path) -> Option<u32> {
     bitstream_layout(path).map(|l| l.track_count())
 }
 
+/// Fold an edited sector image back into its bit-stream `master`, keeping the
+/// master's **physical layout**. Plain `gw convert img → hfe` re-encodes every
+/// track from the format definition, which flattens anything the format can't
+/// express — the HP-150's 128-byte spare sectors, a signature track — so the
+/// result is a different disk from the one the machine read. When the master
+/// is an HFE and hxcfe is present, this instead encodes the edits with gw and
+/// then has hxcfe copy them *sector by sector* into the master's own track
+/// layout (`-reffile`), so only the sector contents change. Anything else
+/// (an .scp master, no hxcfe, a failed re-lay) falls back to the plain path.
+pub fn reencode_into_master(work: &Path, master: &Path, format: &str) -> Result<()> {
+    let is_hfe = master
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("hfe"));
+    if !(is_hfe && hxcfe_available()) {
+        return convert(work, master, format);
+    }
+    let encoded = master.with_extension("edit.hfe");
+    let relaid = master.with_extension("relaid.hfe");
+    let _ = std::fs::remove_file(&encoded);
+    let _ = std::fs::remove_file(&relaid);
+    convert(work, &encoded, format)?;
+    let relay = hxcfe_reffile(&encoded, master, &relaid);
+    let _ = std::fs::remove_file(&encoded);
+    match relay {
+        Ok(()) => {
+            std::fs::rename(&relaid, master).map_err(|e| {
+                CoreError::Tool(format!("could not replace the master with the re-laid image: {e}"))
+            })
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&relaid);
+            convert(work, master, format)
+        }
+    }
+}
+
+/// `hxcfe -finput:EDITS -reffile:MASTER -conv:HXC_HFE -foutput:OUT`: the
+/// master's tracks with each sector's contents taken from `edits` (matched by
+/// sector ID). Success = exit 0 and a non-empty output, like [`run_hxcfe`].
+fn hxcfe_reffile(edits: &Path, master: &Path, output: &Path) -> Result<()> {
+    // hxcfe applies its flags in order: `-reffile` must FOLLOW `-conv`/`-foutput`
+    // or it is silently ignored and a plain (layout-flattening) conversion runs.
+    let mut cmd = Command::new("hxcfe");
+    cmd.arg(format!("-finput:{}", edits.display()))
+        .arg("-conv:HXC_HFE")
+        .arg(format!("-foutput:{}", output.display()))
+        .arg(format!("-reffile:{}", master.display()));
+    inject_caps_libpath(&mut cmd);
+    let out = cmd
+        .output()
+        .map_err(|e| CoreError::Tool(format!("hxcfe could not run: {e}")))?;
+    let wrote = std::fs::metadata(output).map(|m| m.len() > 0).unwrap_or(false);
+    if out.status.success() && wrote {
+        Ok(())
+    } else {
+        Err(CoreError::Tool("hxcfe sector copy produced no output".to_string()))
+    }
+}
+
 pub fn container_to_hfe(input: &Path, output: &Path) -> Result<()> {
     hxcfe_convert(input, output, "HXC_HFE")
 }

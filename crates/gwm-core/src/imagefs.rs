@@ -374,6 +374,17 @@ pub fn mtools_available() -> bool {
     have("mdir")
 }
 
+/// An mtools command with its sanity check off. mtools refuses images whose
+/// boot-sector media byte isn't one it knows ("Bad media types ff/fa, probably
+/// non-MSDOS disk") — which is every HP-150 disk, 256- and 512-byte alike —
+/// though it reads and writes them fine once told to. `MTOOLS_SKIP_CHECK` is
+/// mtools' own switch for exactly this; normal PC disks are unaffected.
+fn mtools(cmd: &str) -> Command {
+    let mut c = Command::new(cmd);
+    c.env("MTOOLS_SKIP_CHECK", "1");
+    c
+}
+
 fn have(cmd: &str) -> bool {
     // Cross-platform PATH probe (`where` on Windows, `command -v` elsewhere) — the
     // old `sh -c` form silently failed on Windows, where `sh` isn't on PATH, so FAT
@@ -420,20 +431,20 @@ impl FatFs {
 
 impl ImageFs for FatFs {
     fn list(&self, image: &Path) -> Result<Vec<FileEntry>> {
-        let mut cmd = Command::new("mdir");
+        let mut cmd = mtools("mdir");
         cmd.arg("-i").arg(image).arg("::");
         Ok(parse_mdir(&run(cmd)?))
     }
 
     fn extract(&self, image: &Path, entry: &FileEntry, dest: &Path) -> Result<()> {
-        let mut cmd = Command::new("mcopy");
+        let mut cmd = mtools("mcopy");
         cmd.arg("-n").arg("-i").arg(image).arg(format!("::{}", entry.name));
         push_host_operand(&mut cmd, dest);
         run(cmd).map(|_| ())
     }
 
     fn insert(&self, image: &Path, src: &Path, name: &str, _user: u8) -> Result<()> {
-        let mut cmd = Command::new("mcopy");
+        let mut cmd = mtools("mcopy");
         cmd.arg("-n").arg("-i").arg(image);
         push_host_operand(&mut cmd, src);
         cmd.arg(format!("::{name}"));
@@ -441,13 +452,13 @@ impl ImageFs for FatFs {
     }
 
     fn delete(&self, image: &Path, entry: &FileEntry) -> Result<()> {
-        let mut cmd = Command::new("mdel");
+        let mut cmd = mtools("mdel");
         cmd.arg("-i").arg(image).arg(format!("::{}", entry.name));
         run(cmd).map(|_| ())
     }
 
     fn usage(&self, image: &Path) -> Result<FsUsage> {
-        let mut cmd = Command::new("mdir");
+        let mut cmd = mtools("mdir");
         cmd.arg("-i").arg(image).arg("::");
         parse_mdir_usage(&run(cmd)?)
             .ok_or_else(|| CoreError::Tool("could not read image capacity".to_string()))
@@ -456,7 +467,7 @@ impl ImageFs for FatFs {
 
 /// Create a blank FAT image. `size` is an mtools `-f` value (e.g. `1440`).
 pub fn fat_mkfs(size: &str, image: &Path) -> Result<()> {
-    let mut cmd = Command::new("mformat");
+    let mut cmd = mtools("mformat");
     cmd.arg("-i").arg(image).arg("-C").args(["-f", size, "::"]);
     run(cmd).map(|_| ())
 }
