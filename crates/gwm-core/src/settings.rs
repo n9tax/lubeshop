@@ -99,10 +99,60 @@ impl Settings {
     /// backup first means a truncated or hand-edited file costs at most the
     /// last change.
     pub fn load(store_dir: &Path) -> Self {
-        if let Some(settings) = Self::read(&Self::file(store_dir)) {
-            return settings;
+        Self::load_checked(store_dir).0
+    }
+
+    /// Like [`load`](Self::load), but also says when `settings.toml` is present
+    /// and could not be read, in plain English and with the line at fault.
+    ///
+    /// A hand edit that breaks the file (the classic is a Windows path in
+    /// double quotes, where `\g` is not a valid TOML escape) used to be
+    /// invisible: the app fell back to the backup or to defaults, saved, and the
+    /// person's edit looked "ignored". Now the broken file is preserved as
+    /// `settings.toml.broken` so the edit can be fixed, and the front-end gets a
+    /// message to show. A missing or empty file is not a problem worth
+    /// reporting; only a file with content that does not parse is.
+    pub fn load_checked(store_dir: &Path) -> (Self, Option<String>) {
+        let main = Self::file(store_dir);
+        match Self::read_checked(&main) {
+            Ok(Some(settings)) => return (settings, None),
+            Ok(None) => {}
+            Err(reason) => {
+                // Keep the person's edit: the next save rolls the current file
+                // to `.bak`, which would otherwise overwrite the good backup with
+                // the broken text and lose both.
+                let _ = std::fs::copy(&main, Self::broken_file(store_dir));
+                let fallback = Self::read(&Self::backup_file(store_dir));
+                let using = if fallback.is_some() {
+                    "your previous settings (settings.toml.bak)"
+                } else {
+                    "default settings"
+                };
+                let message = format!(
+                    "settings.toml could not be read: {reason}. Running with {using}; \
+                     the broken file is kept as settings.toml.broken."
+                );
+                return (fallback.unwrap_or_default(), Some(message));
+            }
         }
-        Self::read(&Self::backup_file(store_dir)).unwrap_or_default()
+        (Self::read(&Self::backup_file(store_dir)).unwrap_or_default(), None)
+    }
+
+    /// Parse one settings file: `Ok(None)` if it is missing or empty, `Err` with
+    /// a one-line, plain-English reason if it has content that does not parse.
+    fn read_checked(path: &Path) -> Result<Option<Self>, String> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Ok(None);
+        };
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        toml::from_str(&text).map(Some).map_err(|err| describe_toml_error(&text, &err))
+    }
+
+    /// Where a settings file that failed to parse is preserved.
+    fn broken_file(store_dir: &Path) -> std::path::PathBuf {
+        store_dir.join("settings.toml.broken")
     }
 
     /// Parse one settings file, or `None` if it is missing, empty, or invalid.
@@ -152,6 +202,26 @@ impl Settings {
     }
 }
 
+/// One line for a TOML parse failure: the line number, the parser's first
+/// sentence, and — for the mistake people actually make — how to fix it.
+fn describe_toml_error(text: &str, err: &toml::de::Error) -> String {
+    let where_ = err
+        .span()
+        .map(|span| {
+            let line = text[..span.start.min(text.len())].matches('\n').count() + 1;
+            format!("line {line}: ")
+        })
+        .unwrap_or_default();
+    let what = err.message().lines().next().unwrap_or("invalid TOML").trim().to_string();
+    let hint = if what.contains("escape") {
+        " (a Windows path needs single quotes, e.g. diag_command = 'C:\\tools\\gw.exe', \
+         or forward slashes)"
+    } else {
+        ""
+    };
+    format!("{where_}{what}{hint}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +269,42 @@ mod tests {
         );
         assert_eq!(loaded.format_labels.get("ibm.1440"), Some(&"My PC disk".to_string()));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broken_file_is_reported_kept_and_falls_back() {
+        let dir = std::env::temp_dir().join(format!("gwm-settings-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A good save first, so there is a backup to fall back on.
+        let mut good = Settings::default();
+        good.theme = "c64".to_string();
+        good.save(&dir).unwrap();
+        good.theme = "borland".to_string();
+        good.save(&dir).unwrap(); // rolls the c64 file to .bak
+
+        // The classic Windows mistake: a backslash path in double quotes.
+        std::fs::write(
+            Settings::file(&dir),
+            "theme = \"borland\"\ndiag_command = \"C:\\gw-diag\\gw.exe\"\n",
+        )
+        .unwrap();
+
+        let (loaded, problem) = Settings::load_checked(&dir);
+        let problem = problem.expect("a broken file must be reported");
+        assert!(problem.contains("line 2"), "{problem}");
+        assert!(problem.contains("single quotes"), "{problem}");
+        assert!(problem.contains("settings.toml.bak"), "{problem}");
+        assert_eq!(loaded.theme, "c64", "falls back to the backup, not defaults");
+        assert!(Settings::broken_file(&dir).exists(), "the edit is preserved");
+
+        // Missing and empty files are not problems.
+        std::fs::remove_file(Settings::file(&dir)).unwrap();
+        assert!(Settings::load_checked(&dir).1.is_none());
+        std::fs::write(Settings::file(&dir), "").unwrap();
+        assert!(Settings::load_checked(&dir).1.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

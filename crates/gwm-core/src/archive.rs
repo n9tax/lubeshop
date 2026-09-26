@@ -24,6 +24,8 @@ use crate::error::{CoreError, Result};
 pub const IMAGE_EXTS: &[&str] = &[
     "adf", "adz", "dsk", "d64", "d71", "d81", "d80", "d82", "g64", "img", "ima", "st", "msa", "dmk",
     "hdf", "do", "po", "2mg", "nib", "woz", "imd", "td0", "fdi", "hfe", "scp", "gz",
+    // Macintosh: DiskCopy 4.2 (`.image`/`.dc42`) and bare HFS volumes.
+    "image", "dc42", "hfs",
 ];
 
 /// One item returned by an Archive search.

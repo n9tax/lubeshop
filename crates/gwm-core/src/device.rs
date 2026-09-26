@@ -24,6 +24,19 @@ pub struct GwStatus {
 /// and `gw info` prints `Host Tools: <ver>` and exits 0 even with no device
 /// attached. Note it writes that banner to *stderr*, so we scan both streams and
 /// key off the presence of the `Host Tools:` line rather than the exit status.
+impl GwStatus {
+    /// The status when the device deliberately wasn't probed (see
+    /// [`crate::no_device`]): reported as unavailable, so nothing downstream
+    /// tries to drive hardware.
+    pub fn not_probed() -> Self {
+        GwStatus {
+            available: false,
+            version: None,
+            detail: "device not probed (LUBESHOP_NO_DEVICE is set)".to_string(),
+        }
+    }
+}
+
 pub fn probe() -> GwStatus {
     let output = match Command::new("gw").arg("info").output() {
         Ok(output) => output,

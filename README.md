@@ -7,8 +7,8 @@ floppy reader/writer — and a manager for your growing pile of disk images.
 
 Read old floppies to image files, write images back to disk, and **browse right
 inside** those images to pull files out, drop files in, or edit them — across CP/M,
-MS-DOS/FAT, Commodore, TRS-80, Amiga, and Apple II disks, all from one keyboard-driven
-screen.
+MS-DOS/FAT, Commodore, TRS-80, Amiga, Apple II, and Macintosh disks, all from one
+keyboard-driven screen.
 
 > The command you run is `lubeshop`.
 
@@ -19,13 +19,32 @@ screen.
 - **Read floppies** — pick a disk format (with plain-English descriptions for all
   ~150 Greaseweazle formats), pick a drive, and capture the disk to an image file
   with a live progress bar. Everything you read is filed in a searchable library.
+- **Batch read a disk set** — for a program that came on several floppies: name the
+  set, say how many disks, pick (or make) a folder, choose the format once, then
+  it prompts for each disk in turn and saves them as `Name-disk1`, `Name-disk2`, …
+  A disk that won't read can be retried or skipped.
+- **Test disk media** — is that old floppy safe to use? Pick the kind of disk
+  (3.5"/5.25", DD/HD, 40/80 track) and it writes random data to every sector, reads
+  it back and compares, then does it again with the exact inverse so every bit is
+  tested both ways. You get a verdict (good / weak / bad), a track-by-track map, and
+  the exact sectors that failed. It erases the disk, so it asks first.
+- **Repair a disk (experimental)** — for old disks that throw bad sectors. It erases
+  and writes every track and reads it back; any track that isn't perfect is erased again,
+  rewritten with its bits flipped and read again, over and over (20 cycles by default),
+  until it reads good — and then it must pass three more cycles in a row before it
+  counts as repaired (a relapse sends it back). The erase (an AC erase, close to
+  degaussing) can be switched off to compare.
+  Old disks often recover this way (stale signal from other drives and loose debris get
+  cleared); missing oxide doesn't. You get what was repaired, on which cycle, and what
+  still fails. After a media test, `c` does the same for just the tracks it flagged.
+  Clean the drive head afterwards.
 - **Write images back to floppies** — with a clear destructive-action confirmation
   (and optional erase-first) so you never overwrite a disk by accident.
 - **Browse inside a disk image** — see the files on the disk and its free space,
   then **extract**, **insert**, **delete**, or **hex-edit** files. Copy a file from
   one disk and paste it into another. Works across many vintage systems (see below).
-- **Create blank disks** — make a fresh CP/M, FAT, Commodore, Amiga, or Apple II
-  disk ready to fill.
+- **Create blank disks** — make a fresh CP/M, FAT, Commodore, Amiga, Apple II, or
+  Macintosh disk ready to fill.
 - **Organize your library** — folders, search, rename, notes, and a SHA-256
   integrity check. Drop image files into the store folder and they're imported
   automatically.
@@ -209,10 +228,20 @@ helper with a ✓/✗ so you can install what you need with a keystroke:
 | VICE (`c1541`) | Commodore D64/D71/D81 |
 | amitools (`xdftool`) | Amiga ADF/HDF |
 | AppleCommander | Apple II (DOS 3.3 / ProDOS / Pascal) |
+| hfsutils | Macintosh 800K / 1.44MB (HFS) |
 | atari-tools | Atari 8-bit ATR |
 | HxC (`hxcfe`) | decode TRS-80 flux captures to DMK |
 
 TRS-80 disks are read and written **built in** — no extra tool needed.
+
+**Macintosh disks.** 800K and 1.44MB Mac floppies (HFS) open with hfsutils, which
+the Tools menu installs from your distro's packages. The original 400K disks (MFS,
+1984–86) have no tool anywhere, so the app reads them itself: you can browse and
+copy files off, but not change them. Bare images (`.dsk`, `.img`, `.hfs`) and
+DiskCopy 4.2 images (`.image`, `.dc42`) both work, and the app recognises a Mac disk
+by its contents whatever it's called. Applications and other files with a resource
+fork come out as MacBinary (`.bin`) so nothing is lost; plain documents come out as
+ordinary files. Editing a file on the disk keeps its Mac type, creator, and icon.
 
 The app works fine without any of these installed; it just tells you what a given
 action needs and offers to install it.
@@ -279,7 +308,16 @@ This one needs the **diagnostic fork** of the Greaseweazle tools, since `gw diag
 isn't in an upstream release. Install **Greaseweazle diag** from the **Tools**
 screen and it's picked up automatically — it goes in beside your normal `gw` as
 `gw-diag`, so reads and writes stay on the release build. To point at a different
-build instead, set `diag_command` in `settings.toml`.
+build instead, go to **Settings → Drive diagnostic command** and type the full
+path to that build's `gw` (Enter saves it and tells you at once whether it
+works; blank goes back to auto-detect).
+
+The same setting is `diag_command` in `settings.toml` if you prefer to edit the
+file. On Windows put the path in **single quotes** — `diag_command =
+'C:\gw-diag\gw.exe'` — because `\g` is not a valid escape inside double quotes
+and the whole file then fails to read. If that happens the app tells you on
+startup, keeps your edit as `settings.toml.broken`, and carries on with the
+previous settings.
 
 ---
 

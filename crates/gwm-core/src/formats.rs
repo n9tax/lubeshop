@@ -429,7 +429,8 @@ pub fn format_cylinders(format: &str) -> Option<u32> {
 
 /// Disk-image file suffixes (without the leading dot), recognised when scanning
 /// the storage folder. Parsed once from `gw read --help`'s "Supported file
-/// suffixes:" section, with a built-in fallback, plus `cpm`.
+/// suffixes:" section, with a built-in fallback, plus the containers only a
+/// filesystem driver reads (`cpm`, and the Mac `image`/`dc42`/`hfs`).
 pub fn image_suffixes() -> &'static [String] {
     static SUFFIXES: OnceLock<Vec<String>> = OnceLock::new();
     SUFFIXES.get_or_init(|| {
@@ -437,8 +438,13 @@ pub fn image_suffixes() -> &'static [String] {
         if set.is_empty() {
             set = DEFAULT_SUFFIXES.iter().map(|s| s.to_string()).collect();
         }
-        if !set.iter().any(|s| s == "cpm") {
-            set.push("cpm".to_string());
+        // Containers gw doesn't know but a filesystem driver reads: cpmtools'
+        // `.cpm`, and the Mac driver's DiskCopy 4.2 (`.image`/`.dc42`) and bare
+        // HFS volumes (`.hfs`).
+        for extra in ["cpm", "image", "dc42", "hfs"] {
+            if !set.iter().any(|s| s == extra) {
+                set.push(extra.to_string());
+            }
         }
         set
     })

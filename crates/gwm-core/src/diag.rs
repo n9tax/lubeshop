@@ -257,19 +257,37 @@ pub fn parse_line(line: &str) -> Option<DiagEvent> {
 /// exits without touching the device, which keeps this safe to call at
 /// startup with a disk in the drive.
 pub fn probe(cmd: &str) -> bool {
-    let Ok(out) = Command::new(cmd)
+    probe_detail(cmd).is_ok()
+}
+
+/// [`probe`] with the reason it failed, in plain English: the command could
+/// not be run at all (not installed, or a wrong path), or it runs but is a
+/// build without `diag --batch`. The two need different fixes, and a menu
+/// that just says "no" sends people to the wrong one.
+pub fn probe_detail(cmd: &str) -> Result<(), String> {
+    let out = Command::new(cmd)
         .args(["diag", "--help"])
         .stdin(Stdio::null())
         .output()
-    else {
-        return false;
-    };
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                format!("'{cmd}' was not found — check the path, or install Greaseweazle diag from Tools")
+            } else {
+                format!("'{cmd}' could not be run: {err}")
+            }
+        })?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    text.contains("--batch")
+    if text.contains("--batch") {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{cmd}' runs, but has no 'diag --batch' — it is the stock gw or an older diag build"
+        ))
+    }
 }
 
 /// Reset the device to its power-on state, using the same binary that runs the

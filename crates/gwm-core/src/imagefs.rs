@@ -1339,6 +1339,414 @@ fn parse_xdm99_usage(text: &str) -> Option<FsUsage> {
     })
 }
 
+// ---- Macintosh: HFS via hfsutils, MFS read natively -------------------------
+
+/// Is hfsutils installed? (`hmount` is its entry point; every hfsutils command
+/// is the same binary under another name.)
+pub fn hfsutils_available() -> bool {
+    have("hmount")
+}
+
+/// Sizes a blank Mac floppy can be created at: 800 KB double-sided and 1.44 MB
+/// HD. Both are HFS — hfsutils won't format below 800 KB, and 400 KB disks are
+/// MFS, which is read-only here.
+fn mac_blank_size(option: &str) -> Option<u64> {
+    match option {
+        "800" => Some(819_200),
+        "1440" => Some(1_474_560),
+        _ => None,
+    }
+}
+
+/// Create a blank HFS floppy image (`hformat` on a zero-filled file). The volume
+/// name comes from the file stem, as for TI-99 and Amiga images.
+pub fn mac_mkfs(option: &str, image: &Path) -> Result<()> {
+    let size = mac_blank_size(option)
+        .ok_or_else(|| CoreError::Tool(format!("unknown Macintosh disk size {option}")))?;
+    let file = std::fs::File::create(image)?;
+    file.set_len(size)?;
+    drop(file);
+    let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
+    let mut label = crate::mac_disk::mac_roman_encode(stem);
+    label.retain(|&b| b != b':');
+    label.truncate(27);
+    if label.is_empty() {
+        label = b"Untitled".to_vec();
+    }
+    let scratch = MacScratch::new()?;
+    let mut cmd = scratch.hfs("hformat");
+    cmd.arg("-l").arg(mac_arg(&label)).arg(image).arg("0");
+    if let Err(err) = mac_run(cmd) {
+        let _ = std::fs::remove_file(image);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// A private working folder for one Mac operation, removed on drop.
+///
+/// hfsutils keeps its "currently mounted volume" in `$HOME/.hcwd`. Giving every
+/// operation its own HOME means the app never touches the user's real one, two
+/// images can't get crossed, and nothing is left mounted if we stop half-way.
+/// It also holds the unwrapped copy of a DiskCopy image and MacBinary staging.
+struct MacScratch(std::path::PathBuf);
+
+impl MacScratch {
+    fn new() -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("lubeshop-mac-{}-{n}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(MacScratch(dir))
+    }
+
+    fn file(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+
+    /// An hfsutils command confined to this scratch folder's HOME.
+    fn hfs(&self, tool: &str) -> Command {
+        let mut cmd = Command::new(tool);
+        cmd.env("HOME", &self.0).stdin(std::process::Stdio::null());
+        cmd
+    }
+
+    /// Mount `volume` as this scratch's current HFS volume.
+    fn mount(&self, volume: &Path) -> Result<()> {
+        let mut cmd = self.hfs("hmount");
+        cmd.arg(volume);
+        mac_run(cmd).map(|_| ())
+    }
+}
+
+impl Drop for MacScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A Mac Roman path or name as a command argument, byte for byte (names can hold
+/// ™, accented letters, even a carriage return).
+fn mac_arg(bytes: &[u8]) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(bytes).to_os_string()
+    }
+    #[cfg(not(unix))]
+    {
+        std::ffi::OsString::from(crate::mac_disk::mac_roman_decode(bytes))
+    }
+}
+
+/// Run an hfsutils command. Unlike gw or c1541 these report failure honestly
+/// through the exit status; the message is reworded into plain English where we
+/// know it, and otherwise passed through without the `hcopy: "path":` prefix.
+fn mac_run(mut cmd: Command) -> Result<Vec<u8>> {
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CoreError::Tool(
+                "Mac disks need hfsutils — install it from the Tools screen".to_string(),
+            ))
+        }
+        Err(err) => return Err(CoreError::Io(err)),
+    };
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let first = stderr.lines().next().unwrap_or("hfsutils reported an error").trim();
+    let low = first.to_lowercase();
+    let msg = if low.contains("volume full") {
+        "The disk is full.".to_string()
+    } else if low.contains("read-only") {
+        "This image file is read-only, so it can't be changed.".to_string()
+    } else if low.contains("locked") {
+        "That file or disk is locked.".to_string()
+    } else {
+        first.rsplit(": ").next().unwrap_or(first).to_string()
+    };
+    Err(CoreError::Tool(msg))
+}
+
+/// Run `op` against the raw volume inside `image`, whatever wraps it.
+///
+/// A DiskCopy 4.2 image is unwrapped into the scratch folder first (hfsutils
+/// can't see past its header); when `write` is set and `op` succeeds, the edited
+/// sectors are wrapped back with a fresh checksum and swapped in atomically. A
+/// bare volume is used in place. Anything that isn't a Mac volume gets a plain
+/// answer instead of a tool error.
+fn with_mac_volume<T>(
+    image: &Path,
+    write: bool,
+    op: impl FnOnce(&Path, crate::mac_disk::MacVolume, &MacScratch) -> Result<T>,
+) -> Result<T> {
+    use crate::mac_disk::{self, MacVolume};
+    let (kind, wrapped) = mac_disk::sniff(image).ok_or_else(|| {
+        CoreError::Tool("This isn't a Macintosh disk — no HFS or MFS volume was found in it.".to_string())
+    })?;
+    if kind == MacVolume::HfsPlus {
+        return Err(CoreError::Tool(
+            "This is an HFS+ volume (Mac OS 8.1 and later hard disks and CDs), not a floppy format — it isn't supported."
+                .to_string(),
+        ));
+    }
+    if write && kind == MacVolume::Mfs {
+        return Err(CoreError::Tool(
+            "This is an MFS disk (the original 1984 400 KB format). It is read-only here: copy files off it, or onto an 800 KB HFS disk."
+                .to_string(),
+        ));
+    }
+    let scratch = MacScratch::new()?;
+    if !wrapped {
+        return op(image, kind, &scratch);
+    }
+    let original = std::fs::read(image)?;
+    let sectors = mac_disk::dc42_unwrap(&original)
+        .ok_or_else(|| CoreError::Tool("the DiskCopy image header is damaged".to_string()))?;
+    let raw = scratch.file("volume.img");
+    std::fs::write(&raw, sectors)?;
+    let result = op(&raw, kind, &scratch)?;
+    if write {
+        let edited = std::fs::read(&raw)?;
+        let rewrapped = mac_disk::dc42_rewrap(&original, &edited)
+            .ok_or_else(|| CoreError::Tool("could not rebuild the DiskCopy image".to_string()))?;
+        let tmp = image.with_extension("lubeshop-tmp");
+        std::fs::write(&tmp, rewrapped)?;
+        std::fs::rename(&tmp, image)?;
+    }
+    Ok(result)
+}
+
+/// Macintosh floppies: HFS (800 KB / 1.44 MB) through hfsutils, and the
+/// original 400 KB MFS read natively. Bare volumes (`.dsk`/`.img`/`.hfs`) and
+/// DiskCopy 4.2 (`.image`/`.dc42`) both work. See `mac_disk` for the formats.
+///
+/// Files with a resource fork (applications, fonts, most system files) come off
+/// the disk as MacBinary, so nothing is lost; plain data files come off as their
+/// bytes. Editing a file keeps its type, creator, Finder flags, dates and
+/// resource fork.
+pub struct MacFs;
+
+impl MacFs {
+    pub fn new() -> Self {
+        MacFs
+    }
+}
+
+impl Default for MacFs {
+    fn default() -> Self {
+        MacFs::new()
+    }
+}
+
+/// Copy the HFS file at display path `name` out as a portable [`MacFile`].
+fn hfs_read_file(scratch: &MacScratch, name: &str) -> Result<crate::mac_disk::MacFile> {
+    let staged = scratch.file("out.bin");
+    let mut cmd = scratch.hfs("hcopy");
+    cmd.arg("-m").arg(mac_arg(&crate::mac_disk::hfs_path(name))).arg(&staged);
+    mac_run(cmd)?;
+    let bytes = std::fs::read(&staged)?;
+    crate::mac_disk::macbinary_parse(&bytes)
+        .ok_or_else(|| CoreError::Tool(format!("could not read {name} off the disk")))
+}
+
+/// Bytes that look like plain text (no NULs, printable or line/tab controls).
+fn looks_like_text(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(|&b| b >= 0x20 || matches!(b, b'\t' | b'\r' | b'\n' | 0x0C))
+}
+
+/// Mac line endings for text arriving from a host (CRLF or LF → CR); text that
+/// already uses CR (e.g. copied off another Mac disk) is left alone.
+fn to_mac_text(bytes: &[u8]) -> Vec<u8> {
+    if bytes.contains(&b'\r') && !bytes.contains(&b'\n') {
+        return bytes.to_vec();
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+                out.push(b'\r');
+                i += 1;
+            }
+            b'\n' => out.push(b'\r'),
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    out
+}
+
+impl ImageFs for MacFs {
+    fn list(&self, image: &Path) -> Result<Vec<FileEntry>> {
+        use crate::mac_disk::{self, MacVolume};
+        with_mac_volume(image, false, |volume, kind, scratch| match kind {
+            MacVolume::Mfs => {
+                let bytes = std::fs::read(volume)?;
+                let files = mac_disk::mfs_list(&bytes).map_err(CoreError::Tool)?;
+                Ok(files
+                    .into_iter()
+                    .map(|f| FileEntry {
+                        name: mac_disk::mac_roman_decode(&f.name),
+                        size: f.data_len as u64 + f.rsrc_len as u64,
+                        user: 0,
+                    })
+                    .collect())
+            }
+            _ => {
+                scratch.mount(volume)?;
+                let mut cmd = scratch.hfs("hls");
+                cmd.arg("-laRUN");
+                let out = mac_run(cmd)?;
+                Ok(mac_disk::parse_hls(&out)
+                    .into_iter()
+                    .map(|f| FileEntry {
+                        name: mac_disk::display_path(&f.path),
+                        size: f.data_len + f.rsrc_len,
+                        user: 0,
+                    })
+                    .collect())
+            }
+        })
+    }
+
+    fn extract(&self, image: &Path, entry: &FileEntry, dest: &Path) -> Result<()> {
+        use crate::mac_disk::{self, MacVolume};
+        let file = with_mac_volume(image, false, |volume, kind, scratch| match kind {
+            MacVolume::Mfs => {
+                let bytes = std::fs::read(volume)?;
+                let files = mac_disk::mfs_list(&bytes).map_err(CoreError::Tool)?;
+                let found = files
+                    .iter()
+                    .find(|f| mac_disk::mac_roman_decode(&f.name) == entry.name)
+                    .ok_or_else(|| CoreError::Tool(format!("{} is not on this disk", entry.name)))?;
+                mac_disk::mfs_read(&bytes, found).map_err(CoreError::Tool)
+            }
+            _ => {
+                scratch.mount(volume)?;
+                hfs_read_file(scratch, &entry.name)
+            }
+        })?;
+        std::fs::write(dest, mac_disk::export_bytes(&file))?;
+        Ok(())
+    }
+
+    fn insert(&self, image: &Path, src: &Path, name: &str, _user: u8) -> Result<()> {
+        use crate::mac_disk;
+        let bytes = std::fs::read(src)?;
+        with_mac_volume(image, true, |volume, _kind, scratch| {
+            scratch.mount(volume)?;
+            // A MacBinary file carries its own name, type, creator and both forks.
+            let (staged, target, mode, text) = if let Some(mb) = mac_disk::macbinary_parse(&bytes) {
+                let mut t = vec![b':'];
+                t.extend(mb.name.iter().filter(|&&b| b != b':'));
+                (src.to_path_buf(), t, "-m", false)
+            } else {
+                let mut t = vec![b':'];
+                t.extend(mac_disk::hfs_leaf_name(name));
+                if looks_like_text(&bytes) {
+                    let staged = scratch.file("in.txt");
+                    std::fs::write(&staged, to_mac_text(&bytes))?;
+                    (staged, t, "-r", true)
+                } else {
+                    (src.to_path_buf(), t, "-r", false)
+                }
+            };
+            let mut cmd = scratch.hfs("hcopy");
+            cmd.arg(mode).arg(&staged).arg(mac_arg(&target));
+            if let Err(err) = mac_run(cmd) {
+                // A copy that ran out of room leaves a truncated file behind.
+                let mut del = scratch.hfs("hdel");
+                del.arg(mac_arg(&target));
+                let _ = mac_run(del);
+                return Err(err);
+            }
+            if text {
+                // So SimpleText/TeachText opens it with a double-click.
+                let mut attr = scratch.hfs("hattrib");
+                attr.args(["-t", "TEXT", "-c", "ttxt"]).arg(mac_arg(&target));
+                let _ = mac_run(attr);
+            }
+            Ok(())
+        })
+    }
+
+    fn delete(&self, image: &Path, entry: &FileEntry) -> Result<()> {
+        with_mac_volume(image, true, |volume, _kind, scratch| {
+            scratch.mount(volume)?;
+            let mut cmd = scratch.hfs("hdel");
+            cmd.arg(mac_arg(&crate::mac_disk::hfs_path(&entry.name)));
+            mac_run(cmd).map(|_| ())
+        })
+    }
+
+    fn usage(&self, image: &Path) -> Result<FsUsage> {
+        with_mac_volume(image, false, |volume, _kind, _scratch| {
+            let bytes = std::fs::read(volume)?;
+            let (used, free) = crate::mac_disk::usage(&bytes)
+                .ok_or_else(|| CoreError::Tool("could not read the disk's capacity".to_string()))?;
+            Ok(FsUsage { used, free })
+        })
+    }
+
+    /// Save an edited file without losing what makes it a Mac file.
+    ///
+    /// Delete-and-insert would strip the type, creator, Finder flags, dates and
+    /// the resource fork. Instead the original is copied off as MacBinary, the
+    /// edit is folded in (a new data fork, or — for a file that was handed out as
+    /// MacBinary — the edited MacBinary itself), written under a temporary name,
+    /// and only then swapped for the original, so a full disk can't eat the file.
+    fn overwrite(&self, image: &Path, entry: &FileEntry, src: &Path) -> Option<Result<()>> {
+        use crate::mac_disk;
+        let edited = match std::fs::read(src) {
+            Ok(b) => b,
+            Err(err) => return Some(Err(err.into())),
+        };
+        Some(with_mac_volume(image, true, |volume, _kind, scratch| {
+            scratch.mount(volume)?;
+            let original = hfs_read_file(scratch, &entry.name)?;
+            let updated = if original.rsrc.is_empty() {
+                mac_disk::MacFile { data: edited, ..original }
+            } else {
+                mac_disk::macbinary_parse(&edited).ok_or_else(|| {
+                    CoreError::Tool(
+                        "The edited file is no longer valid MacBinary, so it wasn't saved.".to_string(),
+                    )
+                })?
+            };
+            let staged = scratch.file("edit.bin");
+            std::fs::write(&staged, mac_disk::macbinary_build(&updated))?;
+
+            let target = mac_disk::hfs_path(&entry.name);
+            let folder_end = target.iter().rposition(|&b| b == b':').unwrap_or(0);
+            let mut temp = target[..=folder_end].to_vec();
+            temp.extend_from_slice(b"lubeshop-saving");
+
+            let mut copy = scratch.hfs("hcopy");
+            copy.arg("-m").arg(&staged).arg(mac_arg(&temp));
+            if let Err(err) = mac_run(copy) {
+                let mut del = scratch.hfs("hdel");
+                del.arg(mac_arg(&temp));
+                let _ = mac_run(del);
+                return Err(err);
+            }
+            let mut del = scratch.hfs("hdel");
+            del.arg(mac_arg(&target));
+            mac_run(del)?;
+            let mut rename = scratch.hfs("hrename");
+            rename.arg(mac_arg(&temp)).arg(mac_arg(&target));
+            mac_run(rename).map(|_| ())
+        }))
+    }
+}
+
 /// A named option for creating a blank image (a diskdef, a size, a type…).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateOption {
@@ -1356,6 +1764,7 @@ pub enum FsKind {
     Amiga,
     Apple,
     Ti99,
+    Mac,
 }
 
 impl FsKind {
@@ -1367,6 +1776,7 @@ impl FsKind {
         FsKind::Amiga,
         FsKind::Apple,
         FsKind::Ti99,
+        FsKind::Mac,
     ];
 
     pub fn id(self) -> &'static str {
@@ -1378,6 +1788,7 @@ impl FsKind {
             FsKind::Amiga => "amiga",
             FsKind::Apple => "apple",
             FsKind::Ti99 => "ti99",
+            FsKind::Mac => "mac",
         }
     }
 
@@ -1394,6 +1805,7 @@ impl FsKind {
             FsKind::Amiga => "Amiga · ADF/HDF  (xdftool)",
             FsKind::Apple => "Apple II · DOS 3.3 / ProDOS  (AppleCommander)",
             FsKind::Ti99 => "TI-99/4A · V9T9 DSK  (xdm99)",
+            FsKind::Mac => "Macintosh · HFS / MFS  (hfsutils)",
         }
     }
 
@@ -1407,6 +1819,7 @@ impl FsKind {
             FsKind::Amiga => "Amiga",
             FsKind::Apple => "Apple II",
             FsKind::Ti99 => "TI-99",
+            FsKind::Mac => "Macintosh",
         }
     }
 
@@ -1420,6 +1833,7 @@ impl FsKind {
             FsKind::Amiga => xdftool_available(),
             FsKind::Apple => applecommander_available(),
             FsKind::Ti99 => xdm99_available(),
+            FsKind::Mac => hfsutils_available(),
         }
     }
 
@@ -1439,7 +1853,7 @@ impl FsKind {
         match self {
             FsKind::Cpm => cpm_formats(),
             FsKind::Fat | FsKind::Cbm | FsKind::Trs | FsKind::Amiga | FsKind::Apple
-            | FsKind::Ti99 => Vec::new(),
+            | FsKind::Ti99 | FsKind::Mac => Vec::new(),
         }
     }
 
@@ -1457,6 +1871,9 @@ impl FsKind {
             // TI-99 images are `.dsk` (shared with Apple/TRS), so the user picks
             // the driver rather than it being auto-detected from the extension.
             FsKind::Ti99 => &[],
+            // DiskCopy 4.2 and bare HFS. Mac `.dsk`/`.img` volumes are found by
+            // content instead — see [`FsKind::guess`].
+            FsKind::Mac => &["image", "dc42", "hfs"],
         }
     }
 
@@ -1469,6 +1886,19 @@ impl FsKind {
             .find(|k| k.extensions().contains(&ext.as_str()))
     }
 
+    /// Best-guess driver for the image at `path`: its contents first, where a
+    /// format identifies itself (a Mac volume's MDB signature, which also sees
+    /// through a DiskCopy header), then the file extension. Content matters
+    /// because Mac disks travel as `.dsk` and `.img`, which the extension guess
+    /// leaves ambiguous or maps to FAT.
+    pub fn guess(path: &Path) -> Option<FsKind> {
+        if crate::mac_disk::sniff(path).is_some() {
+            return Some(FsKind::Mac);
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        FsKind::guess_from_ext(ext)
+    }
+
     /// Build a driver instance for browsing (`format` is the CP/M diskdef).
     pub fn open(self, format: Option<&str>) -> Box<dyn ImageFs> {
         match self {
@@ -1479,6 +1909,7 @@ impl FsKind {
             FsKind::Amiga => Box::new(AmigaFs::new()),
             FsKind::Apple => Box::new(AppleFs::new()),
             FsKind::Ti99 => Box::new(Ti99Fs::new()),
+            FsKind::Mac => Box::new(MacFs::new()),
         }
     }
 
@@ -1542,6 +1973,16 @@ impl FsKind {
                 label: label.to_string(),
             })
             .collect(),
+            FsKind::Mac => [
+                ("800", "800 KB — HFS double-sided"),
+                ("1440", "1.44 MB — HFS high density"),
+            ]
+            .iter()
+            .map(|(id, label)| CreateOption {
+                id: id.to_string(),
+                label: label.to_string(),
+            })
+            .collect(),
             // No creation presets (no native TRSDOS formatter yet).
             FsKind::Trs => Vec::new(),
         }
@@ -1572,6 +2013,9 @@ impl FsKind {
                 _ => "po",
             },
             FsKind::Ti99 => "dsk",
+            // What Mac emulators use, and gw reads `.dsk` as a raw image, so it
+            // can be written straight back to a floppy.
+            FsKind::Mac => "dsk",
         }
     }
 
@@ -1583,6 +2027,7 @@ impl FsKind {
             FsKind::Amiga => amiga_mkfs(option, path),
             FsKind::Apple => apple_mkfs(option, path),
             FsKind::Ti99 => ti99_mkfs(option, path),
+            FsKind::Mac => mac_mkfs(option, path),
             FsKind::Trs => Err(CoreError::Tool(
                 "creating TRS-80 images is not supported".to_string(),
             )),

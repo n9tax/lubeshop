@@ -19,6 +19,8 @@ use gwm_core::Core;
 
 use crate::count_job::{CountJob, CountState};
 use crate::diag_job::DiagJob;
+use crate::condition_job::ConditionJob;
+use crate::disk_test_job::DiskTestJob;
 use crate::scan_job::ScanJob;
 use crate::convert_job::ConvertJob;
 use crate::gotek_job::GotekJob;
@@ -40,9 +42,11 @@ use crate::text_input::TextInput;
 use crate::theme::{self, Theme};
 use crate::write_job::WriteJob;
 
-pub const MENU_ITEMS: [&str; 14] = [
+pub const MENU_ITEMS: [&str; 17] = [
     "Read a disk",
+    "Batch read a disk set",
     "Write a disk",
+    "Test disk media",
     "Identify disk format",
     "Custom disk formats",
     "Reset the device",
@@ -55,16 +59,49 @@ pub const MENU_ITEMS: [&str; 14] = [
     "Tools",
     "Settings",
     "Quit",
+    "Repair / condition a disk",
 ];
+
+/// The core for a test: started with the Greaseweazle left alone (no `gw info`
+/// probe, no timing push), so a test run can't disturb a real read or write
+/// going on in a running copy of the app.
+#[cfg(test)]
+pub fn test_core() -> Core {
+    std::env::set_var("LUBESHOP_NO_DEVICE", "1");
+    Core::init().unwrap()
+}
+
+/// The main menu's three columns: a heading, and the `MENU_ITEMS` indices under
+/// it, top to bottom. Every item appears exactly once; `MENU_ITEMS`/`MENU_KEYS`
+/// keep their order, so accelerator letters and `activate_menu` are unchanged.
+pub const MENU_COLUMNS: [(&str, &[usize]); 3] = [
+    // Getting data on and off disks, and managing it.
+    ("I/O Operations", &[0, 1, 2, 4, 10, 11, 12]),
+    // Checking and looking after disks, drives and the device.
+    ("Diagnostic / Repair", &[3, 16, 7, 8, 9, 6]),
+    // Setting the app up (and leaving it).
+    ("Settings", &[5, 13, 14, 15]),
+];
+
+/// Where menu item `i` sits: (column, row) in `MENU_COLUMNS`.
+pub fn menu_position(i: usize) -> (usize, usize) {
+    MENU_COLUMNS
+        .iter()
+        .enumerate()
+        .find_map(|(c, (_, items))| items.iter().position(|&x| x == i).map(|r| (c, r)))
+        .unwrap_or((0, 0))
+}
 
 /// One accelerator letter per menu item (parallel to `MENU_ITEMS`): pressing
 /// it jumps straight to that screen, no scrolling. Each letter occurs in its
 /// label, where the menu underlines it — the first letter where that's
 /// unambiguous, otherwise a later one (Reset → e, Test drive RPM → P, Clean
 /// drive → v, archive → a). `q`, `u` (update), `j`/`k` (navigation) stay free.
-pub const MENU_KEYS: [char; 14] = [
+pub const MENU_KEYS: [char; 17] = [
     'r', // Read a disk
+    'b', // Batch read a disk set
     'w', // Write a disk
+    'm', // Test disk media
     'i', // Identify disk format
     'c', // Custom disk formats
     'e', // Reset the device
@@ -77,6 +114,7 @@ pub const MENU_KEYS: [char; 14] = [
     't', // Tools
     's', // Settings
     'q', // Quit
+    'o', // Repair / condition a disk
 ];
 
 /// Where a menu label's accelerator letter sits, for underlining: the first
@@ -91,7 +129,9 @@ pub fn menu_key_pos(label: &str, key: char) -> Option<usize> {
 }
 
 /// Rows on the settings screen.
-pub const SETTINGS_ROWS: usize = 4;
+pub const SETTINGS_ROWS: usize = 5;
+/// The settings row that edits the drive-diagnostic command.
+pub const SETTINGS_DIAG_ROW: usize = 4;
 
 /// A tunable Greaseweazle drive-delay parameter, matching a `gw delays --<name>`.
 pub struct TuneParam {
@@ -139,6 +179,19 @@ pub enum Screen {
     ReadOptions,
     Reading,
     ReadDone,
+    /// Disk media test: pick the media type, confirm (it erases), run, report.
+    TestMedia,
+    TestConfirm,
+    Testing,
+    TestDone,
+    /// Experimental conditioning of a tested disk's flagged tracks.
+    ConditionConfirm,
+    Conditioning,
+    ConditionDone,
+    /// Batch read set-up: the set's name, how many disks, which folder.
+    BatchSetup,
+    /// Between disks of a batch read: "insert disk N", results so far, summary.
+    BatchPrompt,
     /// Live drive diagnostic: set-up form, then the running session.
     DiagOptions,
     Diag,
@@ -214,9 +267,84 @@ fn tool_index_for_driver(driver: FsKind) -> Option<usize> {
         FsKind::Amiga => "xdftool",
         FsKind::Apple => "applecommander-ac",
         FsKind::Ti99 => "xdm99",
+        FsKind::Mac => "hmount",
         FsKind::Trs => return None,
     };
     gwm_core::tools::TOOLS.iter().position(|t| t.cmd == cmd)
+}
+
+/// What the level-by-level folder picker is choosing a folder for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovePurpose {
+    /// Move the selected library file into the chosen folder.
+    MoveFile,
+    /// Choose where a batch read saves its disks.
+    BatchFolder,
+}
+
+/// How one disk of a batch read went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchDisk {
+    pub disk: u32,
+    pub ok: bool,
+    /// The saved file name (on success).
+    pub file: Option<String>,
+    /// Sector summary on success, the reason on failure, or "skipped".
+    pub detail: String,
+}
+
+/// A multi-disk read: one program on several floppies, read one after another
+/// into one folder as `<name>-disk1`, `<name>-disk2`, … with one format/drive
+/// choice for the whole set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchRead {
+    pub name: String,
+    pub count: u32,
+    pub dir: PathBuf,
+    /// The disk to read next (1-based).
+    pub next: u32,
+    /// The latest result for each disk tried so far, in disk order.
+    pub results: Vec<BatchDisk>,
+    /// Set when the user ends the batch before the last disk.
+    pub stopped: bool,
+}
+
+impl BatchRead {
+    /// Every disk has been dealt with, or the user ended the batch.
+    pub fn finished(&self) -> bool {
+        self.stopped || self.next > self.count
+    }
+
+    /// The latest result for `disk`, if it has been tried.
+    pub fn result(&self, disk: u32) -> Option<&BatchDisk> {
+        self.results.iter().find(|r| r.disk == disk)
+    }
+
+    /// Record a disk's result (replacing an earlier attempt) and move on if it
+    /// read, or was skipped; a failed disk stays current so it can be retried.
+    fn record(&mut self, result: BatchDisk, advance: bool) {
+        self.results.retain(|r| r.disk != result.disk);
+        self.results.push(result);
+        self.results.sort_by_key(|r| r.disk);
+        if advance {
+            self.next += 1;
+        }
+    }
+}
+
+/// `<name>-disk<n>.<ext>` in `dir`, never overwriting: an existing file gets a
+/// ` (2)`, ` (3)`… suffix, since a batch into a folder that already holds a set
+/// must not destroy the earlier reads.
+pub fn batch_file_path(dir: &Path, name: &str, disk: u32, ext: &str) -> PathBuf {
+    let stem = format!("{}-disk{disk}", name.trim().replace(['/', '\\'], "_"));
+    let first = dir.join(format!("{stem}.{ext}"));
+    if !first.exists() {
+        return first;
+    }
+    (2..1000)
+        .map(|n| dir.join(format!("{stem} ({n}).{ext}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
 }
 
 /// What the host file browser is picking.
@@ -241,6 +369,8 @@ enum Flow {
     /// "Identify disk format": a scan read (`ibm.scan`) whose result is the
     /// disk's geometry + matching formats, not a catalogued image.
     Identify,
+    /// "Test disk media": a format chosen only to exercise the disk.
+    DiskTest,
 }
 
 /// Which pane of the two-pane image browser has focus.
@@ -279,6 +409,8 @@ pub struct App {
     pub settings_index: usize,
     pub settings_editing: bool,
     pub storage_input: TextInput,
+    /// Text being typed for the drive-diagnostic command (Settings row 4).
+    pub diag_input: TextInput,
     pub tune_index: usize,
     pub tune_values: Vec<u32>,
     /// Name being typed when saving the current timings as a profile.
@@ -302,6 +434,38 @@ pub struct App {
     move_then_create: bool,
     pub move_state: ListState,
     move_item: Option<(i64, String, String)>,
+    /// The folder level the move picker is showing (row 0 of `move_targets` is
+    /// this folder itself; the rest are its sub-folders).
+    pub move_dir: PathBuf,
+    /// Per row of `move_targets`: does that folder have sub-folders to open (→)?
+    pub move_has_children: Vec<bool>,
+    /// What the folder picker is for (moving a file, or a batch read's folder).
+    pub move_purpose: MovePurpose,
+    /// Batch read set-up form: name, disk count, folder, and the selected row.
+    pub batch_name_input: TextInput,
+    pub batch_count: u32,
+    pub batch_dir: PathBuf,
+    pub batch_row: usize,
+    /// The last key on the disk-count row was a digit (so a second digit makes
+    /// a two-digit count instead of replacing it).
+    batch_count_typing: bool,
+    /// Disk media test: the highlighted media row, the chosen type's label and
+    /// layout, and the running (or finished) test.
+    pub test_media_index: usize,
+    pub test_media_label: String,
+    pub test_geom: Option<gwm_core::disk_test::Geometry>,
+    pub test_job: Option<DiskTestJob>,
+    /// Conditioning: its round limit (set on the confirm screen) and the job.
+    pub condition_rounds: u32,
+    pub condition_job: Option<ConditionJob>,
+    /// "Repair a disk": the media pick and confirmation lead straight into the
+    /// write → verify → flip-bits repair loop over the whole disk (no test).
+    pub repair_mode: bool,
+    /// Repair: AC-erase the tracks before each write (toggled with `e`).
+    pub condition_erase: bool,
+    /// The batch read under way, if any. `Some` routes the Read flow's end
+    /// through the between-disks prompt instead of the single-read result.
+    pub batch: Option<BatchRead>,
     pub notes_input: TextInput,
     notes_id: i64,
     pub folder_input: TextInput,
@@ -584,16 +748,21 @@ impl App {
         // which is cheap but not free, and the answer can't change while we run.
         let diag_supported = gwm_core::diag::probe(&diag_command(&core));
         let diag_drive = core.settings.default_drive.clone();
+        // A settings.toml that failed to parse is the one startup problem the
+        // person caused and can fix; say so before they wonder why an edit was
+        // "ignored".
+        let notice = core.settings_problem.clone();
         Self {
             core,
             screen: Screen::Menu,
             theme,
-            notice: None,
+            notice,
             should_quit: false,
             flow: Flow::Read,
             settings_index: 0,
             settings_editing: false,
             storage_input: TextInput::new(),
+            diag_input: TextInput::new(),
             tune_index: 0,
             tune_values: Vec::new(),
             tuning_name_input: TextInput::new(),
@@ -609,6 +778,23 @@ impl App {
             move_then_create: false,
             move_state: ListState::default(),
             move_item: None,
+            move_dir: PathBuf::new(),
+            move_has_children: Vec::new(),
+            move_purpose: MovePurpose::MoveFile,
+            batch_name_input: TextInput::new(),
+            batch_count: 2,
+            batch_dir: PathBuf::new(),
+            batch_row: 0,
+            batch_count_typing: false,
+            batch: None,
+            test_media_index: 0,
+            test_media_label: String::new(),
+            test_geom: None,
+            test_job: None,
+            condition_rounds: 20,
+            condition_job: None,
+            repair_mode: false,
+            condition_erase: true,
             notes_input: TextInput::new(),
             notes_id: 0,
             folder_input: TextInput::new(),
@@ -802,6 +988,16 @@ impl App {
                 Screen::Ti99Transfer => {
                     if self.ti99_job.as_mut().map(Ti99Job::pump).unwrap_or(false) {
                         self.finalize_ti99();
+                    }
+                }
+                Screen::Testing => {
+                    if self.test_job.as_mut().map(DiskTestJob::pump).unwrap_or(false) {
+                        self.test_finished();
+                    }
+                }
+                Screen::Conditioning => {
+                    if self.condition_job.as_mut().map(ConditionJob::pump).unwrap_or(false) {
+                        self.screen = Screen::ConditionDone;
                     }
                 }
                 Screen::Writing => {
@@ -1230,6 +1426,15 @@ impl App {
             Screen::DrivePicker => self.on_drive_key(code),
             Screen::NameInput => self.on_name_key(code, mods),
             Screen::ReadOptions => self.on_read_options_key(code),
+            Screen::BatchSetup => self.on_batch_setup_key(code, mods),
+            Screen::TestMedia => self.on_test_media_key(code),
+            Screen::TestConfirm => self.on_test_confirm_key(code),
+            Screen::Testing => self.on_testing_key(code),
+            Screen::TestDone => self.on_test_done_key(code),
+            Screen::ConditionConfirm => self.on_condition_confirm_key(code),
+            Screen::Conditioning => self.on_conditioning_key(code),
+            Screen::ConditionDone => self.on_condition_done_key(code),
+            Screen::BatchPrompt => self.on_batch_prompt_key(code),
             Screen::WriteSource => self.on_write_source_key(code),
             Screen::WriteFluxMode => self.on_write_flux_mode_key(code),
             Screen::WriteConfirm => self.on_write_confirm_key(code),
@@ -1454,8 +1659,9 @@ impl App {
             return;
         }
 
-        // Unknown → pick a driver, pre-selecting the extension guess.
-        self.open_driver_picker(PickMode::Browse, FsKind::guess_from_ext(ext));
+        // Unknown → pick a driver, pre-selecting the best guess (the image's own
+        // contents where it identifies itself, else its extension).
+        self.open_driver_picker(PickMode::Browse, FsKind::guess(Path::new(&path)));
     }
 
     /// Convert the highlighted flux master (`.scp`/`.hfe`/`.raw`) into a permanent
@@ -1539,6 +1745,9 @@ impl App {
         self.convert_fs_driver = master_item
             .as_ref()
             .and_then(|m| m.fs_driver.clone())
+            // A Mac decode lands in a plain `.img`, which the extension guess
+            // would call FAT.
+            .or_else(|| gw_format.starts_with("mac.").then(|| FsKind::Mac.id().to_string()))
             .or_else(|| FsKind::guess_from_ext(ext).map(|k| k.id().to_string()));
 
         self.convert_job = Some(ConvertJob::start(master, out, gw_format.to_string()));
@@ -1732,7 +1941,11 @@ impl App {
         let remembered = self
             .master_item()
             .and_then(|m| m.format)
-            .filter(|f| !f.trim().is_empty());
+            .filter(|f| !f.trim().is_empty())
+            // Browsing a Mac capture with nothing remembered: start on the 800 KB
+            // GCR format rather than the top of the list (400 KB and the 1.44 MB
+            // MFM `ibm.1440` are a couple of keystrokes away).
+            .or_else(|| (self.browse_driver == FsKind::Mac).then(|| "mac.800".to_string()));
         self.flow = Flow::Decode;
         self.format_filter.clear();
         let idx = {
@@ -1905,17 +2118,13 @@ impl App {
 
     /// Re-pick the filesystem driver/format for the selected library image
     /// without having to open the (possibly garbled) browser first. Opens the
-    /// driver picker pre-set to the remembered driver, or the extension guess.
+    /// driver picker pre-set to the remembered driver, or the best guess.
     fn reformat_selected(&mut self) {
         let Some(it) = self.selected_file() else { return };
         self.browse_id = it.id;
         self.browse_image = PathBuf::from(&it.path);
-        let name = item_file_name(&it);
         let current = it.fs_driver.as_deref().and_then(FsKind::from_id);
-        let preselect = current.or_else(|| {
-            let ext = Path::new(&name).extension().and_then(|e| e.to_str()).unwrap_or("");
-            FsKind::guess_from_ext(ext)
-        });
+        let preselect = current.or_else(|| FsKind::guess(Path::new(&it.path)));
         self.open_driver_picker(PickMode::Browse, preselect);
     }
 
@@ -2650,12 +2859,18 @@ impl App {
 
     fn on_settings_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         if self.settings_editing {
+            let diag = self.settings_index == SETTINGS_DIAG_ROW;
             match code {
                 KeyCode::Enter => {
-                    self.apply_storage_dir();
+                    if diag {
+                        self.apply_diag_command();
+                    } else {
+                        self.apply_storage_dir();
+                    }
                     self.settings_editing = false;
                 }
                 KeyCode::Esc => self.settings_editing = false,
+                _ if diag => edit_input(&mut self.diag_input, code, mods),
                 _ => edit_input(&mut self.storage_input, code, mods),
             }
             return;
@@ -2685,9 +2900,34 @@ impl App {
                 }
                 2 => self.cycle_default_drive(1),
                 3 => self.enter_drive_tuning(),
+                SETTINGS_DIAG_ROW => {
+                    self.diag_input
+                        .set(self.core.settings.diag_command.clone().unwrap_or_default());
+                    self.settings_editing = true;
+                }
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// Save the typed drive-diagnostic command (blank = detect automatically)
+    /// and say straight away whether it works, so nobody has to hand-edit
+    /// settings.toml — or find out on the Drive diagnostic menu later.
+    fn apply_diag_command(&mut self) {
+        let typed = self.diag_input.text().trim().to_string();
+        self.core.settings.diag_command = (!typed.is_empty()).then_some(typed);
+        let _ = self.core.save_settings();
+        let cmd = diag_command(&self.core);
+        match gwm_core::diag::probe_detail(&cmd) {
+            Ok(()) => {
+                self.diag_supported = true;
+                self.notice = Some(format!("Drive diagnostic will use '{cmd}' — it works."));
+            }
+            Err(reason) => {
+                self.diag_supported = false;
+                self.notice = Some(format!("Saved, but {reason}."));
+            }
         }
     }
 
@@ -2724,8 +2964,9 @@ impl App {
                 // Import the new store's existing files in the background.
                 self.index_job = None;
                 self.start_indexing();
-                self.notice =
-                    Some("Store directory updated — indexing in the background.".to_string());
+                self.notice = Some(self.core.settings_problem.clone().unwrap_or_else(|| {
+                    "Store directory updated — indexing in the background.".to_string()
+                }));
             }
             Err(err) => self.notice = Some(format!("Could not set store dir: {err}")),
         }
@@ -3101,12 +3342,12 @@ impl App {
     fn on_menu_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.menu_index = self.menu_index.checked_sub(1).unwrap_or(MENU_ITEMS.len() - 1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.menu_index = (self.menu_index + 1) % MENU_ITEMS.len();
-            }
+            // ↑/↓ move within the column; ←/→ and Tab/Shift+Tab move between
+            // columns, keeping the row where the other column has one.
+            KeyCode::Up | KeyCode::Char('k') => self.menu_move(0, -1),
+            KeyCode::Down | KeyCode::Char('j') => self.menu_move(0, 1),
+            KeyCode::Left | KeyCode::BackTab => self.menu_move(-1, 0),
+            KeyCode::Right | KeyCode::Tab => self.menu_move(1, 0),
             KeyCode::Enter => self.activate_menu(self.menu_index),
             // Install an available update (only meaningful when the badge shows).
             KeyCode::Char('u') | KeyCode::Char('U') => self.start_self_update(),
@@ -3121,30 +3362,45 @@ impl App {
         }
     }
 
+    /// Move the menu cursor `dc` columns and `dr` rows, wrapping both ways.
+    fn menu_move(&mut self, dc: isize, dr: isize) {
+        let (col, row) = menu_position(self.menu_index);
+        let ncols = MENU_COLUMNS.len() as isize;
+        let col = (col as isize + dc).rem_euclid(ncols) as usize;
+        let items = MENU_COLUMNS[col].1;
+        let row = if dr == 0 {
+            row.min(items.len() - 1)
+        } else {
+            (row.min(items.len() - 1) as isize + dr).rem_euclid(items.len() as isize) as usize
+        };
+        self.menu_index = items[row];
+    }
+
     /// Open menu item `i` (Enter, or its accelerator letter).
     fn activate_menu(&mut self, i: usize) {
-        {
-            match i {
-                0 => self.enter_read_flow(),
-                1 => self.enter_write_flow(),
-                2 => self.enter_identify_flow(),
-                3 => self.enter_custom_formats(),
-                4 => self.reset_device(),
-                5 => self.test_rpm(),
-                6 => self.enter_diag(),
-                7 => self.start_clean(),
-                8 => self.enter_library(),
-                9 => self.enter_create_flow(),
-                10 => self.enter_archive(),
-                11 => self.enter_tools(),
-                12 => {
-                    self.settings_index = 0;
-                    self.settings_editing = false;
-                    self.screen = Screen::Settings;
-                }
-                13 => self.should_quit = true,
-                _ => {}
+        match i {
+            0 => self.enter_read_flow(),
+            1 => self.enter_batch_read(),
+            2 => self.enter_write_flow(),
+            3 => self.enter_disk_test(),
+            4 => self.enter_identify_flow(),
+            5 => self.enter_custom_formats(),
+            6 => self.reset_device(),
+            7 => self.test_rpm(),
+            8 => self.enter_diag(),
+            9 => self.start_clean(),
+            10 => self.enter_library(),
+            11 => self.enter_create_flow(),
+            12 => self.enter_archive(),
+            13 => self.enter_tools(),
+            14 => {
+                self.settings_index = 0;
+                self.settings_editing = false;
+                self.screen = Screen::Settings;
             }
+            15 => self.should_quit = true,
+            16 => self.enter_disk_repair(),
+            _ => {}
         }
     }
 
@@ -3231,11 +3487,12 @@ impl App {
             return;
         }
         if !self.diag_supported {
+            let reason = gwm_core::diag::probe_detail(&diag_command(&self.core))
+                .err()
+                .unwrap_or_else(|| "the diagnostic command is not working".to_string());
             self.notice = Some(format!(
-                "The live diagnostic needs the Greaseweazle diagnostic fork — \
-                 '{}' has no 'diag --batch'. Set diag_command in settings.toml \
-                 to point at it.",
-                diag_command(&self.core)
+                "The live diagnostic needs the Greaseweazle diagnostic fork: {reason}. \
+                 Install it from Tools, or point at it under Settings → Drive diagnostic command."
             ));
             return;
         }
@@ -3778,6 +4035,7 @@ impl App {
             self.notice = Some("Could not read the format list from gw.".to_string());
             return;
         }
+        self.batch = None;
         self.flow = Flow::Read;
         self.format_filter.clear();
         self.format_state.select(Some(0));
@@ -4052,10 +4310,16 @@ impl App {
             self.screen = if from_move { Screen::LibraryMove } else { Screen::Library };
             return;
         }
-        let path = self.lib_base().join(&name);
+        // From the move picker, the new folder goes in the level being viewed.
+        let base = if from_move { self.move_dir.clone() } else { self.lib_base() };
+        let path = base.join(&name);
         match std::fs::create_dir_all(&path) {
             Ok(()) => {
                 self.notice = Some(format!("Created folder “{name}”"));
+                if from_move && self.move_purpose == MovePurpose::BatchFolder {
+                    self.batch_folder_chosen(path);
+                    return;
+                }
                 if from_move {
                     self.move_targets = vec![path];
                     self.move_state.select(Some(0));
@@ -4695,48 +4959,88 @@ impl App {
         self.screen = Screen::Library;
     }
 
-    /// Destination folders a file may be moved into: the store root plus every
-    /// catalogued or empty sub-folder (foreign tool/junk folders are hidden, same
-    /// as the library view), minus `exclude` (the file's current folder). Sorted
-    /// with the root first, then by relative path.
-    fn move_target_dirs(&self, exclude: Option<&Path>) -> Vec<PathBuf> {
-        let root = self.core.paths.library_dir.clone();
-        let image_dirs = self.catalogued_dirs();
-        let mut out = Vec::new();
-        if exclude != Some(root.as_path()) {
-            out.push(root.clone());
-        }
-        // Walk sub-folders with a depth cap, matching library.rs's bounded scan.
-        let mut stack = vec![(root.clone(), 0u32)];
-        while let Some((dir, depth)) = stack.pop() {
-            if depth >= 8 {
-                continue;
-            }
-            let Ok(read) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in read.flatten() {
+    /// Sub-folders of `dir` a file may be moved into, sorted by name: folders
+    /// that lead to catalogued images or are empty. Foreign tool/junk folders are
+    /// hidden, as in the library view, and so are dot-folders and `originals/`.
+    fn move_children(&self, dir: &Path, image_dirs: &HashSet<PathBuf>) -> Vec<PathBuf> {
+        let root = self.core.paths.library_dir.as_path();
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = read
+            .flatten()
+            .filter_map(|entry| {
                 let path = entry.path();
                 if !path.is_dir() {
-                    continue;
+                    return None;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name.starts_with('.') || (dir == root && name == "originals") {
-                    continue;
+                    return None;
                 }
-                // Only offer folders that lead to catalogued images or are empty,
-                // so unpacked tools and source trees don't clutter the picker.
-                let catalogued = image_dirs.contains(&path);
-                if (catalogued || dir_is_empty(&path)) && Some(path.as_path()) != exclude {
-                    out.push(path.clone());
-                }
-                if catalogued {
-                    stack.push((path, depth + 1)); // empty folders have nothing below
-                }
-            }
-        }
-        out.sort_by_key(|p| p.strip_prefix(&root).unwrap_or(p).to_string_lossy().to_lowercase());
+                (image_dirs.contains(&path) || dir_is_empty(&path)).then_some(path)
+            })
+            .collect();
+        out.sort_by_key(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+        });
         out
+    }
+
+    /// Show one level of the move picker: `dir` itself first ("this folder"),
+    /// then its sub-folders. Re-selects `select` if it is on this level (coming
+    /// back up lands on the folder you just left), else the first sub-folder.
+    fn load_move_level(&mut self, dir: PathBuf, select: Option<&Path>) {
+        let image_dirs = self.catalogued_dirs();
+        let children = self.move_children(&dir, &image_dirs);
+        let has_children: Vec<bool> = std::iter::once(false)
+            .chain(
+                children
+                    .iter()
+                    .map(|c| !self.move_children(c, &image_dirs).is_empty()),
+            )
+            .collect();
+        self.move_has_children = has_children;
+        self.move_targets = std::iter::once(dir.clone()).chain(children).collect();
+        let idx = select
+            .and_then(|s| self.move_targets.iter().position(|p| p == s))
+            .unwrap_or(if self.move_targets.len() > 1 { 1 } else { 0 });
+        self.move_state.select(Some(idx));
+        self.move_dir = dir;
+    }
+
+    /// The folder the file being moved is in now.
+    fn move_current_dir(&self) -> Option<PathBuf> {
+        self.move_item
+            .as_ref()
+            .and_then(|(_, path, _)| Path::new(path).parent().map(Path::to_path_buf))
+    }
+
+    /// Whether `dir` is where the file being moved already lives.
+    pub fn move_is_current(&self, dir: &Path) -> bool {
+        self.move_current_dir().as_deref() == Some(dir)
+    }
+
+    /// A folder's path for the picker's header: `⌂ store / HP-150 / Games`.
+    pub fn move_path_display(&self, dir: &Path) -> String {
+        match dir.strip_prefix(&self.core.paths.library_dir) {
+            Ok(rel) => {
+                let mut out = String::from("⌂ store");
+                for part in rel.components() {
+                    out.push_str(" / ");
+                    out.push_str(&part.as_os_str().to_string_lossy());
+                }
+                out
+            }
+            Err(_) => dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Whether the move picker is at the top of the store.
+    pub fn move_at_root(&self) -> bool {
+        self.move_dir == self.core.paths.library_dir
     }
 
     /// Human label for a destination folder: the store root, or its path relative
@@ -4754,25 +5058,16 @@ impl App {
         self.move_item.as_ref().map(|(_, _, name)| name.as_str())
     }
 
-    /// Display string for a destination folder row in the move picker.
-    pub fn move_target_display(&self, dir: &Path) -> String {
-        match dir.strip_prefix(&self.core.paths.library_dir) {
-            Ok(rel) if rel.as_os_str().is_empty() => "⌂  store root".to_string(),
-            Ok(rel) => rel.to_string_lossy().into_owned(),
-            Err(_) => dir.to_string_lossy().into_owned(),
-        }
-    }
-
     fn enter_library_move(&mut self) {
         let Some((id, path, name)) = self.selected_library() else {
             return;
         };
-        let current = Path::new(&path).parent().map(Path::to_path_buf);
-        // Even with no other folder yet, the picker offers "new folder…".
-        let targets = self.move_target_dirs(current.as_deref());
+        // Start at the top of the store and let the user walk down into folders.
+        // Even with no folders yet, the picker offers "new folder…".
         self.move_item = Some((id, path, name));
-        self.move_targets = targets;
-        self.move_state.select(Some(0));
+        self.move_purpose = MovePurpose::MoveFile;
+        let root = self.core.paths.library_dir.clone();
+        self.load_move_level(root, None);
         self.screen = Screen::LibraryMove;
     }
 
@@ -4782,16 +5077,51 @@ impl App {
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.move_item = None;
-                self.screen = Screen::Library;
+                if self.move_purpose == MovePurpose::BatchFolder {
+                    self.move_purpose = MovePurpose::MoveFile;
+                    self.screen = Screen::BatchSetup;
+                } else {
+                    self.screen = Screen::Library;
+                }
             }
             KeyCode::Up | KeyCode::Char('k') => move_list(&mut self.move_state, count, -1),
             KeyCode::Down | KeyCode::Char('j') => move_list(&mut self.move_state, count, 1),
+            // Open the highlighted folder — even one with no sub-folders yet, so
+            // a new folder can be made inside it ("new folder…" works per level).
+            KeyCode::Right | KeyCode::Char('l') => {
+                let row = self.move_state.selected().unwrap_or(0);
+                if row > 0 && row < self.move_targets.len() {
+                    if let Some(dir) = self.move_targets.get(row).cloned() {
+                        self.load_move_level(dir, None);
+                    }
+                }
+            }
+            // Back up a level, landing on the folder we came out of.
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
+                if !self.move_at_root() {
+                    let left = self.move_dir.clone();
+                    if let Some(parent) = left.parent().map(Path::to_path_buf) {
+                        self.load_move_level(parent, Some(&left));
+                    }
+                }
+            }
             KeyCode::Enter => {
                 if self.move_state.selected() == Some(self.move_targets.len()) {
-                    // Make the destination right here, then move into it.
-                    self.folder_input.set(String::new());
+                    // Make the destination right here, then move into it. For a
+                    // batch, suggest the set's own name for its folder.
+                    let suggestion = if self.move_purpose == MovePurpose::BatchFolder {
+                        self.batch_name()
+                    } else {
+                        String::new()
+                    };
+                    self.folder_input.set(suggestion);
                     self.move_then_create = true;
                     self.screen = Screen::NewFolder;
+                } else if self.move_purpose == MovePurpose::BatchFolder {
+                    let chosen = self.move_state.selected().and_then(|i| self.move_targets.get(i)).cloned();
+                    if let Some(dir) = chosen {
+                        self.batch_folder_chosen(dir);
+                    }
                 } else {
                     self.do_move();
                 }
@@ -4848,10 +5178,13 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.screen = match self.flow {
+                    // Backing out of a batch's format choice returns to its form.
+                    Flow::Read if self.batch.take().is_some() => Screen::BatchSetup,
                     Flow::Read => Screen::Menu,
                     Flow::Write => Screen::WriteSource,
                     Flow::Decode | Flow::Convert => Screen::Library,
                     Flow::Identify => Screen::Menu,
+                    Flow::DiskTest => Screen::TestMedia,
                 };
                 if matches!(self.flow, Flow::Decode | Flow::Convert) {
                     self.browse_master = None;
@@ -4887,6 +5220,11 @@ impl App {
                         Flow::Convert => self.decode_to_library(&fmt),
                         // A scan never reaches the format picker.
                         Flow::Identify => {}
+                        Flow::DiskTest => {
+                            self.test_media_label = fmt.clone();
+                            self.chosen_format = fmt;
+                            self.choose_test_format();
+                        }
                         Flow::Read | Flow::Write => {
                             self.chosen_format = fmt;
                             self.drive_index = self.default_drive_index();
@@ -4963,6 +5301,7 @@ impl App {
                     Flow::Write => Screen::WriteSource,
                     Flow::Decode | Flow::Convert => Screen::Library,
                     Flow::Identify => Screen::Menu,
+                    Flow::DiskTest => Screen::TestMedia,
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -4990,6 +5329,8 @@ impl App {
                     Flow::Write => self.screen = Screen::WriteConfirm,
                     // No format to choose for a scan: straight to reading.
                     Flow::Identify => self.start_identify(),
+                    // A test erases the disk: always confirm first.
+                    Flow::DiskTest => self.screen = Screen::TestConfirm,
                     // Decode/Convert never reach the drive picker.
                     Flow::Decode | Flow::Convert => {}
                 }
@@ -5022,6 +5363,11 @@ impl App {
                 self.read_opt_row = (self.read_opt_row + 1) % Self::READ_OPT_ROWS;
             }
             KeyCode::Enter => {
+                // A batch names its disks itself: straight to "insert disk 1".
+                if self.batch.is_some() {
+                    self.screen = Screen::BatchPrompt;
+                    return;
+                }
                 let default = self.default_name();
                 self.name_input.set(default);
                 self.screen = Screen::NameInput;
@@ -5296,23 +5642,13 @@ impl App {
     /// "disk platter" next to the capture, then open it in the host's default
     /// image viewer (a TUI can't draw it in the terminal).
     fn export_disk_map(&mut self) {
-        let Some(job) = self.read_job.as_ref() else {
-            return;
+        let (bmp_path, good, total) = match self.save_disk_map() {
+            Ok(saved) => saved,
+            Err(err) => {
+                self.notice = Some(err);
+                return;
+            }
         };
-        if !job.has_track_health() {
-            self.notice = Some("No per-track data to map for this read.".to_string());
-            return;
-        }
-        let label = file_name(&job.out_path);
-        let map = job.disk_map(&label);
-        let (good, total) = map.totals();
-        let bytes = gwm_core::diskmap::render_bmp(&map);
-        // Sibling of the capture, e.g. DISK.scp -> DISK.readmap.bmp.
-        let bmp_path = job.out_path.with_extension("readmap.bmp");
-        if let Err(err) = std::fs::write(&bmp_path, &bytes) {
-            self.notice = Some(format!("Could not write the sector map: {err}"));
-            return;
-        }
         match open_in_viewer(&bmp_path) {
             Ok(()) => {
                 self.notice =
@@ -5325,6 +5661,23 @@ impl App {
                 ))
             }
         }
+    }
+
+    /// Write the just-finished read's sector map next to the capture
+    /// (`DISK.img` → `DISK.readmap.bmp`). Returns the file and its good/total
+    /// sector counts. Batch reads call this for every disk, since there is no
+    /// result screen to press `v` on between disks.
+    fn save_disk_map(&self) -> std::result::Result<(PathBuf, u32, u32), String> {
+        let job = self.read_job.as_ref().ok_or_else(|| "No read to map.".to_string())?;
+        if !job.has_track_health() {
+            return Err("No per-track data to map for this read.".to_string());
+        }
+        let map = job.disk_map(file_name(&job.out_path));
+        let (good, total) = map.totals();
+        let bmp_path = job.out_path.with_extension("readmap.bmp");
+        std::fs::write(&bmp_path, gwm_core::diskmap::render_bmp(&map))
+            .map_err(|err| format!("Could not write the sector map: {err}"))?;
+        Ok((bmp_path, good, total))
     }
 
     // --- read lifecycle --------------------------------------------------
@@ -5363,8 +5716,26 @@ impl App {
 
     /// The full `gw read …` command the current selections will run — shown on
     /// the name screen for documentation / reproducibility.
+    /// Where the read will be saved: a batch's `<name>-diskN` in its folder, or
+    /// the typed/default name in the Library's current folder.
+    fn read_out_path(&self) -> PathBuf {
+        match &self.batch {
+            Some(b) => batch_file_path(&b.dir, &b.name, b.next, &self.read_extension()),
+            None => self.lib_base().join(self.read_out_name()),
+        }
+    }
+
+    /// The file extension this read produces (flux capture or sector image).
+    fn read_extension(&self) -> String {
+        if self.read_raw_flux {
+            "scp".to_string()
+        } else {
+            formats::default_extension(&self.chosen_format).to_string()
+        }
+    }
+
     pub fn read_command_preview(&self) -> String {
-        let out = self.lib_base().join(self.read_out_name());
+        let out = self.read_out_path();
         let args = gwm_core::device::build_read_args(
             &self.chosen_format,
             &self.chosen_drive,
@@ -5378,7 +5749,10 @@ impl App {
     }
 
     fn start_read(&mut self) {
-        let out_path = self.lib_base().join(self.read_out_name());
+        let out_path = self.read_out_path();
+        if let Some(dir) = out_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         // Push saved drive-timing tuning to the device before reading.
         let _ = gwm_core::device::apply_delays(&self.core.settings.tuning);
         let tracks = self.read_tracks();
@@ -5435,8 +5809,8 @@ impl App {
                 sha256: gwm_core::util::sha256_file(&job.dsk).ok(),
                 source: Source::Device,
                 remote_id: None,
-                tags: Vec::new(),
-                notes: Some("read via HFE".to_string()),
+                tags: self.batch_tags(),
+                notes: self.batch_note(Some("read via HFE".to_string())),
                 fs_format: None,
                 fs_driver: Some(FsKind::Ti99.id().to_string()),
             };
@@ -5453,6 +5827,11 @@ impl App {
         };
         if outcome.is_ok() {
             let _ = self.reload_library();
+        }
+        let was_read = self.ti99_job.as_ref().is_some_and(|j| !j.write);
+        if self.batch.is_some() && was_read {
+            self.batch_disk_done(outcome, "read via HFE".to_string());
+            return;
         }
         self.ti99_outcome = Some(outcome);
         self.screen = Screen::Ti99Done;
@@ -5512,10 +5891,11 @@ impl App {
                     sha256: gwm_core::util::sha256_file(&job.out_path).ok(),
                     source: Source::Device,
                     remote_id: None,
-                    tags: Vec::new(),
-                    notes: job
-                        .summary
-                        .map(|(found, total, pct)| format!("{found}/{total} sectors ({pct}%)")),
+                    tags: self.batch_tags(),
+                    notes: self.batch_note(
+                        job.summary
+                            .map(|(found, total, pct)| format!("{found}/{total} sectors ({pct}%)")),
+                    ),
                     fs_format: None,
                     fs_driver: None,
                 };
@@ -5535,8 +5915,459 @@ impl App {
         if outcome.is_ok() {
             let _ = self.reload_library();
         }
+        if self.batch.is_some() {
+            let summary = self.read_job.as_ref().and_then(|j| j.summary);
+            let mut detail = summary
+                .map(|(found, total, pct)| format!("{found}/{total} sectors ({pct}%)"))
+                .unwrap_or_default();
+            // Every disk of the set gets its track map, saved beside it.
+            if outcome.is_ok() && self.save_disk_map().is_ok() {
+                detail.push_str(" · track map saved");
+            }
+            self.batch_disk_done(outcome, detail);
+            return;
+        }
         self.read_outcome = Some(outcome);
         self.screen = Screen::ReadDone;
+    }
+
+    // --- disk media test -------------------------------------------------
+
+    fn enter_disk_test(&mut self) {
+        if !self.gw_ready() {
+            return;
+        }
+        self.repair_mode = false;
+        self.flow = Flow::DiskTest;
+        self.screen = Screen::TestMedia;
+    }
+
+    /// "Repair / condition a disk": the same media pick and confirmation, then
+    /// straight into the repair loop over every track — no test first.
+    fn enter_disk_repair(&mut self) {
+        if !self.gw_ready() {
+            return;
+        }
+        self.repair_mode = true;
+        self.flow = Flow::DiskTest;
+        self.screen = Screen::TestMedia;
+    }
+
+    fn on_test_media_key(&mut self, code: KeyCode) {
+        let rows = gwm_core::disk_test::MEDIA.len() + 1; // + "Other format…"
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Menu,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.test_media_index = self.test_media_index.checked_sub(1).unwrap_or(rows - 1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.test_media_index = (self.test_media_index + 1) % rows,
+            KeyCode::Enter => match gwm_core::disk_test::MEDIA.get(self.test_media_index) {
+                Some(media) => {
+                    self.test_media_label = media.label.to_string();
+                    self.chosen_format = media.format.to_string();
+                    self.choose_test_format();
+                }
+                // Any other gw format (a system's own layout, or a custom one).
+                None => {
+                    if self.formats.is_empty() {
+                        self.formats = formats::list_formats();
+                    }
+                    self.flow = Flow::DiskTest;
+                    self.format_filter.clear();
+                    self.format_state.select(Some(0));
+                    self.notice = Some("Pick the format to test the disk with.".to_string());
+                    self.screen = Screen::FormatPicker;
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// The chosen format must be one the test can build a reference image for.
+    fn choose_test_format(&mut self) {
+        match gwm_core::disk_test::geometry(&self.chosen_format) {
+            Some(geom) => {
+                self.test_geom = Some(geom);
+                self.flow = Flow::DiskTest;
+                self.drive_index = self.default_drive_index();
+                self.screen = Screen::DrivePicker;
+            }
+            None => {
+                self.notice = Some(format!(
+                    "{} can't be media-tested — only IBM-style (FM/MFM) sector formats can. Pick one of the media types.",
+                    self.chosen_format
+                ));
+                self.screen = Screen::TestMedia;
+            }
+        }
+    }
+
+    fn on_test_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Left | KeyCode::Char('-') if self.repair_mode => {
+                self.condition_rounds = self.condition_rounds.saturating_sub(1).max(1)
+            }
+            KeyCode::Right | KeyCode::Char('+') if self.repair_mode => {
+                self.condition_rounds = (self.condition_rounds + 1).min(50)
+            }
+            KeyCode::Char('e') if self.repair_mode => self.condition_erase = !self.condition_erase,
+            KeyCode::Char('y') | KeyCode::Char('Y') if self.repair_mode => self.start_repair(),
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.start_disk_test(),
+            KeyCode::Esc | KeyCode::Char('n') => self.screen = Screen::DrivePicker,
+            _ => {}
+        }
+    }
+
+    fn start_disk_test(&mut self) {
+        let Some(geom) = self.test_geom else {
+            self.screen = Screen::TestMedia;
+            return;
+        };
+        let _ = gwm_core::device::apply_delays(&self.core.settings.tuning);
+        let tracks = gwm_core::device::read_tracks_arg(&self.chosen_format, None, None, false);
+        self.test_job = Some(DiskTestJob::start(
+            self.chosen_format.clone(),
+            self.chosen_drive.clone(),
+            geom,
+            is_hard_sectored(&self.chosen_format),
+            tracks,
+        ));
+        self.screen = Screen::Testing;
+    }
+
+    /// The media test ended: show its result.
+    fn test_finished(&mut self) {
+        self.screen = Screen::TestDone;
+    }
+
+    /// "Repair a disk": write → verify → flip-bits over every track, straight
+    /// from the menu (the erase was confirmed on the previous screen).
+    fn start_repair(&mut self) {
+        let Some(geom) = self.test_geom else {
+            self.screen = Screen::TestMedia;
+            return;
+        };
+        let _ = gwm_core::device::apply_delays(&self.core.settings.tuning);
+        self.condition_job = Some(ConditionJob::start(
+            self.chosen_format.clone(),
+            self.chosen_drive.clone(),
+            geom,
+            gwm_core::disk_test::all_tracks(&geom),
+            true,
+            self.condition_rounds,
+            self.condition_erase,
+            is_hard_sectored(&self.chosen_format),
+        ));
+        self.screen = Screen::Conditioning;
+    }
+
+    fn on_testing_key(&mut self, code: KeyCode) {
+        if matches!(code, KeyCode::Esc | KeyCode::Char('c')) {
+            if let Some(job) = self.test_job.as_mut() {
+                if !job.cancelled {
+                    job.request_cancel();
+                    self.notice = Some("Stopping the test…".to_string());
+                }
+            }
+        }
+    }
+
+    fn on_test_done_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('v') | KeyCode::Char('m') => self.open_test_map(),
+            // Same disk type and drive, fresh data.
+            KeyCode::Char('r') => self.screen = Screen::TestConfirm,
+            // Try to bring the flagged tracks back (experimental).
+            KeyCode::Char('c') => {
+                if self.test_problem_tracks().is_empty() {
+                    self.notice = Some("Nothing to condition — no track was flagged.".to_string());
+                } else {
+                    self.screen = Screen::ConditionConfirm;
+                }
+            }
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {
+                self.test_job = None;
+                self.screen = Screen::Menu;
+            }
+            _ => {}
+        }
+    }
+
+    /// Tracks the last test flagged (bad sectors, or needed re-reads).
+    pub fn test_problem_tracks(&self) -> std::collections::BTreeSet<(u32, u32)> {
+        self.test_job
+            .as_ref()
+            .map(|j| gwm_core::disk_test::problem_tracks(&j.passes))
+            .unwrap_or_default()
+    }
+
+    fn on_condition_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Left | KeyCode::Char('-') => self.condition_rounds = self.condition_rounds.saturating_sub(1).max(1),
+            KeyCode::Right | KeyCode::Char('+') => self.condition_rounds = (self.condition_rounds + 1).min(50),
+            KeyCode::Char('e') => self.condition_erase = !self.condition_erase,
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.start_conditioning(),
+            KeyCode::Esc | KeyCode::Char('n') => self.screen = Screen::TestDone,
+            _ => {}
+        }
+    }
+
+    fn start_conditioning(&mut self) {
+        let tracks = self.test_problem_tracks();
+        let Some(job) = self.test_job.as_ref() else { return };
+        if tracks.is_empty() {
+            self.screen = Screen::TestDone;
+            return;
+        }
+        let _ = gwm_core::device::apply_delays(&self.core.settings.tuning);
+        self.condition_job = Some(ConditionJob::start(
+            job.format.clone(),
+            job.drive.clone(),
+            job.geom,
+            tracks,
+            false,
+            self.condition_rounds,
+            self.condition_erase,
+            is_hard_sectored(&job.format),
+        ));
+        self.screen = Screen::Conditioning;
+    }
+
+    fn on_conditioning_key(&mut self, code: KeyCode) {
+        if matches!(code, KeyCode::Esc | KeyCode::Char('c')) {
+            if let Some(job) = self.condition_job.as_mut() {
+                if !job.cancelled {
+                    job.request_cancel();
+                    self.notice = Some("Stopping after gw exits…".to_string());
+                }
+            }
+        }
+    }
+
+    fn on_condition_done_key(&mut self, code: KeyCode) {
+        match code {
+            // Conditioning only touched the flagged tracks: prove the whole disk.
+            KeyCode::Enter | KeyCode::Char('r') => {
+                self.condition_job = None;
+                self.repair_mode = false; // the re-test checks; it doesn't repair again
+                self.screen = Screen::TestConfirm;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.condition_job = None;
+                self.test_job = None;
+                self.screen = Screen::Menu;
+            }
+            _ => {}
+        }
+    }
+
+    /// The circular sector map of the test (worst pass per track), in the
+    /// host's image viewer. Written to the temp folder: a test keeps no image.
+    fn open_test_map(&mut self) {
+        let Some(job) = self.test_job.as_ref() else { return };
+        let tracks = gwm_core::disk_test::track_health(&job.geom, &job.passes);
+        let map = gwm_core::diskmap::DiskMap::from_tracks(format!("Media test · {}", job.format), tracks);
+        let path = std::env::temp_dir().join("lubeshop-media-test.readmap.bmp");
+        match std::fs::write(&path, gwm_core::diskmap::render_bmp(&map)) {
+            Ok(()) => {
+                self.notice = Some(match open_in_viewer(&path) {
+                    Ok(()) => "Sector map opened in your image viewer.".to_string(),
+                    Err(err) => format!("Wrote {} but couldn't open a viewer: {err}", path.display()),
+                })
+            }
+            Err(err) => self.notice = Some(format!("Could not write the sector map: {err}")),
+        }
+    }
+
+    // --- batch read ------------------------------------------------------
+
+    fn enter_batch_read(&mut self) {
+        if !self.gw_ready() {
+            return;
+        }
+        self.open_batch_setup();
+    }
+
+    #[cfg(test)]
+    fn enter_batch_read_for_test(&mut self) {
+        self.open_batch_setup();
+    }
+
+    fn open_batch_setup(&mut self) {
+        self.batch = None;
+        if self.batch_dir.as_os_str().is_empty() || !self.batch_dir.is_dir() {
+            self.batch_dir = self.lib_base();
+        }
+        self.batch_row = 0;
+        self.batch_count_typing = false;
+        self.screen = Screen::BatchSetup;
+    }
+
+    /// Rows on the batch form: name, disks, folder, start.
+    pub const BATCH_ROWS: usize = 4;
+
+    fn on_batch_setup_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let row = self.batch_row;
+        let typing_count = std::mem::take(&mut self.batch_count_typing);
+        match code {
+            KeyCode::Esc => self.screen = Screen::Menu,
+            KeyCode::Up | KeyCode::BackTab => {
+                self.batch_row = row.checked_sub(1).unwrap_or(Self::BATCH_ROWS - 1);
+            }
+            KeyCode::Down | KeyCode::Tab => self.batch_row = (row + 1) % Self::BATCH_ROWS,
+            KeyCode::Enter => match row {
+                0 | 1 => self.batch_row = row + 1,
+                2 => self.open_batch_folder_picker(),
+                _ => self.begin_batch(),
+            },
+            KeyCode::Left | KeyCode::Char('-') if row == 1 => {
+                self.batch_count = self.batch_count.saturating_sub(1).max(1);
+            }
+            KeyCode::Right | KeyCode::Char('+') if row == 1 => {
+                self.batch_count = (self.batch_count + 1).min(99);
+            }
+            KeyCode::Char(c @ '0'..='9') if row == 1 => {
+                let d = c as u32 - '0' as u32;
+                let two_digit = self.batch_count * 10 + d;
+                self.batch_count = if typing_count && two_digit <= 99 {
+                    two_digit
+                } else {
+                    d.max(1)
+                };
+                self.batch_count_typing = true;
+            }
+            _ if row == 0 => edit_input(&mut self.batch_name_input, code, mods),
+            _ => {}
+        }
+    }
+
+    /// The set's name as typed, made safe for a file name.
+    pub fn batch_name(&self) -> String {
+        self.batch_name_input.text().trim().replace(['/', '\\'], "_")
+    }
+
+    fn open_batch_folder_picker(&mut self) {
+        self.move_purpose = MovePurpose::BatchFolder;
+        self.move_item = None;
+        let root = self.core.paths.library_dir.clone();
+        let current = self.batch_dir.clone();
+        // Open at the chosen folder's level, with it highlighted.
+        match current.parent().filter(|p| p.starts_with(&root) && current != root) {
+            Some(parent) => self.load_move_level(parent.to_path_buf(), Some(&current)),
+            None => self.load_move_level(root, None),
+        }
+        self.screen = Screen::LibraryMove;
+    }
+
+    /// The batch's folder was picked (or just made): back to the form, on Start.
+    fn batch_folder_chosen(&mut self, dir: PathBuf) {
+        self.batch_dir = dir;
+        self.move_purpose = MovePurpose::MoveFile;
+        self.batch_row = Self::BATCH_ROWS - 1;
+        self.screen = Screen::BatchSetup;
+    }
+
+    /// Start the set: remember it, then the usual format → drive → options,
+    /// chosen once for every disk.
+    fn begin_batch(&mut self) {
+        let name = self.batch_name();
+        if name.is_empty() {
+            self.notice = Some("Give the disk set a name first — the disks are saved as <name>-disk1, -disk2, …".to_string());
+            self.batch_row = 0;
+            return;
+        }
+        if self.formats.is_empty() {
+            self.formats = formats::list_formats();
+        }
+        if self.formats.is_empty() {
+            self.notice = Some("Could not read the format list from gw.".to_string());
+            return;
+        }
+        self.batch = Some(BatchRead {
+            name,
+            count: self.batch_count,
+            dir: self.batch_dir.clone(),
+            next: 1,
+            results: Vec::new(),
+            stopped: false,
+        });
+        self.flow = Flow::Read;
+        self.format_filter.clear();
+        self.format_state.select(Some(0));
+        self.notice = Some(format!(
+            "Pick the format of the disks — it's used for all {}.",
+            self.batch_count
+        ));
+        self.screen = Screen::FormatPicker;
+    }
+
+    fn on_batch_prompt_key(&mut self, code: KeyCode) {
+        let Some(batch) = self.batch.as_mut() else {
+            self.screen = Screen::Menu;
+            return;
+        };
+        if batch.finished() {
+            match code {
+                // Open the set's folder in the Library.
+                KeyCode::Enter => {
+                    let dir = batch.dir.clone();
+                    self.batch = None;
+                    self.lib_subpath = dir
+                        .strip_prefix(&self.core.paths.library_dir)
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    self.lib_state.select(Some(0));
+                    self.enter_library();
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.batch = None;
+                    self.screen = Screen::Menu;
+                }
+                _ => {}
+            }
+            return;
+        }
+        match code {
+            KeyCode::Enter => self.start_read(),
+            // Skip this disk (missing, or unreadable after a few tries).
+            KeyCode::Char('s') => {
+                let disk = batch.next;
+                batch.record(
+                    BatchDisk { disk, ok: false, file: None, detail: "skipped".to_string() },
+                    true,
+                );
+            }
+            // End the set early; what's been read stays.
+            KeyCode::Esc => batch.stopped = true,
+            _ => {}
+        }
+    }
+
+    /// A batch disk's read finished: note it and wait for the next disk.
+    fn batch_disk_done(&mut self, outcome: Result<String, String>, detail: String) {
+        let Some(batch) = self.batch.as_mut() else {
+            return;
+        };
+        let disk = batch.next;
+        match outcome {
+            Ok(file) => batch.record(BatchDisk { disk, ok: true, file: Some(file), detail }, true),
+            Err(reason) => batch.record(BatchDisk { disk, ok: false, file: None, detail: reason }, false),
+        }
+        self.screen = Screen::BatchPrompt;
+    }
+
+    /// Catalog tags for a read: a batch disk is tagged with its set's name.
+    fn batch_tags(&self) -> Vec<String> {
+        self.batch.as_ref().map(|b| vec![b.name.clone()]).unwrap_or_default()
+    }
+
+    /// Catalog note for a read: a batch disk's says which disk of the set it is.
+    fn batch_note(&self, note: Option<String>) -> Option<String> {
+        match (&self.batch, note) {
+            (Some(b), Some(n)) => Some(format!("Disk {} of {} · {n}", b.next, b.count)),
+            (Some(b), None) => Some(format!("Disk {} of {}", b.next, b.count)),
+            (None, n) => n,
+        }
     }
 
     // --- write lifecycle -------------------------------------------------
@@ -6007,7 +6838,7 @@ mod clean_options {
     /// toggling. Driven through the real key handler.
     #[test]
     fn space_toggles_and_esc_backs_out() {
-        let mut app = App::new(Core::init().unwrap());
+        let mut app = App::new(crate::app::test_core());
         app.screen = Screen::CleanOptions;
         let before = app.core.settings.clean_48tpi;
 
@@ -6047,7 +6878,7 @@ mod format_labels {
 
     #[test]
     fn label_editor_prefills_and_cancels_without_saving() {
-        let mut app = App::new(Core::init().unwrap());
+        let mut app = App::new(crate::app::test_core());
         app.formats = vec!["ibm.1440".to_string()];
         // Decode flow so the read/write-only TI-99 entry isn't injected here.
         app.flow = Flow::Decode;
@@ -6092,7 +6923,7 @@ mod archive_live {
     #[test]
     #[ignore = "hits the live archive.org API"]
     fn live_search_then_files_flow() {
-        let mut app = App::new(Core::init().unwrap());
+        let mut app = App::new(crate::app::test_core());
 
         // Type a query and search, through the real key handlers + worker thread.
         app.screen = Screen::ArchiveSearch;
@@ -6124,7 +6955,47 @@ mod archive_live {
 
 #[cfg(test)]
 mod menu_keys {
-    use super::{menu_key_pos, MENU_ITEMS, MENU_KEYS};
+    use super::{menu_key_pos, App, KeyCode, KeyModifiers, Screen, MENU_ITEMS, MENU_KEYS};
+
+    /// Arrows and Tab walk the columns; rows wrap within a column and are
+    /// kept (or clamped) when changing column.
+    #[test]
+    fn arrows_and_tab_move_between_and_within_columns() {
+        let mut app = App::new(crate::app::test_core());
+        app.screen = Screen::Menu;
+        app.menu_index = 0;
+        let key = |app: &mut App, k| app.test_key(k, KeyModifiers::NONE);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.menu_index, 1, "Batch read");
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.menu_index, 16, "row 1 of Diagnostic / Repair: Repair / condition a disk");
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.menu_index, 13, "row 1 of Settings: Tools");
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.menu_index, 1, "wraps back to I/O");
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.menu_index, 13, "Shift+Tab goes the other way");
+        // A long column's low row clamps into a shorter one.
+        app.menu_index = 12; // Import from archive.org, row 6
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.menu_index, 6, "last row of Diagnostic / Repair: Reset the device");
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.menu_index, 3, "wraps to the top of the column");
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.menu_index, 6);
+        key(&mut app, KeyCode::Left);
+        assert_eq!(app.menu_index, 11, "row 5 of I/O: New image");
+    }
+
+    #[test]
+    fn every_item_is_in_exactly_one_column() {
+        let mut all: Vec<usize> = super::MENU_COLUMNS.iter().flat_map(|(_, items)| items.iter().copied()).collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..MENU_ITEMS.len()).collect::<Vec<_>>());
+        assert_eq!(super::menu_position(0), (0, 0));
+        assert_eq!(super::menu_position(3), (1, 0), "Test disk media heads Diagnostic / Repair");
+        assert_eq!(super::menu_position(15), (2, 3), "Quit is last in Settings");
+    }
 
     #[test]
     fn every_menu_item_has_a_unique_letter_that_is_in_its_label() {
@@ -6139,5 +7010,546 @@ mod menu_keys {
         assert_eq!(menu_key_pos("Reset the device", 'e'), Some(1));
         assert_eq!(menu_key_pos("Clean drive", 'v'), Some(9));
         assert_eq!(menu_key_pos("Import from archive.org", 'a'), Some(12));
+    }
+}
+
+#[cfg(test)]
+mod move_picker {
+    use super::*;
+    use gwm_core::models::{MediaItem, MediaKind, Source};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn item(id: i64, path: &Path) -> MediaItem {
+        MediaItem {
+            id,
+            kind: MediaKind::Image,
+            path: path.to_string_lossy().into_owned(),
+            format: None,
+            system: None,
+            size_bytes: 0,
+            sha256: None,
+            source: Source::Import,
+            remote_id: None,
+            tags: Vec::new(),
+            notes: None,
+            fs_format: None,
+            fs_driver: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn screen_text(app: &mut App) -> String {
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| crate::ui::render(app, f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The picker shows one level at a time: top-level folders first, `›` on
+    /// the ones with sub-folders, → to open, ← back up to the folder you left,
+    /// and the highlighted destination's full path in the header. Junk, hidden
+    /// and `originals/` folders stay out, as in the library view.
+    #[test]
+    fn walks_folders_one_level_at_a_time() {
+        let root = std::env::temp_dir().join(format!("gwm-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["Games/Arcade", "Games/Empty", "Utils", ".hidden", "junk", "originals"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("junk/readme"), "not an image").unwrap();
+        std::fs::write(root.join("Games/Arcade/pac.img"), "x").unwrap();
+        std::fs::write(root.join("top.img"), "x").unwrap();
+
+        let mut app = App::new(crate::app::test_core());
+        app.core.paths.library_dir = root.clone();
+        app.library = vec![item(1, &root.join("top.img")), item(2, &root.join("Games/Arcade/pac.img"))];
+        app.move_item = Some((1, root.join("top.img").to_string_lossy().into_owned(), "top.img".into()));
+        app.load_move_level(root.clone(), None);
+        app.screen = Screen::LibraryMove;
+
+        let games = root.join("Games");
+        assert_eq!(app.move_targets, vec![root.clone(), games.clone(), root.join("Utils")]);
+        assert_eq!(app.move_has_children, vec![false, true, false]);
+        assert_eq!(app.move_state.selected(), Some(1), "starts on the first folder");
+
+        let text = screen_text(&mut app);
+        assert!(text.contains("Move “top.img” to:"), "{text}");
+        assert!(text.contains("⌂ store / Games"), "{text}");
+        assert!(text.contains("Games  ›"), "{text}");
+        assert!(text.contains("store root (top level)  (it's here now)"), "{text}");
+        assert!(!text.contains("Arcade"), "sub-folders stay hidden until opened");
+
+        // → opens Games; the header follows the highlight.
+        app.test_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.move_dir, games);
+        assert_eq!(app.move_targets, vec![games.clone(), games.join("Arcade"), games.join("Empty")]);
+        let text = screen_text(&mut app);
+        assert!(text.contains("⌂ store / Games / Arcade"), "{text}");
+        assert!(text.contains("this folder"), "{text}");
+
+        // The "this folder" row targets the level itself.
+        app.test_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.move_state.selected(), Some(0));
+        let text = screen_text(&mut app);
+        let header = text.lines().find(|l| l.contains("⌂ store")).unwrap_or_default();
+        assert_eq!(header.trim(), "⌂ store / Games", "{text}");
+
+        // ← goes back up and lands on the folder we came out of.
+        app.test_key(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.move_dir, root);
+        assert_eq!(app.move_state.selected(), Some(1));
+
+        // → opens even a folder with nothing below (to make one inside it);
+        // ← comes back, and ← at the top does nothing.
+        app.test_key(KeyCode::Down, KeyModifiers::NONE);
+        app.test_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.move_dir, root.join("Utils"));
+        assert_eq!(app.move_targets, vec![root.join("Utils")]);
+        app.test_key(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.move_dir, root);
+        assert_eq!(app.move_state.selected(), Some(2));
+        app.test_key(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(app.move_dir, root);
+
+        // The last row is "new folder…", and its header says where it will go.
+        app.test_key(KeyCode::Down, KeyModifiers::NONE);
+        assert!(screen_text(&mut app).contains("⌂ store / + new folder…"));
+
+        app.test_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::Library);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod batch_read {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn screen_text(app: &mut App) -> String {
+        let mut t = Terminal::new(TestBackend::new(110, 32)).unwrap();
+        t.draw(|f| crate::ui::render(app, f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn keys(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.test_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn file_names_count_up_and_never_overwrite() {
+        let dir = std::env::temp_dir().join(format!("gwm-batch-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(batch_file_path(&dir, "Lotus 1-2-3", 2, "img"), dir.join("Lotus 1-2-3-disk2.img"));
+        std::fs::write(dir.join("Lotus 1-2-3-disk2.img"), "x").unwrap();
+        assert_eq!(batch_file_path(&dir, "Lotus 1-2-3", 2, "img"), dir.join("Lotus 1-2-3-disk2 (2).img"));
+        assert_eq!(batch_file_path(&dir, "a/b", 1, "scp"), dir.join("a_b-disk1.scp"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole set-up → prompt → summary path, driven through the real key
+    /// handler. Reads are fed in as outcomes (no drive needed).
+    #[test]
+    fn set_up_pick_folder_then_read_skip_and_retry_disks() {
+        let root = std::env::temp_dir().join(format!("gwm-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("PC")).unwrap();
+
+        let mut app = App::new(crate::app::test_core());
+        app.core.paths.library_dir = root.clone();
+        app.library.clear();
+        app.lib_subpath = PathBuf::new();
+        app.formats = vec!["ibm.360".to_string()];
+        app.batch_dir = PathBuf::new();
+        app.screen = Screen::Menu;
+        app.enter_batch_read_for_test();
+        assert_eq!(app.screen, Screen::BatchSetup);
+        assert_eq!(app.batch_dir, root);
+
+        // Name, then a two-digit count typed as digits, then back to 4.
+        keys(&mut app, "Lotus 1-2-3");
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.batch_row, 1);
+        keys(&mut app, "12");
+        assert_eq!(app.batch_count, 12);
+        keys(&mut app, "4");
+        assert_eq!(app.batch_count, 4, "a third digit starts over");
+        app.test_key(KeyCode::Left, KeyModifiers::NONE);
+        app.test_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.batch_count, 4);
+
+        let text = screen_text(&mut app);
+        assert!(text.contains("Saved as Lotus 1-2-3-disk1 … Lotus 1-2-3-disk4"), "{text}");
+
+        // Folder row → the level-by-level picker, in batch mode.
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::LibraryMove);
+        assert!(screen_text(&mut app).contains("Save the disk set in:"));
+        // The picker starts on the first folder (PC): choose it. Then make a
+        // new folder inside it, which is pre-named after the set.
+        assert_eq!(app.move_state.selected(), Some(1));
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::BatchSetup, "picking a folder returns to the form");
+        assert_eq!(app.batch_dir, root.join("PC"));
+        app.batch_row = 2;
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        // Reopened at PC's level with PC highlighted; → steps inside it.
+        assert_eq!(app.move_dir, root);
+        app.test_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.move_dir, root.join("PC"));
+        let new_row = app.move_targets.len();
+        app.move_state.select(Some(new_row));
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::NewFolder);
+        assert_eq!(app.folder_input.text(), "Lotus 1-2-3");
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        let set_dir = root.join("PC").join("Lotus 1-2-3");
+        assert!(set_dir.is_dir());
+        assert_eq!(app.batch_dir, set_dir);
+        assert_eq!((app.screen, app.batch_row), (Screen::BatchSetup, 3));
+
+        // Start → the format picker for the whole set; Esc comes back to the form.
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::FormatPicker);
+        assert!(app.batch.is_some());
+        app.test_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::BatchSetup);
+        assert!(app.batch.is_none());
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        // (Format and drive pickers are the ordinary Read flow.)
+        app.chosen_format = "ibm.360".to_string();
+        app.chosen_drive = "a".to_string();
+        app.read_raw_flux = false;
+        app.screen = Screen::ReadOptions;
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::BatchPrompt);
+        assert_eq!(app.read_out_path(), set_dir.join("Lotus 1-2-3-disk1.img"));
+        let text = screen_text(&mut app);
+        assert!(text.contains("Put disk 1 of 4 in drive A and press Enter."), "{text}");
+
+        // Disk 1 reads; its catalog note says which disk it is.
+        assert_eq!(app.batch_note(Some("720/720 sectors (100%)".into())).unwrap(), "Disk 1 of 4 · 720/720 sectors (100%)");
+        assert_eq!(app.batch_tags(), vec!["Lotus 1-2-3".to_string()]);
+        app.batch_disk_done(Ok("Lotus 1-2-3-disk1.img".into()), "720/720 sectors (100%)".into());
+        assert_eq!(app.read_out_path(), set_dir.join("Lotus 1-2-3-disk2.img"));
+
+        // Disk 2 fails: it stays current, and the prompt offers a retry.
+        app.batch_disk_done(Err("Track 0 not found".into()), String::new());
+        let text = screen_text(&mut app);
+        assert!(text.contains("Disk 2 didn't read"), "{text}");
+        assert!(text.contains("Track 0 not found"), "{text}");
+        // …then reads on the retry.
+        app.batch_disk_done(Ok("Lotus 1-2-3-disk2.img".into()), "720/720 sectors (100%)".into());
+        // Disk 3 is skipped, disk 4 reads.
+        app.test_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        app.batch_disk_done(Ok("Lotus 1-2-3-disk4.img".into()), "719/720 sectors (99%)".into());
+
+        let batch = app.batch.clone().unwrap();
+        assert!(batch.finished());
+        assert_eq!(batch.results.iter().map(|r| (r.disk, r.ok)).collect::<Vec<_>>(),
+                   vec![(1, true), (2, true), (3, false), (4, true)]);
+        let text = screen_text(&mut app);
+        assert!(text.contains("3 of 4 disks read."), "{text}");
+        assert!(text.contains("skipped"), "{text}");
+        assert!(!text.contains("Track 0 not found"), "a retried disk shows its latest result");
+
+        // Enter opens the set's folder in the Library.
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::Library);
+        assert_eq!(app.lib_subpath, PathBuf::from("PC/Lotus 1-2-3"));
+        assert!(app.batch.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Esc part-way ends the set and shows what was read.
+    #[test]
+    fn esc_ends_the_set_early() {
+        let mut app = App::new(crate::app::test_core());
+        app.batch = Some(BatchRead {
+            name: "Set".into(),
+            count: 3,
+            dir: std::env::temp_dir(),
+            next: 1,
+            results: Vec::new(),
+            stopped: false,
+        });
+        app.screen = Screen::BatchPrompt;
+        app.batch_disk_done(Ok("Set-disk1.img".into()), String::new());
+        app.test_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.batch.as_ref().unwrap().finished());
+        assert!(screen_text(&mut app).contains("1 of 3 disks read."));
+        app.test_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::Menu);
+        assert!(app.batch.is_none());
+    }
+}
+
+#[cfg(test)]
+mod disk_test_screens {
+    use super::*;
+    use gwm_core::disk_test::{Geometry, PassResult, SectorAt};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn screen_text(app: &mut App) -> String {
+        let mut t = Terminal::new(TestBackend::new(110, 36)).unwrap();
+        t.draw(|f| crate::ui::render(app, f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Media list → drive → an erase confirmation that Esc backs out of.
+    /// Nothing here starts the test itself: that would write to the drive.
+    #[test]
+    fn media_pick_leads_to_an_erase_confirmation() {
+        if gwm_core::disk_test::geometry("ibm.360").is_none() {
+            return; // no gw definitions on this machine (CI)
+        }
+        let mut app = App::new(crate::app::test_core());
+        app.flow = Flow::DiskTest;
+        app.screen = Screen::TestMedia;
+        let text = screen_text(&mut app);
+        assert!(text.contains("What kind of disk is it?") && text.contains("Other format…"), "{text}");
+        // Down to "5.25" DD · 40 track, double-sided (360 KB)".
+        for _ in 0..4 {
+            app.test_key(KeyCode::Down, KeyModifiers::NONE);
+        }
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.chosen_format, "ibm.360");
+        assert_eq!(app.screen, Screen::DrivePicker);
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::TestConfirm);
+        let text = screen_text(&mut app);
+        assert!(text.contains("This ERASES everything on the disk in drive"), "{text}");
+        assert!(text.contains("40 tracks × 2 sides · 720 sectors"), "{text}");
+        app.test_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::DrivePicker);
+        assert!(app.test_job.is_none(), "backing out never starts a test");
+        app.test_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::TestMedia);
+    }
+
+    /// A formats the test can't build a reference for is turned away up front.
+    #[test]
+    fn non_ibm_formats_are_refused_before_the_drive_is_touched() {
+        let mut app = App::new(crate::app::test_core());
+        app.chosen_format = "amiga.amigados".to_string();
+        app.screen = Screen::TestMedia;
+        app.choose_test_format();
+        assert_eq!(app.screen, Screen::TestMedia);
+        assert!(app.notice.as_deref().unwrap_or("").contains("can't be media-tested"));
+    }
+
+    #[test]
+    fn result_screen_shows_verdict_track_map_and_bad_sectors() {
+        let geom = Geometry { cyls: 40, heads: 2, secs: 9, bps: 512 };
+        let mut p1 = PassResult { pass: 1, ..Default::default() };
+        p1.retried.insert((20, 1));
+        let mut p2 = PassResult { pass: 2, ..Default::default() };
+        p2.bad = vec![SectorAt { cyl: 33, head: 0, sector: 4 }, SectorAt { cyl: 33, head: 0, sector: 5 }];
+        let mut app = App::new(crate::app::test_core());
+        app.test_media_label = "5.25\" DD · 40 track, double-sided (360 KB)".into();
+        app.test_job = Some(DiskTestJob::finished_for_test("ibm.360", geom, vec![p1, p2]));
+        app.screen = Screen::TestDone;
+        let text = screen_text(&mut app);
+        assert!(text.contains("Bad disk"), "{text}");
+        assert!(text.contains("Pass 1 (random data)  all data correct; 1 track needed re-reads"), "{text}");
+        assert!(text.contains("Pass 2 (inverse pattern)  2 sectors didn't come back as written"), "{text}");
+        assert!(text.contains("33.0:4  33.0:5"), "{text}");
+        let side0 = text.lines().find(|l| l.contains("side 0")).unwrap();
+        assert_eq!(side0.matches('✗').count(), 1, "one bad track on side 0: {side0}");
+        let side1 = text.lines().find(|l| l.contains("side 1")).unwrap();
+        assert_eq!(side1.matches('▒').count(), 1, "{side1}");
+    }
+}
+
+#[cfg(test)]
+mod condition_screens {
+    use super::*;
+    use crate::condition_job::ConditionJob;
+    use gwm_core::disk_test::{ConditionEnd, ConditionRound, Geometry, PassResult, SectorAt};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const G: Geometry = Geometry { cyls: 40, heads: 2, secs: 9, bps: 512 };
+
+    fn screen_text(app: &mut App) -> String {
+        let mut t = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        t.draw(|f| crate::ui::render(app, f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn tested_app() -> App {
+        let mut p = PassResult { pass: 1, ..Default::default() };
+        p.bad = vec![SectorAt { cyl: 33, head: 0, sector: 4 }];
+        p.retried.insert((20, 1));
+        let mut app = App::new(crate::app::test_core());
+        app.chosen_drive = "a".into();
+        app.test_job = Some(DiskTestJob::finished_for_test("ibm.360", G, vec![p, PassResult { pass: 2, ..Default::default() }]));
+        app.screen = Screen::TestDone;
+        app
+    }
+
+    /// `c` from a flagged test → confirm (with the tracks and a cycle limit),
+    /// and Esc backs out without starting anything.
+    #[test]
+    fn c_offers_repair_for_flagged_tracks_only() {
+        let mut app = tested_app();
+        assert!(screen_text(&mut app).contains("c repair the flagged tracks (experimental)"));
+        app.test_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::ConditionConfirm);
+        let text = screen_text(&mut app);
+        assert!(text.contains("2 tracks (cyl.side)  20.1  33.0"), "{text}");
+        assert!(text.contains("Cycle limit            ◂ 20 ▸"), "{text}");
+        assert!(text.contains("Erase before each write  [x]"), "{text}");
+        app.test_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(!app.condition_erase);
+        assert!(screen_text(&mut app).contains("Erase before each write  [ ]"));
+        app.test_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(app.condition_erase);
+        for _ in 0..30 {
+            app.test_key(KeyCode::Left, KeyModifiers::NONE);
+        }
+        assert_eq!(app.condition_rounds, 1);
+        for _ in 0..80 {
+            app.test_key(KeyCode::Right, KeyModifiers::NONE);
+        }
+        assert_eq!(app.condition_rounds, 50);
+        app.test_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::TestDone);
+        assert!(app.condition_job.is_none());
+
+        // A clean test has nothing to repair.
+        let mut clean = tested_app();
+        clean.test_job.as_mut().unwrap().passes = vec![PassResult::default()];
+        clean.test_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(clean.screen, Screen::TestDone);
+    }
+
+    /// A whole-disk repair: tracks good on the first write aren't "repairs";
+    /// the confirmed ones are listed with the cycle they started reading good
+    /// on, relapses are noted, and the ones that never held are called out.
+    #[test]
+    fn whole_disk_result_lists_repairs_and_failures() {
+        use gwm_core::disk_test::TrackOutcome;
+        let mut app = tested_app();
+        let start: BTreeSet<_> = gwm_core::disk_test::all_tracks(&G);
+        let mut outcomes: BTreeMap<(u32, u32), TrackOutcome> =
+            start.iter().map(|&t| (t, TrackOutcome::GoodFirstTime)).collect();
+        outcomes.insert((33, 0), TrackOutcome::Failed);
+        outcomes.insert((20, 1), TrackOutcome::Repaired { cycle: 3 });
+        outcomes.insert((21, 1), TrackOutcome::Repaired { cycle: 2 });
+        let relapsed: BTreeSet<_> = [(20, 1)].into_iter().collect();
+        let r = |round, tracks, healed, bad, retried| ConditionRound { round, tracks, healed, bad_sectors: bad, retried, ..Default::default() };
+        let mut history = vec![r(1, 80, 77, 5, 2), r(2, 3, 1, 3, 1), r(3, 2, 1, 2, 0)];
+        history.extend((4..=20).map(|n| r(n, 1, 0, 2, 0)));
+        app.condition_job = Some(ConditionJob::finished_for_test(G, true, start, outcomes, relapsed, history, ConditionEnd::CycleLimit, 20));
+        app.screen = Screen::ConditionDone;
+        let text = screen_text(&mut app);
+        assert!(text.contains("1 track still failed after 20 cycles"), "{text}");
+        assert!(text.contains("77 tracks were good on the first write. 3 needed repair: 2 repaired, 1 still failing."), "{text}");
+        assert!(text.contains("Repaired (cyl.side, on cycle)  20.1 (3)  21.1 (2)"), "{text}");
+        assert!(text.contains("Still failing (cyl.side)  33.0"), "{text}");
+        assert!(text.contains("Read good, then failed again while confirming (1 track)  20.1"), "{text}");
+        // Enter goes to a full test confirmation, not straight to writing.
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::TestConfirm);
+        assert!(!app.repair_mode);
+    }
+}
+
+#[cfg(test)]
+mod repair_entry {
+    use super::*;
+    use gwm_core::disk_test::{Geometry, PassResult};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn screen_text(app: &mut App) -> String {
+        let mut t = Terminal::new(TestBackend::new(110, 36)).unwrap();
+        t.draw(|f| crate::ui::render(app, f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// It's on the main menu, under Diagnostic / Repair, with its own letter.
+    #[test]
+    fn repair_is_a_visible_menu_item() {
+        let mut app = App::new(crate::app::test_core());
+        app.screen = Screen::Menu;
+        let text = screen_text(&mut app);
+        assert!(text.contains("Repair / condition a disk"), "{text}");
+        assert_eq!(menu_position(16), (1, 1), "second in Diagnostic / Repair");
+    }
+
+    /// Same media pick, but repair wording and a round limit on the confirm.
+    /// (Starting it would erase the disk in the drive, so the test stops at
+    /// the confirmation.)
+    #[test]
+    fn repair_flow_confirms_with_a_round_limit() {
+        if gwm_core::disk_test::geometry("ibm.720").is_none() {
+            return; // no gw definitions on this machine (CI)
+        }
+        let mut app = App::new(crate::app::test_core());
+        // The menu letter for it, then what enter_disk_repair sets up (the real
+        // entry refuses without a probed device, which tests never touch).
+        assert_eq!(MENU_KEYS[16], 'o');
+        app.repair_mode = true;
+        app.flow = Flow::DiskTest;
+        app.screen = Screen::TestMedia;
+        assert!(screen_text(&mut app).contains("Repair a disk (experimental)"));
+        app.test_key(KeyCode::Down, KeyModifiers::NONE);
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE); // 3.5" DD
+        app.test_key(KeyCode::Enter, KeyModifiers::NONE); // drive
+        assert_eq!(app.screen, Screen::TestConfirm);
+        let text = screen_text(&mut app);
+        assert!(text.contains("Cycle limit  ◂ 20 ▸"), "{text}");
+        assert!(text.contains("Erase before each write  [x]"), "{text}");
+        assert!(text.contains("rewritten with its bits flipped"), "{text}");
+        assert!(!text.contains("Pass 1 writes"), "repair doesn't run the two-pass test: {text}");
+        app.test_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(app.condition_rounds, 21);
+        app.test_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.test_job.is_none());
+    }
+
+    /// The repair entry never runs a test first: a finished test in repair
+    /// mode just shows its result (no conditioning is started behind it).
+    #[test]
+    fn a_test_never_chains_into_repair() {
+        let mut app = App::new(crate::app::test_core());
+        app.repair_mode = true;
+        let geom = Geometry { cyls: 80, heads: 2, secs: 9, bps: 512 };
+        let mut p = PassResult { pass: 1, ..Default::default() };
+        p.retried.insert((3, 0));
+        app.test_job = Some(DiskTestJob::finished_for_test("ibm.720", geom, vec![p]));
+        app.test_finished();
+        assert_eq!(app.screen, Screen::TestDone);
+        assert!(app.condition_job.is_none());
     }
 }

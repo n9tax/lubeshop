@@ -4,8 +4,10 @@
 
 mod app;
 mod convert_job;
+mod condition_job;
 mod count_job;
 mod diag_job;
+mod disk_test_job;
 mod download_job;
 mod file_browser;
 mod gotek_job;

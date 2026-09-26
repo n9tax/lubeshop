@@ -11,11 +11,13 @@ pub mod cbm_disk;
 pub mod convert;
 pub mod device;
 pub mod diag;
+pub mod disk_test;
 pub mod diskmap;
 pub mod error;
 pub mod formats;
 pub mod imagefs;
 pub mod library;
+pub mod mac_disk;
 pub mod models;
 pub mod paths;
 pub mod proc;
@@ -41,6 +43,12 @@ pub use error::{CoreError, Result};
 pub use paths::AppPaths;
 pub use settings::Settings;
 
+/// True when the process must not touch the Greaseweazle (automated tests):
+/// the `LUBESHOP_NO_DEVICE` environment variable is set.
+pub fn no_device() -> bool {
+    std::env::var_os("LUBESHOP_NO_DEVICE").is_some()
+}
+
 /// The bundle of services a front-end builds on: resolved paths, an open
 /// catalog, user settings, and the current status of the `gw` tool.
 pub struct Core {
@@ -48,6 +56,9 @@ pub struct Core {
     pub catalog: Catalog,
     pub gw: GwStatus,
     pub settings: Settings,
+    /// Set when `settings.toml` was present but unreadable (see
+    /// [`Settings::load_checked`]); the front-end should show it once.
+    pub settings_problem: Option<String>,
 }
 
 impl Core {
@@ -84,17 +95,24 @@ impl Core {
         // format picker offers them and gw is handed `--diskdefs` when one is
         // chosen (see formats::diskdefs_arg).
         formats::load_user_diskdefs(&paths.user_diskdefs());
-        let settings = Settings::load(&paths.store_dir);
+        let (settings, settings_problem) = Settings::load_checked(&paths.store_dir);
         let catalog = Catalog::open(&paths.db_path)?;
-        let gw = device::probe();
+        // Both of these talk to the Greaseweazle. gw opens its serial port
+        // shared, so a probe from a test run can land in the middle of a real
+        // read or write in a running app and garble it. Test harnesses set
+        // LUBESHOP_NO_DEVICE to keep their hands off the hardware.
+        let gw = if no_device() { device::GwStatus::not_probed() } else { device::probe() };
         // Push any saved drive-delay tuning to the device (best-effort).
-        let _ = device::apply_delays(&settings.tuning);
+        if !no_device() {
+            let _ = device::apply_delays(&settings.tuning);
+        }
 
         let core = Self {
             paths,
             catalog,
             gw,
             settings,
+            settings_problem,
         };
         // Make sure the store has a settings.toml going forward.
         let _ = core.save_settings();
@@ -125,10 +143,15 @@ impl Core {
         // Re-open the catalog at the new location and adopt its settings if it
         // already has some; otherwise seed it with the settings we carried over.
         self.catalog = Catalog::open(&self.paths.db_path)?;
+        self.settings_problem = None;
         if self.paths.settings_file().exists() {
-            self.settings = Settings::load(&self.paths.store_dir);
+            let (settings, problem) = Settings::load_checked(&self.paths.store_dir);
+            self.settings = settings;
+            self.settings_problem = problem;
             // Re-apply tuning from the newly-loaded settings.
-            let _ = device::apply_delays(&self.settings.tuning);
+            if !no_device() {
+                let _ = device::apply_delays(&self.settings.tuning);
+            }
         }
         // NB: importing the new store's existing files is done by the caller in
         // the *background* (a big folder's hashing must not block the UI) — see

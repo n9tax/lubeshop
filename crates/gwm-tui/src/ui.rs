@@ -11,13 +11,13 @@ use std::path::Path;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use gwm_core::library::{human_size, Integrity};
 use gwm_core::models::MediaItem;
 
-use crate::app::{menu_key_pos, App, Focus, LibRow, Screen, DRIVE_OPTIONS, MENU_ITEMS, MENU_KEYS, TUNE_PARAMS};
+use crate::app::{menu_key_pos, menu_position, MENU_COLUMNS, App, Focus, LibRow, Screen, DRIVE_OPTIONS, MENU_ITEMS, MENU_KEYS, SETTINGS_DIAG_ROW, TUNE_PARAMS};
 use crate::count_job::CountState;
 use crate::version_job::VersionState;
 use crate::text_input::TextInput;
@@ -100,6 +100,15 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::DrivePicker => render_drive_picker(app, frame, chunks[1]),
         Screen::NameInput => render_name_input(app, frame, chunks[1]),
         Screen::ReadOptions => render_read_options(app, frame, chunks[1]),
+        Screen::BatchSetup => render_batch_setup(app, frame, chunks[1]),
+        Screen::TestMedia => render_test_media(app, frame, chunks[1]),
+        Screen::TestConfirm => render_test_confirm(app, frame, chunks[1]),
+        Screen::Testing => render_testing(app, frame, chunks[1]),
+        Screen::TestDone => render_test_done(app, frame, chunks[1]),
+        Screen::ConditionConfirm => render_condition_confirm(app, frame, chunks[1]),
+        Screen::Conditioning => render_conditioning(app, frame, chunks[1]),
+        Screen::ConditionDone => render_condition_done(app, frame, chunks[1]),
+        Screen::BatchPrompt => render_batch_prompt(app, frame, chunks[1]),
         Screen::Reading | Screen::ReadDone => render_reading(app, frame, chunks[1]),
         Screen::Converting => render_converting(app, frame, chunks[1]),
         Screen::IpfChoice => render_ipf_choice(app, frame, chunks[1]),
@@ -213,36 +222,74 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_menu(app: &App, frame: &mut Frame, area: Rect) {
-    let items: Vec<ListItem> = MENU_ITEMS
-        .iter()
-        .enumerate()
-        .map(|(i, label)| {
-            let selected = i == app.menu_index;
-            let (marker, style) = if selected { ("▸ ", hl()) } else { ("  ", base()) };
-            // Underline the accelerator letter (see MENU_KEYS).
-            let mut spans = vec![Span::styled(marker.to_string(), style)];
-            match MENU_KEYS.get(i).and_then(|k| menu_key_pos(label, *k)) {
-                Some(p) => {
-                    let (head, rest) = label.split_at(p);
-                    let mut it = rest.chars();
-                    let letter = it.next().map(|c| c.to_string()).unwrap_or_default();
-                    let tail: String = it.collect();
-                    spans.push(Span::styled(head.to_string(), style));
-                    spans.push(Span::styled(letter, style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD)));
-                    spans.push(Span::styled(tail, style));
-                }
-                None => spans.push(Span::styled(label.to_string(), style)),
+    // One menu row: marker, label with its accelerator letter underlined.
+    let item = |i: usize| -> ListItem<'static> {
+        let label = MENU_ITEMS[i];
+        let selected = i == app.menu_index;
+        let (marker, style) = if selected { ("▸ ", hl()) } else { ("  ", base()) };
+        let mut spans = vec![Span::styled(marker.to_string(), style)];
+        match MENU_KEYS.get(i).and_then(|k| menu_key_pos(label, *k)) {
+            Some(p) => {
+                let (head, rest) = label.split_at(p);
+                let mut it = rest.chars();
+                let letter = it.next().map(|c| c.to_string()).unwrap_or_default();
+                let tail: String = it.collect();
+                spans.push(Span::styled(head.to_string(), style));
+                spans.push(Span::styled(letter, style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD)));
+                spans.push(Span::styled(tail, style));
             }
-            // The RPM item carries a live "testing…"/result note beside its label.
-            if *label == "Test drive RPM" {
-                if let Some(note) = app.rpm_menu_note() {
-                    spans.push(Span::styled(format!("   {note}"), dim()));
-                }
+            None => spans.push(Span::styled(label.to_string(), style)),
+        }
+        // The RPM item carries a live "testing…"/result note beside its label.
+        if label == "Test drive RPM" {
+            if let Some(note) = app.rpm_menu_note() {
+                spans.push(Span::styled(format!("   {note}"), dim()));
             }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-    frame.render_widget(List::new(items).style(base()).block(bordered("Main Menu")), area);
+        }
+        ListItem::new(Line::from(spans))
+    };
+    let (active, _) = menu_position(app.menu_index);
+
+    // Too narrow for three columns side by side: stack the groups instead.
+    if area.width < 78 {
+        let mut items = Vec::new();
+        let mut selected_row = 0;
+        for (c, (title, members)) in MENU_COLUMNS.iter().enumerate() {
+            if c > 0 {
+                items.push(ListItem::new(Line::from("")));
+            }
+            let style = if c == active { accented().add_modifier(Modifier::BOLD) } else { dim() };
+            items.push(ListItem::new(Line::from(Span::styled(format!(" {title}"), style))));
+            for &i in members.iter() {
+                if i == app.menu_index {
+                    selected_row = items.len();
+                }
+                items.push(item(i));
+            }
+        }
+        // Stateful so a short terminal scrolls to keep the cursor in view.
+        let mut state = ListState::default().with_selected(Some(selected_row));
+        frame.render_stateful_widget(List::new(items).style(base()).block(bordered("Main Menu")), area, &mut state);
+        return;
+    }
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(37), Constraint::Percentage(35), Constraint::Percentage(28)])
+        .split(area);
+    for (c, (title, members)) in MENU_COLUMNS.iter().enumerate() {
+        let mut block = bordered(title);
+        // The column holding the cursor gets an accent border.
+        if c == active {
+            block = block.border_style(Style::default().fg(theme().accent).bg(theme().bg));
+        } else {
+            block = block.title_style(dim());
+        }
+        let items: Vec<ListItem> = std::iter::once(ListItem::new(Line::from("")))
+            .chain(members.iter().map(|&i| item(i)))
+            .collect();
+        frame.render_widget(List::new(items).style(base()).block(block), cols[c]);
+    }
 }
 
 fn render_library(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -1621,11 +1668,23 @@ fn render_settings(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         format!("{} override(s) — Enter", app.core.settings.tuning.len())
     };
+    let diag_cmd = app
+        .core
+        .settings
+        .diag_command
+        .clone()
+        .unwrap_or_else(|| "(auto)".to_string());
+    let diag = if app.diag_supported {
+        format!("{diag_cmd}  ✓ works")
+    } else {
+        format!("{diag_cmd}  ✗ not working — Enter to set")
+    };
     let rows = [
         ("Theme", format!("{}  —  {}", app.theme.name, app.theme.desc)),
         ("Store folder (all data)", storage),
         ("Default drive", drive),
         ("Drive tuning (gw delays)", tuning),
+        ("Drive diagnostic command", diag),
     ];
 
     let mut lines = vec![Line::from("")];
@@ -1633,9 +1692,10 @@ fn render_settings(app: &App, frame: &mut Frame, area: Rect) {
         let selected = i == app.settings_index;
         let marker = if selected { "▸ " } else { "  " };
         let label_style = if selected { accented() } else { base() };
-        if i == 1 && app.settings_editing {
+        if app.settings_editing && (i == 1 || i == SETTINGS_DIAG_ROW) && selected {
             let mut spans = vec![Span::styled(format!("{marker}{label}: "), label_style)];
-            spans.extend(input_spans(&app.storage_input));
+            let input = if i == 1 { &app.storage_input } else { &app.diag_input };
+            spans.extend(input_spans(input));
             lines.push(Line::from(spans));
         } else {
             lines.push(Line::from(vec![
@@ -1657,6 +1717,16 @@ fn render_settings(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled(" danger ", Style::default().fg(Color::White).bg(theme().danger)),
     ]));
     lines.push(Line::from(""));
+    if app.settings_index == SETTINGS_DIAG_ROW {
+        for text in [
+            "  The live drive diagnostic needs the Greaseweazle diagnostic fork. Leave",
+            "  this blank to use the one Tools installs (gw-diag); otherwise type the",
+            "  full path to that build's gw, e.g. C:\\gw-diag\\gw.exe. Enter saves and tests it.",
+        ] {
+            lines.push(Line::from(Span::styled(text, dim())));
+        }
+        lines.push(Line::from(""));
+    }
     lines.push(Line::from(Span::styled(
         "  ↑/↓ row · ←/→ change · Enter edit/cycle · Esc back",
         dim(),
@@ -1755,36 +1825,624 @@ fn render_tuning_profiles(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_library_move(app: &mut App, frame: &mut Frame, area: Rect) {
-    let name = app.move_item_name().unwrap_or("this image").to_string();
+    let heading = if app.move_purpose == crate::app::MovePurpose::BatchFolder {
+        "  Save the disk set in:".to_string()
+    } else {
+        format!("  Move “{}” to:", app.move_item_name().unwrap_or("this image"))
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
         .split(area);
+
+    // Where Enter would put the file: the highlighted folder, or a new folder
+    // made at this level. The end of a long path is what differs, so keep it.
+    let selected = app.move_state.selected().unwrap_or(0);
+    let dest = match app.move_targets.get(selected) {
+        Some(dir) => app.move_path_display(dir),
+        None => format!("{} / + new folder…", app.move_path_display(&app.move_dir)),
+    };
+    let dest = keep_tail(&dest, rows[0].width.saturating_sub(4) as usize);
     frame.render_widget(
-        para(vec![Line::from(Span::styled(format!("  Move “{name}” into:"), dim()))]),
+        para(vec![
+            Line::from(Span::styled(heading, dim())),
+            Line::from(Span::styled(format!("  {dest}"), accented())),
+        ]),
         rows[0],
     );
 
-    let mut items: Vec<ListItem> = app
-        .move_targets
-        .iter()
-        .map(|dir| {
-            ListItem::new(Line::from(Span::styled(
-                app.move_target_display(dir),
-                Style::default().add_modifier(Modifier::BOLD),
-            )))
-        })
-        .collect();
-    // Always offer to make the destination on the spot.
-    items.push(ListItem::new(Line::from(Span::styled(
-        "+  new folder…",
-        accented(),
-    ))));
+    let mut items: Vec<ListItem> = Vec::with_capacity(app.move_targets.len() + 1);
+    for (i, dir) in app.move_targets.iter().enumerate() {
+        let mut spans = if i == 0 {
+            // The level itself, so a file can go into a folder that has sub-folders.
+            let label = if app.move_at_root() { "⌂  store root (top level)" } else { "·  this folder" };
+            vec![Span::styled(label, Style::default().add_modifier(Modifier::BOLD))]
+        } else {
+            let folder = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut spans = vec![Span::styled(folder, Style::default().add_modifier(Modifier::BOLD))];
+            if app.move_has_children.get(i).copied().unwrap_or(false) {
+                spans.push(Span::styled("  ›", accented()));
+            }
+            spans
+        };
+        if app.move_is_current(dir) {
+            spans.push(Span::styled("  (it's here now)", dim()));
+        }
+        items.push(ListItem::new(Line::from(spans)));
+    }
+    // Always offer to make the destination on the spot, at this level.
+    items.push(ListItem::new(Line::from(Span::styled("+  new folder…", accented()))));
     let list = List::new(items)
         .block(bordered("Move to folder"))
         .highlight_style(hl())
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(list, rows[1], &mut app.move_state);
+}
+
+/// `text` cut to `width` characters from the left, with a leading `…`, so the
+/// end of a long path stays visible.
+fn keep_tail(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width || width < 2 {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - (width - 1)).collect();
+    format!("…{tail}")
+}
+
+fn render_test_media(app: &App, frame: &mut Frame, area: Rect) {
+    let intro: [&str; 2] = if app.repair_mode {
+        [
+            "  Writes every track and reads it back. A track that isn't perfect is rewritten with its",
+            "  bits flipped and read again, over and over, until it reads good. It ERASES the disk.",
+        ]
+    } else {
+        [
+            "  Writes test data to every sector, reads it back and compares — twice (random data,",
+            "  then its exact inverse, so every bit is tested both ways). It ERASES the disk.",
+        ]
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(intro[0], dim())),
+        Line::from(Span::styled(intro[1], dim())),
+        Line::from(""),
+        Line::from(Span::styled("  What kind of disk is it?", base())),
+        Line::from(""),
+    ];
+    let media = gwm_core::disk_test::MEDIA;
+    for (i, m) in media.iter().enumerate() {
+        let sel = i == app.test_media_index;
+        lines.push(Line::from(vec![
+            Span::raw(if sel { "▸ " } else { "  " }),
+            Span::styled(m.label.to_string(), if sel { hl() } else { Style::default().add_modifier(Modifier::BOLD) }),
+            Span::styled(format!("   {}", m.format), dim()),
+        ]));
+    }
+    let sel = app.test_media_index == media.len();
+    lines.push(Line::from(vec![
+        Span::raw(if sel { "▸ " } else { "  " }),
+        Span::styled("Other format…", if sel { hl() } else { accented() }),
+        Span::styled("   any system's own layout, or one of your custom formats", dim()),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  The media is what matters: a Kaypro, PC or Amiga double-density disk is the same disk.",
+        dim(),
+    )));
+    let title = if app.repair_mode { "Repair a disk (experimental)" } else { "Test disk media" };
+    frame.render_widget(para(lines).block(bordered(title)), area);
+}
+
+fn render_test_confirm(app: &App, frame: &mut Frame, area: Rect) {
+    let drive = app.chosen_drive.to_uppercase();
+    let geom = app.test_geom;
+    let size = geom
+        .map(|g| format!("{} tracks × {} side{} · {} sectors", g.cyls, g.heads, if g.heads == 1 { "" } else { "s" }, g.sectors()))
+        .unwrap_or_default();
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Disk     ", dim()),
+            Span::styled(app.test_media_label.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![Span::styled("  Format   ", dim()), Span::raw(format!("{} · {size}", app.chosen_format))]),
+        Line::from(vec![Span::styled("  Drive    ", dim()), Span::raw(drive.clone())]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  This ERASES everything on the disk in drive {drive}."),
+            Style::default().fg(theme().danger).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if app.repair_mode {
+        lines.extend([
+            Line::from(Span::styled("  Cycle 1 writes every track and reads it back. Any track that isn't perfect is", dim())),
+            Line::from(Span::styled("  rewritten with its bits flipped and read again, cycle after cycle, until it reads", dim())),
+            Line::from(Span::styled("  good or the cycle limit runs out. A track that reads good again must then pass", dim())),
+            Line::from(Span::styled(format!("  {} more cycles in a row before it counts as repaired.", gwm_core::disk_test::CONFIRM_PASSES), dim())),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Cycle limit  ", dim()),
+                Span::styled(format!("◂ {} ▸", app.condition_rounds), Style::default().add_modifier(Modifier::BOLD)),
+            ]),
+            erase_line(app.condition_erase, "  "),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Experimental. It can't replace missing oxide; clean the drive head afterwards.",
+                Style::default().fg(theme().warning),
+            )),
+        ]);
+    } else {
+        lines.extend([
+            Line::from(Span::styled("  Pass 1 writes random data; pass 2 writes its exact inverse.", dim())),
+            Line::from(Span::styled("  Each pass is read back and every sector compared.", dim())),
+        ]);
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("  Press y to start, Esc to go back.", accented())));
+    let title = if app.repair_mode { "Repair a disk — confirm" } else { "Test disk media — confirm" };
+    frame.render_widget(para(lines).block(bordered(title)), area);
+}
+
+fn render_testing(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(job) = app.test_job.as_ref() else { return };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(
+        para(vec![
+            Line::from(""),
+            Line::from(Span::styled(format!("  {}", job.phase.describe()), accented())),
+            Line::from(Span::styled(format!("  {} · drive {}", job.format, job.drive.to_uppercase()), dim())),
+        ])
+        .block(bordered("Test disk media")),
+        rows[0],
+    );
+    let label = format!("{}/{} tracks", job.tracks_done, job.tracks_total);
+    frame.render_widget(gauge(job.ratio(), label), rows[1]);
+    let mut lines = Vec::new();
+    for p in &job.passes {
+        lines.push(test_pass_line(p));
+    }
+    frame.render_widget(para(lines), rows[2]);
+}
+
+/// One line summarising a finished pass.
+fn test_pass_line(p: &gwm_core::disk_test::PassResult) -> Line<'static> {
+    let what = if p.pass == 1 { "random data" } else { "inverse pattern" };
+    let (mark, style, text) = if let Some(e) = &p.write_error {
+        ("✗", Style::default().fg(theme().danger), format!("write stopped: {e}"))
+    } else if !p.bad.is_empty() {
+        let n = p.bad.len();
+        ("✗", Style::default().fg(theme().danger), format!("{n} sector{} didn't come back as written", if n == 1 { "" } else { "s" }))
+    } else if let Some(e) = &p.read_error {
+        ("!", Style::default().fg(theme().warning), format!("read stopped: {e}"))
+    } else if !p.retried.is_empty() {
+        let n = p.retried.len();
+        ("~", Style::default().fg(theme().warning), format!("all data correct; {n} track{} needed re-reads", if n == 1 { "" } else { "s" }))
+    } else {
+        ("✓", Style::default().fg(theme().success), "every sector correct, first time".to_string())
+    };
+    Line::from(vec![
+        Span::styled(format!("  {mark} Pass {} ({what})  ", p.pass), style),
+        Span::styled(text, style),
+    ])
+}
+
+fn render_test_done(app: &App, frame: &mut Frame, area: Rect) {
+    use gwm_core::disk_test::{TrackMark, Verdict};
+    let Some(job) = app.test_job.as_ref() else { return };
+    let verdict = job.verdict();
+    let style = match verdict {
+        Verdict::Good => Style::default().fg(theme().success),
+        Verdict::Marginal | Verdict::Incomplete => Style::default().fg(theme().warning),
+        Verdict::Bad => Style::default().fg(theme().danger),
+    }
+    .add_modifier(Modifier::BOLD);
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!("  {}", verdict.headline()), style)),
+        Line::from(Span::styled(
+            format!("  {} · {} · drive {}", app.test_media_label, job.format, job.drive.to_uppercase()),
+            dim(),
+        )),
+        Line::from(""),
+    ];
+    if job.cancelled {
+        lines.push(Line::from(Span::styled("  Stopped before the end.", Style::default().fg(theme().warning))));
+    }
+    if let Some(e) = &job.error {
+        lines.push(Line::from(Span::styled(format!("  {e}"), Style::default().fg(theme().warning))));
+    }
+    for p in &job.passes {
+        lines.push(test_pass_line(p));
+    }
+
+    // Track map: one row per side, one cell per cylinder, worst pass wins.
+    if !job.passes.is_empty() {
+        let grid = gwm_core::disk_test::track_grid(&job.geom, &job.passes);
+        let width = area.width.saturating_sub(14).max(20) as usize;
+        lines.push(Line::from(""));
+        for chunk_start in (0..job.geom.cyls as usize).step_by(width) {
+            let end = (chunk_start + width).min(job.geom.cyls as usize);
+            lines.push(Line::from(Span::styled(
+                format!("  cylinders {}–{}", chunk_start, end - 1),
+                dim(),
+            )));
+            for (head, row) in grid.iter().enumerate() {
+                let mut spans = vec![Span::styled(format!("  side {head}     "), dim())];
+                for mark in &row[chunk_start..end] {
+                    let (ch, st) = match mark {
+                        TrackMark::Good => ("█", Style::default().fg(theme().success)),
+                        TrackMark::Retried => ("▒", Style::default().fg(theme().warning)),
+                        TrackMark::Bad => ("✗", Style::default().fg(theme().danger)),
+                        TrackMark::Untested => ("·", dim()),
+                    };
+                    spans.push(Span::styled(ch, st));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+        lines.push(Line::from(Span::styled(
+            "  █ good   ▒ read only after retries   ✗ data didn't come back   · not tested",
+            dim(),
+        )));
+    }
+
+    // Where the bad sectors are (first few), so a user can decide to keep a
+    // disk for a smaller format or throw it out.
+    let bad: std::collections::BTreeSet<_> = job.passes.iter().flat_map(|p| p.bad.iter().copied()).collect();
+    if !bad.is_empty() {
+        let shown: Vec<String> = bad.iter().take(12).map(|s| format!("{}.{}:{}", s.cyl, s.head, s.sector)).collect();
+        let more = bad.len().saturating_sub(12);
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  Bad sectors (cyl.side:sector)  ", dim()),
+            Span::raw(shown.join("  ")),
+            Span::styled(if more > 0 { format!("  … and {more} more") } else { String::new() }, dim()),
+        ]));
+    }
+    frame.render_widget(para(lines).block(bordered("Test disk media — result")), area);
+}
+
+fn erase_line(on: bool, pad: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  Erase before each write{pad}"), dim()),
+        Span::styled(if on { "[x]" } else { "[ ]" }, Style::default().fg(theme().accent)),
+        Span::styled("  AC-erases the tracks first (e to toggle)", dim()),
+    ])
+}
+
+/// Tracks as `cyl.side` labels, the first `max` of them.
+fn track_list(tracks: &std::collections::BTreeSet<(u32, u32)>, max: usize) -> String {
+    let mut s: Vec<String> = tracks.iter().take(max).map(|(c, h)| format!("{c}.{h}")).collect();
+    if tracks.len() > max {
+        s.push(format!("… +{}", tracks.len() - max));
+    }
+    s.join("  ")
+}
+
+fn render_condition_confirm(app: &App, frame: &mut Frame, area: Rect) {
+    let tracks = app.test_problem_tracks();
+    let drive = app.chosen_drive.to_uppercase();
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("  Experimental: try to bring the flagged tracks back.", accented().add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("  {} track{} (cyl.side)  ", tracks.len(), if tracks.len() == 1 { "" } else { "s" }), dim()),
+            Span::raw(track_list(&tracks, 16)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Cycle limit            ", dim()),
+            Span::styled(format!("◂ {} ▸", app.condition_rounds), Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        erase_line(app.condition_erase, "  "),
+        Line::from(""),
+        Line::from(Span::styled("  Each track is written and read back; if it isn't perfect it's rewritten with its bits", dim())),
+        Line::from(Span::styled("  flipped and read again, cycle after cycle, until it reads good or the limit runs out.", dim())),
+        Line::from(Span::styled(format!("  Once it reads good it must pass {} more cycles in a row to count as repaired.", gwm_core::disk_test::CONFIRM_PASSES), dim())),
+        Line::from(""),
+        Line::from(Span::styled("  This can clear old off-track signal and loose debris. It can't replace missing", dim())),
+        Line::from(Span::styled("  oxide. A shedding disk sheds onto the head — clean the drive afterwards.", Style::default().fg(theme().warning))),
+        Line::from(""),
+        Line::from(Span::styled(format!("  It rewrites those tracks on the disk in drive {drive}."), Style::default().fg(theme().danger).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("  Press y to start, Esc to go back.", accented())),
+    ];
+    frame.render_widget(para(lines).block(bordered("Repair flagged tracks (experimental)")), area);
+}
+
+/// The round-by-round table shared by the progress and result screens.
+fn condition_rounds_lines(job: &crate::condition_job::ConditionJob) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        "  Cycle  Tracks  Bad sectors  Re-reads  Read good  Repaired  Relapsed",
+        dim(),
+    ))];
+    for r in &job.history {
+        let style = if r.error.is_some() {
+            Style::default().fg(theme().danger)
+        } else if r.confirmed > 0 {
+            Style::default().fg(theme().success)
+        } else {
+            base()
+        };
+        let text = match &r.error {
+            Some(e) => format!("  {:>5}  {e}", r.round),
+            None => format!(
+                "  {:>5}  {:>6}  {:>11}  {:>8}  {:>9}  {:>8}  {:>8}",
+                r.round, r.tracks, r.bad_sectors, r.retried, r.healed, r.confirmed, r.relapsed
+            ),
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    lines
+}
+
+fn render_conditioning(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(job) = app.condition_job.as_ref() else { return };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(
+        para(vec![
+            Line::from(""),
+            Line::from(Span::styled(format!("  {}", job.describe_step()), accented())),
+            Line::from(Span::styled(format!("  {} · drive {}", job.format, job.drive.to_uppercase()), dim())),
+        ])
+        .block(bordered("Repair a disk (experimental)")),
+        rows[0],
+    );
+    let left = job.left.len().saturating_sub(job.outcomes.values().filter(|o| **o == gwm_core::disk_test::TrackOutcome::Failed).count());
+    let label = format!("cycle {} (limit {}) · {} track{} still in progress", job.history.len(), job.max_rounds, left, if left == 1 { "" } else { "s" });
+    frame.render_widget(gauge(job.ratio(), label), rows[1]);
+    frame.render_widget(para(condition_rounds_lines(job)), rows[2]);
+}
+
+fn render_condition_done(app: &App, frame: &mut Frame, area: Rect) {
+    use gwm_core::disk_test::ConditionEnd;
+    let Some(job) = app.condition_job.as_ref() else { return };
+    let end = job.end.unwrap_or(ConditionEnd::Stopped);
+    let style = match end {
+        ConditionEnd::AllClean => Style::default().fg(theme().success),
+        ConditionEnd::CycleLimit => Style::default().fg(theme().danger),
+        ConditionEnd::Stopped => Style::default().fg(theme().warning),
+    }
+    .add_modifier(Modifier::BOLD);
+    let repaired = job.repaired();
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let summary = if job.full_disk {
+        let good_first = job.good_first_time();
+        let need = job.start.len().saturating_sub(good_first);
+        if need == 0 {
+            format!("All {} tracks were good on the first write — nothing needed repair.", job.start.len())
+        } else {
+            format!(
+                "{good_first} track{} were good on the first write. {need} needed repair: {} repaired, {} still failing.",
+                plural(good_first),
+                repaired.len(),
+                job.left.len()
+            )
+        }
+    } else {
+        format!(
+            "{} of {} flagged track{} repaired.",
+            repaired.len(),
+            job.start.len(),
+            plural(job.start.len())
+        )
+    };
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!("  {}", end.headline(job.left.len(), job.max_rounds)), style)),
+        Line::from(Span::styled(format!("  {summary}"), base())),
+        Line::from(Span::styled(
+            if job.erase { "  Each write was preceded by an AC erase." } else { "  Run without erasing before writes." },
+            dim(),
+        )),
+        Line::from(""),
+    ];
+    if !repaired.is_empty() {
+        let shown: Vec<String> = repaired.iter().take(14).map(|((c, h), n)| format!("{c}.{h} ({n})")).collect();
+        let more = repaired.len().saturating_sub(14);
+        lines.push(Line::from(vec![
+            Span::styled("  Repaired (cyl.side, on cycle)  ", dim()),
+            Span::styled(shown.join("  "), Style::default().fg(theme().success)),
+            Span::styled(if more > 0 { format!("  … +{more}") } else { String::new() }, dim()),
+        ]));
+    }
+    if !job.left.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  Still failing (cyl.side)  ", dim()),
+            Span::styled(track_list(&job.left, 16), Style::default().fg(theme().danger)),
+        ]));
+    }
+    if !job.relapsed.is_empty() {
+        let n = job.relapsed.len();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  Read good, then failed again while confirming ({n} track{})  ", plural(n)),
+                dim(),
+            ),
+            Span::styled(track_list(&job.relapsed, 12), Style::default().fg(theme().warning)),
+        ]));
+    }
+
+    // Track map: good on the first write, repaired, still failing.
+    let g = job.geom;
+    let width = area.width.saturating_sub(14).max(20) as usize;
+    lines.push(Line::from(""));
+    for chunk_start in (0..g.cyls as usize).step_by(width) {
+        let end_c = (chunk_start + width).min(g.cyls as usize);
+        lines.push(Line::from(Span::styled(format!("  cylinders {}–{}", chunk_start, end_c - 1), dim())));
+        for head in 0..g.heads {
+            let mut spans = vec![Span::styled(format!("  side {head}     "), dim())];
+            for cyl in chunk_start as u32..end_c as u32 {
+                let t = (cyl, head);
+                let (ch, st) = if job.left.contains(&t) {
+                    ("✗", Style::default().fg(theme().danger))
+                } else if repaired.contains_key(&t) {
+                    ("▓", Style::default().fg(theme().warning))
+                } else if job.outcomes.get(&t) == Some(&gwm_core::disk_test::TrackOutcome::GoodFirstTime) {
+                    ("█", Style::default().fg(theme().success))
+                } else {
+                    ("·", dim())
+                };
+                spans.push(Span::styled(ch, st));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "  █ good first time   ▓ repaired (good, then confirmed 3× in a row)   ✗ still failing   · not worked on",
+        dim(),
+    )));
+    lines.push(Line::from(""));
+    lines.extend(condition_rounds_lines(job).into_iter().take(8));
+    if job.history.len() > 7 {
+        lines.push(Line::from(Span::styled(format!("  … {} cycles in all", job.history.len()), dim())));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Enter runs the full two-pass test to confirm the whole disk. Clean the drive head too.",
+        dim(),
+    )));
+    frame.render_widget(para(lines).block(bordered("Repair a disk — result")), area);
+}
+
+fn render_batch_setup(app: &App, frame: &mut Frame, area: Rect) {
+    let row = |i: usize, label: &str, value: Vec<Span<'static>>| -> Line<'static> {
+        let sel = app.batch_row == i;
+        let marker = if sel { "▸ " } else { "  " };
+        let style = if sel { accented() } else { base() };
+        let mut spans = vec![Span::styled(format!("{marker}{label:<9}"), style)];
+        spans.extend(value);
+        Line::from(spans)
+    };
+    let bold = |t: String| Span::styled(t, Style::default().add_modifier(Modifier::BOLD));
+
+    let name = app.batch_name();
+    let name_value = if app.batch_row == 0 {
+        input_spans(&app.batch_name_input)
+    } else if name.is_empty() {
+        vec![Span::styled("(type a name)", dim())]
+    } else {
+        vec![bold(name.clone())]
+    };
+    let count = app.batch_count;
+    let start_style = if app.batch_row == 3 { hl() } else { accented() };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "  Read a program that came on several disks, one disk after another.",
+            dim(),
+        )),
+        Line::from(""),
+        row(0, "Name:", name_value),
+        row(1, "Disks:", vec![bold(format!("◂ {count} ▸"))]),
+        row(2, "Folder:", vec![bold(app.move_path_display(&app.batch_dir))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(if app.batch_row == 3 { "▸ " } else { "  " }),
+            Span::styled(" Start → pick the format and drive ", start_style),
+        ]),
+        Line::from(""),
+    ];
+    let shown = if name.is_empty() { "<name>".to_string() } else { name };
+    let naming = if count > 1 {
+        format!("  Saved as {shown}-disk1 … {shown}-disk{count}, in that folder.")
+    } else {
+        format!("  Saved as {shown}-disk1, in that folder.")
+    };
+    lines.push(Line::from(Span::styled(naming, dim())));
+    lines.push(Line::from(Span::styled(
+        "  The format, drive and read options are chosen once, for the whole set.",
+        dim(),
+    )));
+    frame.render_widget(para(lines).block(bordered("Batch read")), area);
+}
+
+fn render_batch_prompt(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(batch) = app.batch.as_ref() else {
+        frame.render_widget(para(vec![Line::from("")]).block(bordered("Batch read")), area);
+        return;
+    };
+    let drive = DRIVE_OPTIONS
+        .iter()
+        .find(|(id, _)| *id == app.chosen_drive)
+        .map(|(id, _)| id.to_uppercase())
+        .unwrap_or_else(|| app.chosen_drive.to_uppercase());
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  Folder  ", dim()),
+            Span::styled(app.move_path_display(&batch.dir), Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Format  ", dim()),
+            Span::raw(format!("{} · drive {drive}", app.chosen_format)),
+        ]),
+        Line::from(""),
+    ];
+    for disk in 1..=batch.count {
+        let line = match batch.result(disk) {
+            Some(r) if r.ok => Line::from(vec![
+                Span::styled(format!("  ✓ Disk {disk:<3}"), Style::default().fg(theme().success)),
+                Span::styled(
+                    format!("{}  ", r.file.clone().unwrap_or_default()),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(r.detail.clone(), dim()),
+            ]),
+            Some(r) if r.detail == "skipped" => Line::from(vec![
+                Span::styled(format!("  – Disk {disk:<3}"), dim()),
+                Span::styled("skipped", dim()),
+            ]),
+            Some(r) => Line::from(vec![
+                Span::styled(format!("  ✗ Disk {disk:<3}"), Style::default().fg(theme().danger)),
+                Span::styled(r.detail.clone(), Style::default().fg(theme().danger)),
+            ]),
+            None if disk == batch.next && !batch.finished() => Line::from(vec![
+                Span::styled(format!("  ▸ Disk {disk:<3}"), accented()),
+                Span::styled("next", accented()),
+            ]),
+            None => Line::from(Span::styled(format!("  · Disk {disk}"), dim())),
+        };
+        lines.push(line);
+    }
+    lines.push(Line::from(""));
+
+    let read = batch.results.iter().filter(|r| r.ok).count();
+    let prompt = if batch.finished() {
+        let total = batch.count as usize;
+        let text = if read == total {
+            format!("  All {total} disks read.")
+        } else {
+            format!("  {read} of {total} disks read.")
+        };
+        vec![
+            Line::from(Span::styled(text, Style::default().fg(theme().success).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("  Enter opens the folder in the Library.", dim())),
+        ]
+    } else if batch.result(batch.next).is_some_and(|r| !r.ok) {
+        vec![
+            Line::from(Span::styled(
+                format!("  Disk {} didn't read. Reseat it (or clean the drive) and press Enter to try again,", batch.next),
+                Style::default().fg(theme().warning),
+            )),
+            Line::from(Span::styled("  or press s to skip it.", Style::default().fg(theme().warning))),
+        ]
+    } else {
+        vec![Line::from(Span::styled(
+            format!("  Put disk {} of {} in drive {drive} and press Enter.", batch.next, batch.count),
+            accented().add_modifier(Modifier::BOLD),
+        ))]
+    };
+    lines.extend(prompt);
+    frame.render_widget(para(lines).block(bordered(&format!("Batch read — {}", batch.name))), area);
 }
 
 fn render_driver_picker(app: &App, frame: &mut Frame, area: Rect) {
@@ -2607,7 +3265,7 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
 /// to (a terminal has no smaller font to shrink a long hint into).
 fn status_hint(app: &App) -> &'static str {
     match app.screen {
-            Screen::Menu => "  ↑/↓ move · Enter select · underlined letter jumps straight there · q quit",
+            Screen::Menu => "  ↑/↓ move · ←/→ or Tab column · Enter select · underlined letter jumps there · q quit",
             Screen::Library => "  ↑/↓ · Enter open · b browse · c convert flux · g →Gotek · f format · h hex · n notes · r rename · m move · a new folder · d del",
             Screen::GotekFormat => "  ↑/↓ choose format · Enter continue · Esc cancel",
             Screen::GotekDrive => {
@@ -2640,13 +3298,69 @@ fn status_hint(app: &App) -> &'static str {
             }
             Screen::LibraryConfirmDelete => "  y confirm · f toggle file · Esc cancel",
             Screen::LibraryRename => "  type name · Enter rename · Esc cancel",
-            Screen::LibraryMove => "  ↑/↓ pick folder · Enter move · last row makes a new folder · Esc cancel",
+            Screen::LibraryMove => {
+                if app.move_purpose == crate::app::MovePurpose::BatchFolder {
+                    "  ↑/↓ pick · → open folder (›) · ← back up · Enter use this folder · last row makes a new folder · Esc back"
+                } else {
+                    "  ↑/↓ pick · → open folder (›) · ← back up · Enter move here · last row makes a new folder · Esc cancel"
+                }
+            }
             Screen::EditNotes => "  type notes · Enter save · Esc cancel",
             Screen::FormatPicker => {
                 "  type to filter · ↑/↓ · Enter pick · Ctrl+E edit label · Esc back"
             }
             Screen::DrivePicker => "  ↑/↓ move · Enter select · Esc back",
             Screen::NameInput => "  type a name · Enter start · Esc back",
+            Screen::TestMedia => "  ↑/↓ choose the disk type · Enter continue · Esc back",
+            Screen::TestConfirm => {
+                if app.repair_mode {
+                    "  ←/→ cycle limit · e erase on/off · y erase and repair the disk · Esc back"
+                } else {
+                    "  y erase and test the disk · Esc back"
+                }
+            }
+            Screen::Testing => {
+                if app.test_job.as_ref().is_some_and(|j| j.cancelled) {
+                    "  stopping… waiting for gw to exit"
+                } else {
+                    "  testing… · Esc to stop"
+                }
+            }
+            Screen::TestDone => {
+                if app.test_problem_tracks().is_empty() {
+                    "  v sector map · r test again (fresh data) · Enter/Esc main menu"
+                } else {
+                    "  c repair the flagged tracks (experimental) · v sector map · r test again · Enter/Esc menu"
+                }
+            }
+            Screen::ConditionConfirm => "  ←/→ cycle limit · e erase on/off · y start repairing · Esc back",
+            Screen::Conditioning => {
+                if app.condition_job.as_ref().is_some_and(|j| j.cancelled) {
+                    "  stopping… waiting for gw to exit"
+                } else {
+                    "  repairing… · Esc to stop"
+                }
+            }
+            Screen::ConditionDone => "  Enter run the full test again · Esc main menu",
+            Screen::BatchSetup => match app.batch_row {
+                0 => "  type the set's name · ↓/Enter next · Esc cancel",
+                1 => "  ←/→ or type a number · ↓/Enter next · Esc cancel",
+                2 => "  Enter choose or make a folder · ↑/↓ row · Esc cancel",
+                _ => "  Enter start: pick the format and drive · ↑ back · Esc cancel",
+            },
+            Screen::BatchPrompt => {
+                if app.batch.as_ref().is_some_and(|b| b.finished()) {
+                    "  Enter open the folder in the Library · Esc main menu"
+                } else if app
+                    .batch
+                    .as_ref()
+                    .is_some_and(|b| b.result(b.next).is_some_and(|r| !r.ok))
+                {
+                    "  Enter try this disk again · s skip it · Esc end the set here"
+                } else {
+                    "  Enter read this disk · s skip it · Esc end the set here"
+                }
+            }
             Screen::ReadOptions => {
                 "  ↑/↓ row · ←/→ or type to change · Space toggle · Enter continue · Esc back"
             }
@@ -3216,14 +3930,13 @@ fn render_diag(app: &App, frame: &mut Frame, area: Rect) {
 mod render_smoke {
     use super::*;
     use crate::app::App;
-    use gwm_core::Core;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::Terminal;
 
     #[test]
     fn file_browse_dir_mode_renders() {
-        let mut app = App::new(Core::init().unwrap());
+        let mut app = App::new(crate::app::test_core());
         // Drive the real path: Settings → storage row → Enter opens the dir picker.
         app.screen = Screen::Settings;
         app.settings_index = 1;
@@ -3242,7 +3955,7 @@ mod render_smoke {
     /// "starting up" state before the first reading, and a full live frame.
     #[test]
     fn diag_screens_render() {
-        let mut app = App::new(Core::init().unwrap());
+        let mut app = App::new(crate::app::test_core());
         app.screen = Screen::DiagOptions;
         for row in 0..App::DIAG_OPT_ROWS {
             app.diag_opt_row = row;
@@ -3273,7 +3986,7 @@ mod render_smoke {
         )
         .expect("a status event");
 
-        let mut app = App::new(Core::init().unwrap());
+        let mut app = App::new(crate::app::test_core());
         app.screen = Screen::Diag;
         let mut job = crate::diag_job::DiagJob::detached_for_test();
         job.absorb(status);
@@ -3294,15 +4007,20 @@ mod render_smoke {
     #[test]
     fn archive_screens_render() {
         use gwm_core::archive::{RemoteFile, SearchHit};
-        let mut app = App::new(Core::init().unwrap());
+        let mut app = App::new(crate::app::test_core());
 
         // Menu → "Import from archive.org" → search screen. Found by name so
-        // inserting a menu item above it doesn't silently retarget this test.
-        let archive_row = MENU_ITEMS
+        // moving menu items around doesn't silently retarget this test, and
+        // reached through the columns (→ to its column, ↓ to its row).
+        let archive = MENU_ITEMS
             .iter()
             .position(|item| item.contains("archive.org"))
             .expect("the archive.org menu item");
-        for _ in 0..archive_row {
+        let (col, row) = menu_position(archive);
+        for _ in 0..col {
+            app.test_key(KeyCode::Right, KeyModifiers::NONE);
+        }
+        for _ in 0..row {
             app.test_key(KeyCode::Down, KeyModifiers::NONE);
         }
         app.test_key(KeyCode::Enter, KeyModifiers::NONE);
