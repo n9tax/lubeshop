@@ -69,9 +69,97 @@ pub fn run_streaming<F: FnMut(&str)>(args: &[String], on_line: F) -> std::io::Re
 pub fn run_streaming_cancellable<F: FnMut(&str)>(
     args: &[String],
     cancel: Arc<AtomicBool>,
+    on_line: F,
+) -> std::io::Result<Option<i32>> {
+    run_program_streaming("gw", args, cancel, on_line)
+}
+
+/// How a watched command ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Watched {
+    /// It exited on its own (with this status code, if any).
+    Exited(Option<i32>),
+    /// It printed nothing for the idle limit and was killed.
+    Stalled,
+    /// The caller's cancel flag stopped it.
+    Cancelled,
+}
+
+/// Like [`run_streaming_cancellable`], but with a stall watchdog: if gw prints
+/// nothing for `idle`, it is killed and the result is [`Watched::Stalled`].
+///
+/// gw has no timeouts of its own. When the Greaseweazle never answers a
+/// command — a dragging disk that stops the index pulse, a firmware hiccup —
+/// gw waits in `select()` on the serial port forever, and so did we. Every
+/// track gw works on prints a line within seconds, so a long silence is a hang,
+/// not slowness. After a kill, reset the device (`device::reset`) before its
+/// next command: it may still be mid-way through the one it never finished.
+pub fn run_streaming_watchdog<F: FnMut(&str)>(
+    args: &[String],
+    cancel: Arc<AtomicBool>,
+    idle: Duration,
+    on_line: F,
+) -> std::io::Result<Watched> {
+    run_program_watchdog("gw", args, cancel, idle, on_line)
+}
+
+fn run_program_watchdog<F: FnMut(&str)>(
+    program: &str,
+    args: &[String],
+    cancel: Arc<AtomicBool>,
+    idle: Duration,
+    mut on_line: F,
+) -> std::io::Result<Watched> {
+    use std::time::Instant;
+    let kill = Arc::new(AtomicBool::new(false));
+    let stalled = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let last = Arc::new(Mutex::new(Instant::now()));
+    let watcher = {
+        let (kill, stalled, done, last, cancel) =
+            (kill.clone(), stalled.clone(), done.clone(), last.clone(), cancel.clone());
+        thread::spawn(move || loop {
+            if done.load(Ordering::Relaxed) {
+                return;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                kill.store(true, Ordering::Relaxed);
+                return;
+            }
+            let quiet = last.lock().map(|t| t.elapsed()).unwrap_or_default();
+            if quiet > idle {
+                stalled.store(true, Ordering::Relaxed);
+                kill.store(true, Ordering::Relaxed);
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        })
+    };
+    let status = run_program_streaming(program, args, kill, |line| {
+        if let Ok(mut t) = last.lock() {
+            *t = Instant::now();
+        }
+        on_line(line);
+    });
+    done.store(true, Ordering::Relaxed);
+    let _ = watcher.join();
+    let status = status?;
+    Ok(if stalled.load(Ordering::Relaxed) {
+        Watched::Stalled
+    } else if cancel.load(Ordering::Relaxed) {
+        Watched::Cancelled
+    } else {
+        Watched::Exited(status)
+    })
+}
+
+fn run_program_streaming<F: FnMut(&str)>(
+    program: &str,
+    args: &[String],
+    cancel: Arc<AtomicBool>,
     mut on_line: F,
 ) -> std::io::Result<Option<i32>> {
-    let mut child = Command::new("gw")
+    let mut child = Command::new(program)
         .args(args)
         // gw is a Python script; if it ever prints to real stdout on a pipe that
         // stream is block-buffered. Force unbuffered so those lines stream live
@@ -152,6 +240,62 @@ pub fn run_streaming_cancellable<F: FnMut(&str)>(
     let _ = watcher.join();
     let status = child.lock().expect("child mutex poisoned").wait()?;
     Ok(status.code())
+}
+
+#[cfg(all(test, unix))]
+mod watchdog_tests {
+    use super::*;
+
+    fn sh(script: &str) -> Vec<String> {
+        vec!["-c".to_string(), script.to_string()]
+    }
+
+    /// A command that goes quiet is killed as stalled — well before it would
+    /// have finished — and what it printed first still arrives.
+    #[test]
+    fn a_silent_command_is_killed_as_stalled() {
+        let started = std::time::Instant::now();
+        let mut lines = Vec::new();
+        let r = run_program_watchdog(
+            "sh",
+            // `exec` so the killed process is the one holding the pipe, as with gw.
+            &sh("echo working; exec sleep 30"),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(400),
+            |l| lines.push(l.to_string()),
+        )
+        .unwrap();
+        assert_eq!(r, Watched::Stalled);
+        assert_eq!(lines, ["working"]);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    /// Steady output keeps it alive past the idle limit in total; it exits
+    /// normally with its status.
+    #[test]
+    fn steady_output_is_not_a_stall() {
+        let r = run_program_watchdog(
+            "sh",
+            &sh("for i in 1 2 3 4 5 6; do echo $i; sleep 0.15; done; exit 3"),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(400),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(r, Watched::Exited(Some(3)));
+    }
+
+    #[test]
+    fn cancel_is_reported_as_cancelled() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flip = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            flip.store(true, Ordering::Relaxed);
+        });
+        let r = run_program_watchdog("sh", &sh("sleep 30"), cancel, Duration::from_secs(20), |_| {}).unwrap();
+        assert_eq!(r, Watched::Cancelled);
+    }
 }
 
 #[cfg(test)]

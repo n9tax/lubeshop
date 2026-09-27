@@ -42,7 +42,7 @@ use crate::text_input::TextInput;
 use crate::theme::{self, Theme};
 use crate::write_job::WriteJob;
 
-pub const MENU_ITEMS: [&str; 17] = [
+pub const MENU_ITEMS: [&str; 18] = [
     "Read a disk",
     "Batch read a disk set",
     "Write a disk",
@@ -60,6 +60,7 @@ pub const MENU_ITEMS: [&str; 17] = [
     "Settings",
     "Quit",
     "Repair / condition a disk",
+    "Batch write a disk set",
 ];
 
 /// The core for a test. It never touches the user's things:
@@ -101,7 +102,7 @@ pub fn test_core() -> Core {
 /// keep their order, so accelerator letters and `activate_menu` are unchanged.
 pub const MENU_COLUMNS: [(&str, &[usize]); 3] = [
     // Getting data on and off disks, and managing it.
-    ("I/O Operations", &[0, 1, 2, 4, 10, 11, 12]),
+    ("I/O Operations", &[0, 1, 2, 17, 4, 10, 11, 12]),
     // Checking and looking after disks, drives and the device.
     ("Diagnostic / Repair", &[3, 16, 7, 8, 9, 6]),
     // Setting the app up (and leaving it).
@@ -122,7 +123,7 @@ pub fn menu_position(i: usize) -> (usize, usize) {
 /// label, where the menu underlines it — the first letter where that's
 /// unambiguous, otherwise a later one (Reset → e, Test drive RPM → P, Clean
 /// drive → v, archive → a). `q`, `u` (update), `j`/`k` (navigation) stay free.
-pub const MENU_KEYS: [char; 17] = [
+pub const MENU_KEYS: [char; 18] = [
     'r', // Read a disk
     'b', // Batch read a disk set
     'w', // Write a disk
@@ -140,6 +141,7 @@ pub const MENU_KEYS: [char; 17] = [
     's', // Settings
     'q', // Quit
     'o', // Repair / condition a disk
+    'h', // Batch write a disk set ("Batc_h_": every other letter is taken)
 ];
 
 /// Where a menu label's accelerator letter sits, for underlining: the first
@@ -213,6 +215,10 @@ pub enum Screen {
     ConditionConfirm,
     Conditioning,
     ConditionDone,
+    /// Batch write: tick the images in the chosen folder, in write order.
+    BatchWriteSelect,
+    /// Between disks of a batch write: "insert disk N" (confirm to erase it).
+    BatchWritePrompt,
     /// Batch read set-up: the set's name, how many disks, which folder.
     BatchSetup,
     /// Between disks of a batch read: "insert disk N", results so far, summary.
@@ -305,6 +311,8 @@ pub enum MovePurpose {
     MoveFile,
     /// Choose where a batch read saves its disks.
     BatchFolder,
+    /// Choose the folder a batch write takes its images from.
+    BatchWriteFolder,
 }
 
 /// How one disk of a batch read went.
@@ -355,6 +363,95 @@ impl BatchRead {
             self.next += 1;
         }
     }
+}
+
+/// How one image of a batch write gets onto a disk — the same choices a
+/// single write makes by default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritePlan {
+    /// A flux capture played back exactly (no format), then read back to check.
+    Flux,
+    /// A Teledisk/ImageDisk container, through the exact-copy path.
+    Container,
+    /// A sector image written through this gw format (gw verifies each track).
+    Format(String),
+    /// A sector image whose format isn't known: uses the one asked for the set.
+    NeedsFormat,
+}
+
+/// One image in a batch write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchWriteFile {
+    pub path: PathBuf,
+    pub plan: WritePlan,
+    /// Ticked to be written.
+    pub chosen: bool,
+}
+
+/// How one disk of a batch write went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchWriteResult {
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// A batch write in progress: the images to write, in order, one disk each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchWrite {
+    pub dir: PathBuf,
+    /// The ticked images, in write order.
+    pub files: Vec<BatchWriteFile>,
+    /// Index into `files` of the disk to write next.
+    pub next: usize,
+    /// Latest result per file (same indices as `files`).
+    pub results: Vec<Option<BatchWriteResult>>,
+    pub stopped: bool,
+    /// The format for images with none catalogued, asked once for the set.
+    pub fallback_format: Option<String>,
+}
+
+impl BatchWrite {
+    pub fn finished(&self) -> bool {
+        self.stopped || self.next >= self.files.len()
+    }
+
+    /// Record the current disk's result; move on when it worked (or skipped).
+    fn record(&mut self, ok: bool, detail: String, advance: bool) {
+        if let Some(slot) = self.results.get_mut(self.next) {
+            *slot = Some(BatchWriteResult { ok, detail });
+        }
+        if advance {
+            self.next += 1;
+        }
+    }
+}
+
+/// Order file names the way people count: `disk2` before `disk10`.
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn chunks(s: &str) -> Vec<(bool, String)> {
+        let mut out: Vec<(bool, String)> = Vec::new();
+        for c in s.chars() {
+            let digit = c.is_ascii_digit();
+            match out.last_mut() {
+                Some((d, run)) if *d == digit => run.push(c),
+                _ => out.push((digit, c.to_string())),
+            }
+        }
+        out
+    }
+    let (ca, cb) = (chunks(a), chunks(b));
+    for ((da, ra), (db, rb)) in ca.iter().zip(cb.iter()) {
+        let ord = if *da && *db {
+            let (ta, tb) = (ra.trim_start_matches('0'), rb.trim_start_matches('0'));
+            ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb))
+        } else {
+            ra.to_lowercase().cmp(&rb.to_lowercase())
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    ca.len().cmp(&cb.len())
 }
 
 /// `<name>-disk<n>.<ext>` in `dir`, never overwriting: an existing file gets a
@@ -488,6 +585,13 @@ pub struct App {
     pub repair_mode: bool,
     /// Repair: AC-erase the tracks before each write (toggled with `e`).
     pub condition_erase: bool,
+    /// Batch write: the folder's images (with ticks) while choosing, the
+    /// highlighted row, and the run once started.
+    pub bwrite_files: Vec<BatchWriteFile>,
+    pub bwrite_index: usize,
+    pub bwrite_state: ListState,
+    pub bwrite_dir: PathBuf,
+    pub bwrite: Option<BatchWrite>,
     /// The batch read under way, if any. `Some` routes the Read flow's end
     /// through the between-disks prompt instead of the single-read result.
     pub batch: Option<BatchRead>,
@@ -812,6 +916,11 @@ impl App {
             batch_row: 0,
             batch_count_typing: false,
             batch: None,
+            bwrite_files: Vec::new(),
+            bwrite_index: 0,
+            bwrite_state: ListState::default(),
+            bwrite_dir: PathBuf::new(),
+            bwrite: None,
             test_media_index: 0,
             test_media_label: String::new(),
             test_geom: None,
@@ -1452,6 +1561,8 @@ impl App {
             Screen::NameInput => self.on_name_key(code, mods),
             Screen::ReadOptions => self.on_read_options_key(code),
             Screen::BatchSetup => self.on_batch_setup_key(code, mods),
+            Screen::BatchWriteSelect => self.on_bwrite_select_key(code),
+            Screen::BatchWritePrompt => self.on_bwrite_prompt_key(code),
             Screen::TestMedia => self.on_test_media_key(code),
             Screen::TestConfirm => self.on_test_confirm_key(code),
             Screen::Testing => self.on_testing_key(code),
@@ -3425,6 +3536,7 @@ impl App {
             }
             15 => self.should_quit = true,
             16 => self.enter_disk_repair(),
+            17 => self.enter_batch_write(),
             _ => {}
         }
     }
@@ -4071,6 +4183,7 @@ impl App {
         if !self.gw_ready() {
             return;
         }
+        self.bwrite = None;
         // Import any files dropped into the store (or present after a relocation)
         // so the write picker isn't empty just because the Library screen hasn't
         // been opened since — but do it in the background, never blocking here.
@@ -5097,14 +5210,19 @@ impl App {
     }
 
     fn on_library_move_key(&mut self, code: KeyCode) {
-        // One extra row at the bottom of the picker: "+ new folder…".
-        let count = self.move_targets.len() + 1;
+        // One extra row at the bottom of the picker: "+ new folder…" — except
+        // when picking a folder to write *from*, where a new one is pointless.
+        let new_row = self.move_purpose != MovePurpose::BatchWriteFolder;
+        let count = self.move_targets.len() + usize::from(new_row);
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.move_item = None;
                 if self.move_purpose == MovePurpose::BatchFolder {
                     self.move_purpose = MovePurpose::MoveFile;
                     self.screen = Screen::BatchSetup;
+                } else if self.move_purpose == MovePurpose::BatchWriteFolder {
+                    self.move_purpose = MovePurpose::MoveFile;
+                    self.screen = Screen::Menu;
                 } else {
                     self.screen = Screen::Library;
                 }
@@ -5146,6 +5264,11 @@ impl App {
                     let chosen = self.move_state.selected().and_then(|i| self.move_targets.get(i)).cloned();
                     if let Some(dir) = chosen {
                         self.batch_folder_chosen(dir);
+                    }
+                } else if self.move_purpose == MovePurpose::BatchWriteFolder {
+                    let chosen = self.move_state.selected().and_then(|i| self.move_targets.get(i)).cloned();
+                    if let Some(dir) = chosen {
+                        self.bwrite_folder_chosen(dir);
                     }
                 } else {
                     self.do_move();
@@ -5206,6 +5329,7 @@ impl App {
                     // Backing out of a batch's format choice returns to its form.
                     Flow::Read if self.batch.take().is_some() => Screen::BatchSetup,
                     Flow::Read => Screen::Menu,
+                    Flow::Write if self.bwrite.take().is_some() => Screen::BatchWriteSelect,
                     Flow::Write => Screen::WriteSource,
                     Flow::Decode | Flow::Convert => Screen::Library,
                     Flow::Identify => Screen::Menu,
@@ -5249,6 +5373,14 @@ impl App {
                             self.test_media_label = fmt.clone();
                             self.chosen_format = fmt;
                             self.choose_test_format();
+                        }
+                        // A batch write asks once for images with no known format.
+                        Flow::Write if self.bwrite.is_some() => {
+                            if let Some(b) = self.bwrite.as_mut() {
+                                b.fallback_format = Some(fmt);
+                            }
+                            self.drive_index = self.default_drive_index();
+                            self.screen = Screen::DrivePicker;
                         }
                         Flow::Read | Flow::Write => {
                             self.chosen_format = fmt;
@@ -5323,6 +5455,7 @@ impl App {
             KeyCode::Esc | KeyCode::Backspace => {
                 self.screen = match self.flow {
                     Flow::Read => Screen::FormatPicker,
+                    Flow::Write if self.bwrite.take().is_some() => Screen::BatchWriteSelect,
                     Flow::Write => Screen::WriteSource,
                     Flow::Decode | Flow::Convert => Screen::Library,
                     Flow::Identify => Screen::Menu,
@@ -5351,6 +5484,7 @@ impl App {
                         self.read_double_step = false;
                         self.screen = Screen::ReadOptions;
                     }
+                    Flow::Write if self.bwrite.is_some() => self.screen = Screen::BatchWritePrompt,
                     Flow::Write => self.screen = Screen::WriteConfirm,
                     // No format to choose for a scan: straight to reading.
                     Flow::Identify => self.start_identify(),
@@ -5854,6 +5988,14 @@ impl App {
             let _ = self.reload_library();
         }
         let was_read = self.ti99_job.as_ref().is_some_and(|j| !j.write);
+        if self.bwrite.is_some() && !was_read {
+            let (ok, detail) = match &outcome {
+                Ok(_) => (true, "written".to_string()),
+                Err(e) => (false, e.clone()),
+            };
+            self.bwrite_record(ok, detail);
+            return;
+        }
         if self.batch.is_some() && was_read {
             self.batch_disk_done(outcome, "read via HFE".to_string());
             return;
@@ -6204,6 +6346,239 @@ impl App {
         }
     }
 
+    // --- batch write -----------------------------------------------------
+
+    fn enter_batch_write(&mut self) {
+        if !self.gw_ready() {
+            return;
+        }
+        self.bwrite = None;
+        self.move_purpose = MovePurpose::BatchWriteFolder;
+        self.move_item = None;
+        let root = self.core.paths.library_dir.clone();
+        let here = self.lib_base();
+        match here.parent().filter(|p| p.starts_with(&root) && here != root) {
+            Some(parent) => self.load_move_level(parent.to_path_buf(), Some(&here)),
+            None => self.load_move_level(root, None),
+        }
+        self.screen = Screen::LibraryMove;
+    }
+
+    /// The images in `dir` a batch write can use, in natural order, each with
+    /// the plan a single write would pick by default. Sidecars (listings,
+    /// sector maps) and KryoFlux `.raw` streams (one file per track) are left out.
+    pub fn bwrite_candidates(&self, dir: &Path) -> Vec<BatchWriteFile> {
+        let suffixes = formats::image_suffixes();
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = read
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .filter(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                !name.ends_with(".readmap.bmp")
+                    && ext != "raw"
+                    && ext != "txt"
+                    && suffixes.iter().any(|s| s.eq_ignore_ascii_case(&ext))
+            })
+            .collect();
+        files.sort_by(|a, b| natural_cmp(&file_name(a), &file_name(b)));
+        files
+            .into_iter()
+            .map(|path| {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                // The catalog entry: same path, or the same file reached another
+                // way (the store is often behind a symlink).
+                let item = self.library.iter().find(|it| Path::new(&it.path) == path).or_else(|| {
+                    let real = std::fs::canonicalize(&path).ok()?;
+                    self.library.iter().find(|it| {
+                        Path::new(&it.path).file_name() == path.file_name()
+                            && std::fs::canonicalize(&it.path).ok().as_ref() == Some(&real)
+                    })
+                });
+                let flux = formats::is_flux_suffix(&ext) || item.is_some_and(|it| matches!(it.kind, MediaKind::Flux));
+                let plan = if flux {
+                    WritePlan::Flux
+                } else if formats::is_sector_container(&ext) {
+                    WritePlan::Container
+                } else {
+                    match item.and_then(|it| it.format.clone()).filter(|f| !f.trim().is_empty()) {
+                        Some(f) => WritePlan::Format(f),
+                        None => WritePlan::NeedsFormat,
+                    }
+                };
+                BatchWriteFile { path, plan, chosen: true }
+            })
+            .collect()
+    }
+
+    fn bwrite_folder_chosen(&mut self, dir: PathBuf) {
+        self.move_purpose = MovePurpose::MoveFile;
+        self.bwrite_files = self.bwrite_candidates(&dir);
+        if self.bwrite_files.is_empty() {
+            self.notice = Some("No disk images in that folder — pick another.".to_string());
+            self.move_purpose = MovePurpose::BatchWriteFolder;
+            return;
+        }
+        self.bwrite_dir = dir;
+        self.bwrite_index = 0;
+        self.bwrite_state.select(Some(0));
+        self.screen = Screen::BatchWriteSelect;
+    }
+
+    /// The ticked images, in order.
+    pub fn bwrite_chosen(&self) -> Vec<BatchWriteFile> {
+        self.bwrite_files.iter().filter(|f| f.chosen).cloned().collect()
+    }
+
+    fn on_bwrite_select_key(&mut self, code: KeyCode) {
+        let n = self.bwrite_files.len();
+        match code {
+            KeyCode::Esc => {
+                // Back to the folders, at this folder's level.
+                self.move_purpose = MovePurpose::BatchWriteFolder;
+                let dir = self.bwrite_dir.clone();
+                let root = self.core.paths.library_dir.clone();
+                match dir.parent().filter(|p| p.starts_with(&root) && dir != root) {
+                    Some(parent) => self.load_move_level(parent.to_path_buf(), Some(&dir)),
+                    None => self.load_move_level(root, None),
+                }
+                self.screen = Screen::LibraryMove;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.bwrite_index = self.bwrite_index.checked_sub(1).unwrap_or(n.saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.bwrite_index = (self.bwrite_index + 1) % n.max(1),
+            KeyCode::Char(' ') | KeyCode::Char('x') => {
+                if let Some(f) = self.bwrite_files.get_mut(self.bwrite_index) {
+                    f.chosen = !f.chosen;
+                }
+            }
+            // All, or none if all are already ticked.
+            KeyCode::Char('a') => {
+                let all = self.bwrite_files.iter().all(|f| f.chosen);
+                for f in &mut self.bwrite_files {
+                    f.chosen = !all;
+                }
+            }
+            KeyCode::Enter => self.begin_bwrite(),
+            _ => {}
+        }
+        self.bwrite_state.select(Some(self.bwrite_index));
+    }
+
+    /// Start the set: ask a format once if any image needs one, then the drive.
+    fn begin_bwrite(&mut self) {
+        let files = self.bwrite_chosen();
+        if files.is_empty() {
+            self.notice = Some("Tick at least one image (Space), or a for all.".to_string());
+            return;
+        }
+        let needs_format = files.iter().any(|f| f.plan == WritePlan::NeedsFormat);
+        self.bwrite = Some(BatchWrite {
+            dir: self.bwrite_dir.clone(),
+            results: vec![None; files.len()],
+            files,
+            next: 0,
+            stopped: false,
+            fallback_format: None,
+        });
+        self.flow = Flow::Write;
+        self.write_erase = false;
+        if needs_format {
+            self.notice = Some("Some images have no known format — pick the one to write them with.".to_string());
+            self.open_write_format_picker();
+        } else {
+            self.drive_index = self.default_drive_index();
+            self.screen = Screen::DrivePicker;
+        }
+    }
+
+    fn on_bwrite_prompt_key(&mut self, code: KeyCode) {
+        let Some(b) = self.bwrite.as_mut() else {
+            self.screen = Screen::Menu;
+            return;
+        };
+        if b.finished() {
+            if matches!(code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                self.bwrite = None;
+                self.screen = Screen::Menu;
+            }
+            return;
+        }
+        match code {
+            // Write this disk: the prompt is the erase confirmation.
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.bwrite_start_disk(),
+            KeyCode::Char('e') => self.write_erase = !self.write_erase,
+            KeyCode::Char('s') => b.record(false, "skipped".to_string(), true),
+            KeyCode::Esc => b.stopped = true,
+            _ => {}
+        }
+    }
+
+    /// Set up the single-write state for the current image and write it.
+    fn bwrite_start_disk(&mut self) {
+        let Some(b) = self.bwrite.as_ref() else { return };
+        let Some(file) = b.files.get(b.next).cloned() else { return };
+        let fallback = b.fallback_format.clone();
+        self.chosen_source = file.path.clone();
+        self.chosen_source_name = file_name(&file.path);
+        self.write_diskdefs = None;
+        self.write_note = None;
+        match file.plan {
+            WritePlan::Flux => self.chosen_format = String::new(),
+            WritePlan::Container => {
+                if !self.stage_container_exact_copy() {
+                    // It said why; count this disk as failed and stay on it.
+                    let why = self.notice.clone().unwrap_or_else(|| "could not prepare the exact copy".to_string());
+                    self.bwrite_record(false, why);
+                    return;
+                }
+            }
+            WritePlan::Format(f) => self.chosen_format = f,
+            WritePlan::NeedsFormat => match fallback {
+                Some(f) => self.chosen_format = f,
+                None => {
+                    self.bwrite_record(false, "no format chosen for this image".to_string());
+                    return;
+                }
+            },
+        }
+        self.start_write();
+    }
+
+    /// A batch disk's write (and read-back, for raw writes) finished.
+    fn bwrite_disk_done(&mut self) {
+        let (ok, mut detail) = match &self.write_outcome {
+            Some(Ok(_)) => (true, "written".to_string()),
+            Some(Err(e)) => (false, e.clone()),
+            None => (false, "write did not complete".to_string()),
+        };
+        let mut ok = ok;
+        if let Some((verified, text)) = self.verify_result.take() {
+            ok = ok && verified;
+            detail = format!("{detail} · {text}");
+        } else if ok {
+            detail.push_str(" · verified by gw");
+        }
+        if let Some(n) = self.write_note.take() {
+            detail = format!("{detail} · {n}");
+        }
+        self.write_job = None;
+        self.verify_job = None;
+        self.bwrite_record(ok, detail);
+    }
+
+    fn bwrite_record(&mut self, ok: bool, detail: String) {
+        if let Some(b) = self.bwrite.as_mut() {
+            b.record(ok, detail, ok);
+        }
+        self.screen = Screen::BatchWritePrompt;
+    }
+
     // --- batch read ------------------------------------------------------
 
     fn enter_batch_read(&mut self) {
@@ -6452,6 +6827,8 @@ impl App {
                 self.chosen_drive.clone(),
             ));
             self.screen = Screen::Verifying;
+        } else if self.bwrite.is_some() {
+            self.bwrite_disk_done();
         } else {
             self.screen = Screen::WriteDone;
         }
@@ -6471,6 +6848,10 @@ impl App {
                 None => (false, "Read-back did not complete".to_string()),
             }
         });
+        if self.bwrite.is_some() {
+            self.bwrite_disk_done();
+            return;
+        }
         self.screen = Screen::WriteDone;
     }
 
@@ -7009,7 +7390,7 @@ mod menu_keys {
         key(&mut app, KeyCode::Up);
         assert_eq!(app.menu_index, 6);
         key(&mut app, KeyCode::Left);
-        assert_eq!(app.menu_index, 11, "row 5 of I/O: New image");
+        assert_eq!(app.menu_index, 10, "row 5 of I/O: Library");
     }
 
     #[test]
@@ -7473,6 +7854,32 @@ mod condition_screens {
         assert_eq!(clean.screen, Screen::TestDone);
     }
 
+    /// Hang notes stay on screen at 80 columns: short lines, and only the
+    /// latest two plus a count when a disk keeps hanging.
+    #[test]
+    fn hang_notes_fit_and_are_capped() {
+        use gwm_core::disk_test::TrackOutcome;
+        let mut app = tested_app();
+        let start: BTreeSet<_> = [(3, 0)].into_iter().collect();
+        let outcomes: BTreeMap<(u32, u32), TrackOutcome> = [((3, 0), TrackOutcome::Failed)].into_iter().collect();
+        let mut job = ConditionJob::finished_for_test(G, false, start, outcomes, BTreeSet::new(), vec![], ConditionEnd::Stopped, 20);
+        job.notes = (1..=5).map(|c| format!("Cycle {c}: device hung erasing — reset, retried")).collect();
+        app.condition_job = Some(job);
+        app.screen = Screen::ConditionDone;
+        let mut t = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        t.draw(|f| crate::ui::render(&mut app, f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let text: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let notes: Vec<&String> = text.iter().filter(|l| l.contains("! ")).collect();
+        assert_eq!(notes.len(), 3, "{text:#?}");
+        assert!(notes[0].contains("3 earlier hangs recovered"));
+        assert!(notes[1].contains("Cycle 4: device hung erasing — reset, retried"));
+        assert!(notes[2].contains("Cycle 5: device hung erasing — reset, retried "), "{}", notes[2]);
+        assert!(notes[2].trim_end().ends_with('│'), "the whole line fits inside the box: {}", notes[2]);
+    }
+
     /// A whole-disk repair: tracks good on the first write aren't "repairs";
     /// the confirmed ones are listed with the cycle they started reading good
     /// on, relapses are noted, and the ones that never held are called out.
@@ -7576,5 +7983,149 @@ mod repair_entry {
         app.test_finished();
         assert_eq!(app.screen, Screen::TestDone);
         assert!(app.condition_job.is_none());
+    }
+}
+
+#[cfg(test)]
+mod batch_write {
+    use super::*;
+    use gwm_core::models::{MediaItem, MediaKind, Source};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn screen_text(app: &mut App) -> String {
+        let mut t = Terminal::new(TestBackend::new(110, 34)).unwrap();
+        t.draw(|f| crate::ui::render(app, f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn item(path: &Path, format: Option<&str>) -> MediaItem {
+        MediaItem {
+            id: 1,
+            kind: MediaKind::Image,
+            path: path.to_string_lossy().into_owned(),
+            format: format.map(str::to_string),
+            system: None,
+            size_bytes: 0,
+            sha256: None,
+            source: Source::Import,
+            remote_id: None,
+            tags: Vec::new(),
+            notes: None,
+            fs_format: None,
+            fs_driver: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn natural_order_counts_like_people_do() {
+        let mut v = vec!["Set-disk10.img", "set-disk2.img", "Set-disk1.img", "Set-disk02b.img"];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(v, ["Set-disk1.img", "set-disk2.img", "Set-disk02b.img", "Set-disk10.img"]);
+    }
+
+    fn setup() -> (App, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("gwm-bwrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("Games");
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["Set-disk10.img", "Set-disk2.img", "Set-disk1.scp", "Set-disk1.readmap.bmp", "Set-disk2.txt", "TRS00.0.raw", "boot.td0"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let mut app = App::new(crate::app::test_core());
+        app.core.paths.library_dir = root.clone();
+        app.library = vec![item(&dir.join("Set-disk2.img"), Some("ibm.720"))];
+        app.formats = vec!["ibm.720".to_string(), "ibm.360".to_string()];
+        (app, root, dir)
+    }
+
+    /// The folder's images in natural order, with the plan a single write
+    /// would pick; sidecars and KryoFlux streams left out.
+    #[test]
+    fn candidates_are_ordered_filtered_and_planned() {
+        let (app, root, dir) = setup();
+        let c = app.bwrite_candidates(&dir);
+        let names: Vec<String> = c.iter().map(|f| file_name(&f.path)).collect();
+        assert_eq!(names, ["boot.td0", "Set-disk1.scp", "Set-disk2.img", "Set-disk10.img"]);
+        let plans: Vec<&WritePlan> = c.iter().map(|f| &f.plan).collect();
+        assert_eq!(
+            plans,
+            [&WritePlan::Container, &WritePlan::Flux, &WritePlan::Format("ibm.720".into()), &WritePlan::NeedsFormat]
+        );
+        assert!(c.iter().all(|f| f.chosen), "ticked by default");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Folder → tick → one format question for the unknown image → drive →
+    /// per-disk prompt that names the disk and says it erases. Writes are fed
+    /// in as outcomes: nothing here presses `y`, so the drive is never touched.
+    #[test]
+    fn choose_files_then_write_disk_by_disk() {
+        let (mut app, root, dir) = setup();
+        let key = |app: &mut App, k| app.test_key(k, KeyModifiers::NONE);
+        app.bwrite_folder_chosen(dir.clone());
+        assert_eq!(app.screen, Screen::BatchWriteSelect);
+        let text = screen_text(&mut app);
+        assert!(text.contains("4 of 4 ticked"), "{text}");
+        assert!(text.contains("Set-disk10.img   format not known — asked once"), "{text}");
+
+        // Untick boot.td0 (row 0); order renumbers.
+        key(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.bwrite_chosen().len(), 3);
+        let text = screen_text(&mut app);
+        assert!(text.contains("[ ]     boot.td0"), "{text}");
+        assert!(text.contains("[x]  1. Set-disk1.scp"), "{text}");
+        // a = none (not all ticked → all), then a again = none.
+        key(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.bwrite_chosen().len(), 4);
+        key(&mut app, KeyCode::Char('a'));
+        assert!(app.bwrite_chosen().is_empty());
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::BatchWriteSelect, "nothing ticked → stays");
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char(' ')); // untick boot.td0 again
+
+        // Enter: Set-disk10 has no format → asked once. Esc backs out cleanly.
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::FormatPicker);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::BatchWriteSelect);
+        assert!(app.bwrite.is_none());
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter); // pick ibm.720 for the set
+        assert_eq!(app.screen, Screen::DrivePicker);
+        assert_eq!(app.bwrite.as_ref().unwrap().fallback_format.as_deref(), Some("ibm.720"));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::BatchWritePrompt);
+        let text = screen_text(&mut app);
+        assert!(text.contains("Put disk 1 of 3 (Set-disk1.scp) in drive A."), "{text}");
+        assert!(text.contains("This ERASES the disk. Press y to write it."), "{text}");
+        assert!(text.contains("flux · exact copy, read back"), "{text}");
+
+        // Disk 1 written and read back fine; disk 2 fails, then works; 3 skipped.
+        app.write_outcome = Some(Ok("Set-disk1.scp".into()));
+        app.verify_result = Some((true, "Read back 720/720 sectors".into()));
+        app.bwrite_disk_done();
+        app.write_outcome = Some(Err("Track 0 not found".into()));
+        app.bwrite_disk_done();
+        let text = screen_text(&mut app);
+        assert!(text.contains("Disk 2 didn't write"), "{text}");
+        app.write_outcome = Some(Ok("Set-disk2.img".into()));
+        app.bwrite_disk_done();
+        key(&mut app, KeyCode::Char('s'));
+        let text = screen_text(&mut app);
+        assert!(text.contains("2 of 3 disks written."), "{text}");
+        assert!(text.contains("Set-disk1.scp  written · Read back 720/720 sectors"), "{text}");
+        assert!(text.contains("Set-disk2.img  written · verified by gw"), "{text}");
+        assert!(text.contains("Set-disk10.img  skipped"), "{text}");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Menu);
+        assert!(app.bwrite.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

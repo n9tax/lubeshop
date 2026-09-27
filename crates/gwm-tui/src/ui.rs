@@ -101,6 +101,8 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Screen::NameInput => render_name_input(app, frame, chunks[1]),
         Screen::ReadOptions => render_read_options(app, frame, chunks[1]),
         Screen::BatchSetup => render_batch_setup(app, frame, chunks[1]),
+        Screen::BatchWriteSelect => render_bwrite_select(app, frame, chunks[1]),
+        Screen::BatchWritePrompt => render_bwrite_prompt(app, frame, chunks[1]),
         Screen::TestMedia => render_test_media(app, frame, chunks[1]),
         Screen::TestConfirm => render_test_confirm(app, frame, chunks[1]),
         Screen::Testing => render_testing(app, frame, chunks[1]),
@@ -1827,6 +1829,8 @@ fn render_tuning_profiles(app: &App, frame: &mut Frame, area: Rect) {
 fn render_library_move(app: &mut App, frame: &mut Frame, area: Rect) {
     let heading = if app.move_purpose == crate::app::MovePurpose::BatchFolder {
         "  Save the disk set in:".to_string()
+    } else if app.move_purpose == crate::app::MovePurpose::BatchWriteFolder {
+        "  Write the disk set from:".to_string()
     } else {
         format!("  Move “{}” to:", app.move_item_name().unwrap_or("this image"))
     };
@@ -1873,10 +1877,17 @@ fn render_library_move(app: &mut App, frame: &mut Frame, area: Rect) {
         }
         items.push(ListItem::new(Line::from(spans)));
     }
-    // Always offer to make the destination on the spot, at this level.
-    items.push(ListItem::new(Line::from(Span::styled("+  new folder…", accented()))));
+    // Offer to make the destination on the spot, at this level (not when
+    // picking a folder to write images *from*).
+    if app.move_purpose != crate::app::MovePurpose::BatchWriteFolder {
+        items.push(ListItem::new(Line::from(Span::styled("+  new folder…", accented()))));
+    }
     let list = List::new(items)
-        .block(bordered("Move to folder"))
+        .block(bordered(if app.move_purpose == crate::app::MovePurpose::BatchWriteFolder {
+            "Batch write — pick the folder"
+        } else {
+            "Move to folder"
+        }))
         .highlight_style(hl())
         .highlight_symbol("▸ ");
     frame.render_stateful_widget(list, rows[1], &mut app.move_state);
@@ -2058,6 +2069,7 @@ fn render_test_done(app: &App, frame: &mut Frame, area: Rect) {
     if let Some(e) = &job.error {
         lines.push(Line::from(Span::styled(format!("  {e}"), Style::default().fg(theme().warning))));
     }
+    lines.extend(note_lines(&job.notes));
     for p in &job.passes {
         lines.push(test_pass_line(p));
     }
@@ -2115,6 +2127,20 @@ fn erase_line(on: bool, pad: &str) -> Line<'static> {
         Span::styled(if on { "[x]" } else { "[ ]" }, Style::default().fg(theme().accent)),
         Span::styled("  AC-erases the tracks first (e to toggle)", dim()),
     ])
+}
+
+/// Hang/recovery notes, kept short: the latest two, plus how many came
+/// before, so a disk that hangs every cycle can't push the table off screen.
+fn note_lines(notes: &[String]) -> Vec<Line<'static>> {
+    let warn = Style::default().fg(theme().warning);
+    let mut out = Vec::new();
+    if notes.len() > 2 {
+        out.push(Line::from(Span::styled(format!("  ! {} earlier hangs recovered", notes.len() - 2), warn)));
+    }
+    for n in notes.iter().skip(notes.len().saturating_sub(2)) {
+        out.push(Line::from(Span::styled(format!("  ! {n}"), warn)));
+    }
+    out
 }
 
 /// Tracks as `cyl.side` labels, the first `max` of them.
@@ -2200,7 +2226,9 @@ fn render_conditioning(app: &App, frame: &mut Frame, area: Rect) {
     let left = job.left.len().saturating_sub(job.outcomes.values().filter(|o| **o == gwm_core::disk_test::TrackOutcome::Failed).count());
     let label = format!("cycle {} (limit {}) · {} track{} still in progress", job.history.len(), job.max_rounds, left, if left == 1 { "" } else { "s" });
     frame.render_widget(gauge(job.ratio(), label), rows[1]);
-    frame.render_widget(para(condition_rounds_lines(job)), rows[2]);
+    let mut table = note_lines(&job.notes);
+    table.extend(condition_rounds_lines(job));
+    frame.render_widget(para(table), rows[2]);
 }
 
 fn render_condition_done(app: &App, frame: &mut Frame, area: Rect) {
@@ -2244,8 +2272,9 @@ fn render_condition_done(app: &App, frame: &mut Frame, area: Rect) {
             if job.erase { "  Each write was preceded by an AC erase." } else { "  Run without erasing before writes." },
             dim(),
         )),
-        Line::from(""),
     ];
+    lines.extend(note_lines(&job.notes));
+    lines.push(Line::from(""));
     if !repaired.is_empty() {
         let shown: Vec<String> = repaired.iter().take(14).map(|((c, h), n)| format!("{c}.{h} ({n})")).collect();
         let more = repaired.len().saturating_sub(14);
@@ -2312,6 +2341,138 @@ fn render_condition_done(app: &App, frame: &mut Frame, area: Rect) {
         dim(),
     )));
     frame.render_widget(para(lines).block(bordered("Repair a disk — result")), area);
+}
+
+/// How a batch-write image will be written, in a few words.
+fn write_plan_label(plan: &crate::app::WritePlan, fallback: Option<&str>) -> String {
+    use crate::app::WritePlan;
+    match plan {
+        WritePlan::Flux => "flux · exact copy, read back".to_string(),
+        WritePlan::Container => "Teledisk/IMD · exact copy".to_string(),
+        WritePlan::Format(f) => f.clone(),
+        WritePlan::NeedsFormat => match fallback {
+            Some(f) => format!("{f} (chosen for the set)"),
+            None => "format not known — asked once".to_string(),
+        },
+    }
+}
+
+fn file_name_of(p: &std::path::Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+fn render_bwrite_select(app: &mut App, frame: &mut Frame, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(area);
+    let chosen = app.bwrite_files.iter().filter(|f| f.chosen).count();
+    frame.render_widget(
+        para(vec![
+            Line::from(vec![
+                Span::styled("  From ", dim()),
+                Span::styled(app.move_path_display(&app.bwrite_dir), accented()),
+            ]),
+            Line::from(Span::styled(
+                format!("  {chosen} of {} ticked — written in this order, one disk each.", app.bwrite_files.len()),
+                dim(),
+            )),
+        ]),
+        rows[0],
+    );
+    let mut order = 0;
+    let items: Vec<ListItem> = app
+        .bwrite_files
+        .iter()
+        .map(|f| {
+            let (tick, num) = if f.chosen {
+                order += 1;
+                ("[x]", format!("{order:>2}."))
+            } else {
+                ("[ ]", "   ".to_string())
+            };
+            let style = if f.chosen { Style::default().add_modifier(Modifier::BOLD) } else { dim() };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{tick} {num} "), Style::default().fg(theme().accent)),
+                Span::styled(file_name_of(&f.path), style),
+                Span::styled(format!("   {}", write_plan_label(&f.plan, None)), dim()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(bordered("Batch write — choose the disks"))
+        .highlight_style(hl())
+        .highlight_symbol("▸ ");
+    frame.render_stateful_widget(list, rows[1], &mut app.bwrite_state);
+}
+
+fn render_bwrite_prompt(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(b) = app.bwrite.as_ref() else { return };
+    let drive = app.chosen_drive.to_uppercase();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  From   ", dim()),
+            Span::styled(app.move_path_display(&b.dir), Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Drive  ", dim()),
+            Span::raw(drive.clone()),
+            Span::styled(if app.write_erase { "   · erase each track first" } else { "" }, dim()),
+        ]),
+        Line::from(""),
+    ];
+    for (i, f) in b.files.iter().enumerate() {
+        let n = i + 1;
+        let name = file_name_of(&f.path);
+        let line = match b.results.get(i).cloned().flatten() {
+            Some(r) if r.ok => Line::from(vec![
+                Span::styled(format!("  ✓ Disk {n:<3}"), Style::default().fg(theme().success)),
+                Span::styled(format!("{name}  "), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(r.detail, dim()),
+            ]),
+            Some(r) if r.detail == "skipped" => Line::from(vec![
+                Span::styled(format!("  – Disk {n:<3}"), dim()),
+                Span::styled(format!("{name}  skipped"), dim()),
+            ]),
+            Some(r) => Line::from(vec![
+                Span::styled(format!("  ✗ Disk {n:<3}"), Style::default().fg(theme().danger)),
+                Span::styled(format!("{name}  "), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(r.detail, Style::default().fg(theme().danger)),
+            ]),
+            None if i == b.next && !b.finished() => Line::from(vec![
+                Span::styled(format!("  ▸ Disk {n:<3}"), accented()),
+                Span::styled(format!("{name}  "), accented()),
+                Span::styled(write_plan_label(&f.plan, b.fallback_format.as_deref()), dim()),
+            ]),
+            None => Line::from(vec![Span::styled(format!("  · Disk {n:<3}"), dim()), Span::styled(name, dim())]),
+        };
+        lines.push(line);
+    }
+    lines.push(Line::from(""));
+    if b.finished() {
+        let ok = b.results.iter().flatten().filter(|r| r.ok).count();
+        lines.push(Line::from(Span::styled(
+            format!("  {ok} of {} disks written.", b.files.len()),
+            Style::default().fg(theme().success).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        let cur = file_name_of(&b.files[b.next].path);
+        if b.results.get(b.next).cloned().flatten().is_some_and(|r| !r.ok) {
+            lines.push(Line::from(Span::styled(
+                format!("  Disk {} didn't write. Try another disk and press y, or s to skip it.", b.next + 1),
+                Style::default().fg(theme().warning),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  Put disk {} of {} ({cur}) in drive {drive}.", b.next + 1, b.files.len()),
+            accented().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  This ERASES the disk. Press y to write it.",
+            Style::default().fg(theme().danger).add_modifier(Modifier::BOLD),
+        )));
+    }
+    frame.render_widget(para(lines).block(bordered("Batch write")), area);
 }
 
 fn render_batch_setup(app: &App, frame: &mut Frame, area: Rect) {
@@ -3299,7 +3460,9 @@ fn status_hint(app: &App) -> &'static str {
             Screen::LibraryConfirmDelete => "  y confirm · f toggle file · Esc cancel",
             Screen::LibraryRename => "  type name · Enter rename · Esc cancel",
             Screen::LibraryMove => {
-                if app.move_purpose == crate::app::MovePurpose::BatchFolder {
+                if app.move_purpose == crate::app::MovePurpose::BatchWriteFolder {
+                    "  ↑/↓ pick · → open folder (›) · ← back up · Enter use this folder's images · Esc cancel"
+                } else if app.move_purpose == crate::app::MovePurpose::BatchFolder {
                     "  ↑/↓ pick · → open folder (›) · ← back up · Enter use this folder · last row makes a new folder · Esc back"
                 } else {
                     "  ↑/↓ pick · → open folder (›) · ← back up · Enter move here · last row makes a new folder · Esc cancel"
@@ -3342,6 +3505,14 @@ fn status_hint(app: &App) -> &'static str {
                 }
             }
             Screen::ConditionDone => "  Enter run the full test again · Esc main menu",
+            Screen::BatchWriteSelect => "  ↑/↓ move · Space tick · a all/none · Enter continue · Esc back to folders",
+            Screen::BatchWritePrompt => {
+                if app.bwrite.as_ref().is_some_and(|b| b.finished()) {
+                    "  Enter/Esc main menu"
+                } else {
+                    "  y erase and write this disk · e erase-first on/off · s skip · Esc end the set"
+                }
+            }
             Screen::BatchSetup => match app.batch_row {
                 0 => "  type the set's name · ↓/Enter next · Esc cancel",
                 1 => "  ←/→ or type a number · ↓/Enter next · Esc cancel",

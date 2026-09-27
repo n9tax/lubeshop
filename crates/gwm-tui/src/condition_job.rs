@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::thread;
 
 use gwm_core::disk_test::{self, ConditionEnd, ConditionRound, Geometry, RepairTracker, TrackOutcome, CONFIRM_PASSES};
+use gwm_core::device::StepOutcome;
 use gwm_core::read::ReadEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,8 @@ enum Msg {
         relapsed: BTreeSet<(u32, u32)>,
     },
     Done { end: ConditionEnd },
+    /// Something worth telling the user (a hang recovered from, a fallback).
+    Note(String),
 }
 
 pub struct ConditionJob {
@@ -64,6 +67,8 @@ pub struct ConditionJob {
     /// Tracks not good or repaired: failed, or unfinished when it stopped.
     pub left: BTreeSet<(u32, u32)>,
     pub cancelled: bool,
+    /// Hangs recovered from, and fallbacks taken, in plain words.
+    pub notes: Vec<String>,
 }
 
 impl ConditionJob {
@@ -101,6 +106,7 @@ impl ConditionJob {
             history: Vec::new(),
             end: None,
             cancelled: false,
+            notes: Vec::new(),
         }
     }
 
@@ -138,6 +144,7 @@ impl ConditionJob {
             end: Some(end),
             left,
             cancelled: false,
+            notes: Vec::new(),
         }
     }
 
@@ -165,6 +172,7 @@ impl ConditionJob {
                     self.end = Some(end);
                     ended = true;
                 }
+                Msg::Note(n) => self.notes.push(n),
             }
         }
         ended
@@ -242,6 +250,8 @@ fn run(
     let seed = disk_test::fresh_seed();
     let mut tracker = RepairTracker::new(&tracks, full_disk, max_cycles, CONFIRM_PASSES);
     let mut stopped = false;
+    // High-frequency erase until it hangs once; then plain erase for the run.
+    let mut hfreq = true;
     // Failing tracks stop at the limit; ones confirming may run CONFIRM_PASSES
     // past it. The hard cap is only a backstop.
     let cap = max_cycles + CONFIRM_PASSES + 1;
@@ -273,28 +283,66 @@ fn run(
                 let _ = tx.send(Msg::Step { cycle, step: s, tracks: here.len(), confirming });
             };
 
+            // Every gw step runs under a stall watchdog: gw has no timeouts, and
+            // a dragging disk can leave it waiting on the device forever. A hang
+            // resets the Greaseweazle and retries once; a second one stops.
+            let note = |n: String| {
+                let _ = tx.send(Msg::Note(n));
+            };
+
             // AC-erase first: clears old and off-track signal.
             if erase {
                 step(Step::Erasing);
-                let args = vec![
-                    "erase".to_string(),
-                    format!("--drive={drive}"),
-                    "--hfreq".to_string(),
-                    "--revs=2".to_string(),
-                    format!("--tracks={spec}"),
-                ];
-                if let Some(e) = run_gw(&args, &cancel) {
-                    result.error = Some(e);
-                    break;
+                let erase_args = |hfreq: bool| {
+                    let mut a = vec!["erase".to_string(), format!("--drive={drive}")];
+                    if hfreq {
+                        a.push("--hfreq".to_string());
+                    }
+                    a.push("--revs=2".to_string());
+                    a.push(format!("--tracks={spec}"));
+                    a
+                };
+                // Retry a stalled high-frequency erase as a plain one: the hang
+                // is in the long single-write path --hfreq uses.
+                let r = gwm_core::device::run_step_recovering(
+                    &erase_args(hfreq),
+                    &erase_args(false),
+                    cancel.clone(),
+                    "erasing",
+                    |_| {},
+                );
+                if r.recovered && hfreq {
+                    hfreq = false;
+                    note(format!(
+                        "Cycle {cycle}: device hung erasing — reset, now plain erase"
+                    ));
+                } else if r.recovered {
+                    note(format!("Cycle {cycle}: device hung erasing — reset, retried"));
+                }
+                match r.outcome {
+                    StepOutcome::Done => {}
+                    StepOutcome::Cancelled => break,
+                    StepOutcome::Failed(e) => {
+                        result.error = Some(e);
+                        break;
+                    }
                 }
             }
 
             // Write once — no gw verify, the read-back is the judge.
             step(Step::Writing);
             let write = crate::disk_test_job::write_args(&format, &drive, hard_sectors, Some(&spec), &img);
-            if let Some(e) = run_gw(&write, &cancel) {
-                result.error = Some(e);
-                break;
+            let r = gwm_core::device::run_step_recovering(&write, &write, cancel.clone(), "writing", |_| {});
+            if r.recovered {
+                note(format!("Cycle {cycle}: device hung writing — reset, retried"));
+            }
+            match r.outcome {
+                StepOutcome::Done => {}
+                StepOutcome::Cancelled => break,
+                StepOutcome::Failed(e) => {
+                    result.error = Some(e);
+                    break;
+                }
             }
 
             // Read just these tracks back and compare them.
@@ -310,20 +358,21 @@ fn run(
                 Some(&spec),
                 &back.to_string_lossy(),
             );
-            let mut failed = None;
-            let status = gwm_core::read::run_read_cancellable(&args, cancel.clone(), |ev| match ev {
-                ReadEvent::Track { cyl, head, retry: Some(_), .. } | ReadEvent::GaveUp { cyl, head, .. } => {
+            let r = gwm_core::device::run_step_recovering(&args, &args, cancel.clone(), "reading", |line| {
+                if let Some(ReadEvent::Track { cyl, head, retry: Some(_), .. } | ReadEvent::GaveUp { cyl, head, .. }) =
+                    gwm_core::read::parse_read_line(line)
+                {
                     retried.insert((cyl, head));
                 }
-                ReadEvent::Failed(e) => failed = Some(e),
-                _ => {}
             });
-            if cancel.load(Ordering::Relaxed) {
-                break;
+            if r.recovered {
+                note(format!("Cycle {cycle}: device hung reading — reset, retried"));
             }
-            if let Err(e) = status {
-                failed = Some(format!("could not run gw: {e}"));
-            }
+            let failed = match r.outcome {
+                StepOutcome::Done => None,
+                StepOutcome::Cancelled => break,
+                StepOutcome::Failed(e) => Some(e),
+            };
             let got = std::fs::read(&back).unwrap_or_default();
             if got.len() < geom.bytes() {
                 result.error = Some(failed.unwrap_or_else(|| "the read-back stopped early".to_string()));
@@ -357,22 +406,9 @@ fn run(
         let _ = tx.send(Msg::Cycle { round: result, outcomes: tracker.outcomes(), relapsed: tracker.relapsed_tracks() });
     }
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = tx.send(Msg::Done { end: tracker.end(stopped) });
-}
-
-/// Run a gw command to completion; `Some(reason)` if it failed.
-fn run_gw(args: &[String], cancel: &Arc<AtomicBool>) -> Option<String> {
-    let mut fatal = gwm_core::proc::FatalTracker::default();
-    let mut failed = None;
-    let status = gwm_core::proc::run_streaming_cancellable(args, cancel.clone(), |line| {
-        if let Some(reason) = fatal.note(line) {
-            failed = Some(reason);
-        } else if line.contains("Command Failed") {
-            failed = Some(line.trim().to_string());
-        }
-    });
-    match status {
-        Err(e) => Some(format!("could not run gw: {e}")),
-        Ok(_) => failed,
+    // A gw killed mid-command (Esc) can leave the device part-way through it.
+    if cancel.load(Ordering::Relaxed) {
+        gwm_core::device::reset_watched();
     }
+    let _ = tx.send(Msg::Done { end: tracker.end(stopped) });
 }

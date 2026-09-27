@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::thread;
 
 use gwm_core::disk_test::{self, Geometry, PassResult};
+use gwm_core::device::StepOutcome;
 use gwm_core::read::ReadEvent;
 use gwm_core::write::WriteEvent;
 
@@ -44,6 +45,7 @@ enum Msg {
     Track,
     Pass(PassResult),
     Error(String),
+    Note(String),
     Done,
 }
 
@@ -63,6 +65,8 @@ pub struct DiskTestJob {
     pub error: Option<String>,
     pub cancelled: bool,
     pub finished: bool,
+    /// Hangs recovered from, in plain words.
+    pub notes: Vec<String>,
 }
 
 impl DiskTestJob {
@@ -85,6 +89,7 @@ impl DiskTestJob {
             error: None,
             cancelled: false,
             finished: false,
+            notes: Vec::new(),
         }
     }
 
@@ -106,6 +111,7 @@ impl DiskTestJob {
             error: None,
             cancelled: false,
             finished: true,
+            notes: Vec::new(),
         }
     }
 
@@ -126,6 +132,7 @@ impl DiskTestJob {
                 Msg::Track => self.tracks_done = (self.tracks_done + 1).min(self.tracks_total),
                 Msg::Pass(r) => self.passes.push(r),
                 Msg::Error(e) => self.error = Some(e),
+                Msg::Note(n) => self.notes.push(n),
                 Msg::Done => {
                     self.finished = true;
                     ended = true;
@@ -192,7 +199,8 @@ fn run(
         let write_args = write_args(&format, &drive, hard_sectors, tracks.as_deref(), &img);
         let mut write_error = None;
         let mut wrote = 0u32;
-        let status = gwm_core::proc::run_streaming_cancellable(&write_args, cancel.clone(), |line| {
+        // Under the stall watchdog: a hang resets the device and retries once.
+        let r = gwm_core::device::run_step_recovering(&write_args, &write_args, cancel.clone(), "writing", |line| {
             match gwm_core::write::parse_write_line(line) {
                 Some(WriteEvent::Track { .. }) => {
                     wrote += 1;
@@ -205,8 +213,11 @@ fn run(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        if let Err(e) = status {
-            write_error = Some(format!("could not run gw: {e}"));
+        if r.recovered {
+            let _ = tx.send(Msg::Note(format!("Pass {pass}: device hung writing — reset, retried")));
+        }
+        if let StepOutcome::Failed(e) = r.outcome {
+            write_error.get_or_insert(e);
         }
         if write_error.is_none() && wrote == 0 {
             write_error = Some("gw wrote no tracks".to_string());
@@ -230,27 +241,31 @@ fn run(
         );
         let mut read_error = None;
         let mut seen = std::collections::HashSet::new();
-        let status = gwm_core::read::run_read_cancellable(&read_args, cancel.clone(), |ev| match ev {
-            ReadEvent::Track { cyl, head, retry, .. } => {
-                // gw prints a line per attempt; count each track once.
-                if seen.insert((cyl, head)) {
-                    let _ = tx.send(Msg::Track);
+        let r = gwm_core::device::run_step_recovering(&read_args, &read_args, cancel.clone(), "reading", |line| {
+            match gwm_core::read::parse_read_line(line) {
+                Some(ReadEvent::Track { cyl, head, retry, .. }) => {
+                    // gw prints a line per attempt; count each track once.
+                    if seen.insert((cyl, head)) {
+                        let _ = tx.send(Msg::Track);
+                    }
+                    if retry.is_some() {
+                        result.retried.insert((cyl, head));
+                    }
                 }
-                if retry.is_some() {
+                Some(ReadEvent::GaveUp { cyl, head, .. }) => {
                     result.retried.insert((cyl, head));
                 }
+                _ => {}
             }
-            ReadEvent::GaveUp { cyl, head, .. } => {
-                result.retried.insert((cyl, head));
-            }
-            ReadEvent::Failed(e) => read_error = Some(e),
-            _ => {}
         });
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        if let Err(e) = status {
-            read_error = Some(format!("could not run gw: {e}"));
+        if r.recovered {
+            let _ = tx.send(Msg::Note(format!("Pass {pass}: device hung reading — reset, retried")));
+        }
+        if let StepOutcome::Failed(e) = r.outcome {
+            read_error = Some(e);
         }
 
         let _ = tx.send(Msg::Phase(TestPhase::Comparing(pass)));
@@ -267,6 +282,10 @@ fn run(
         let _ = tx.send(Msg::Pass(result));
     }
     cleanup(&dir);
+    // A gw killed mid-command (Esc) can leave the device part-way through it.
+    if cancel.load(Ordering::Relaxed) {
+        gwm_core::device::reset_watched();
+    }
     done(&tx)
 }
 

@@ -38,6 +38,11 @@ keyboard-driven screen.
   cleared); missing oxide doesn't. You get what was repaired, on which cycle, and what
   still fails. After a media test, `c` does the same for just the tracks it flagged.
   Clean the drive head afterwards.
+- **Batch write a disk set** — pick a folder, tick the images to write (in natural
+  order, so disk2 comes before disk10), choose the drive once, then it prompts for each
+  disk — confirming each erase — and writes it the way a single write would: flux as an
+  exact copy with a read-back, Teledisk/IMD as an exact copy, sector images through
+  their format. A disk that fails can be retried or skipped.
 - **Write images back to floppies** — with a clear destructive-action confirmation
   (and optional erase-first) so you never overwrite a disk by accident.
 - **Browse inside a disk image** — see the files on the disk and its free space,

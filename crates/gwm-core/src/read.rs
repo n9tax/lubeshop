@@ -204,6 +204,27 @@ pub fn run_read<F: FnMut(ReadEvent)>(args: &[String], on_event: F) -> std::io::R
 }
 
 /// Like [`run_read`], but abortable: flip `cancel` to stop the read mid-track.
+/// [`run_read_cancellable`] with the stall watchdog of
+/// [`crate::proc::run_streaming_watchdog`]: a read that goes silent for
+/// `idle` is killed and reported as [`crate::proc::Watched::Stalled`].
+pub fn run_read_watchdog<F: FnMut(ReadEvent)>(
+    args: &[String],
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    idle: std::time::Duration,
+    mut on_event: F,
+) -> std::io::Result<crate::proc::Watched> {
+    let mut fatal = crate::proc::FatalTracker::default();
+    crate::proc::run_streaming_watchdog(args, cancel, idle, |line| {
+        if let Some(reason) = fatal.note(line) {
+            on_event(ReadEvent::Failed(reason));
+            return;
+        }
+        if let Some(event) = parse_read_line(line) {
+            on_event(event);
+        }
+    })
+}
+
 pub fn run_read_cancellable<F: FnMut(ReadEvent)>(
     args: &[String],
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,

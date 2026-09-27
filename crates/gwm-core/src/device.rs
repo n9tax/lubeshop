@@ -506,3 +506,159 @@ mod tests {
         assert!(!without.iter().any(|a| a == "--pre-erase"));
     }
 }
+
+// ---- watched gw steps with one automatic recovery ---------------------------
+
+/// How long gw may go without printing a line before it's considered hung.
+/// Every track gw works on prints within seconds; this is far past slow.
+pub const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How a recovering step ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepOutcome {
+    Done,
+    /// gw reported a failure (or stalled twice), in plain words.
+    Failed(String),
+    Cancelled,
+}
+
+/// The result of [`run_step_recovering`]: the outcome, and whether it had to
+/// recover from a hang on the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepReport {
+    pub outcome: StepOutcome,
+    pub recovered: bool,
+}
+
+/// Reset the Greaseweazle under the stall watchdog — a wedged device can hang
+/// `gw reset` too. `true` if it answered.
+pub fn reset_watched() -> bool {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    matches!(
+        crate::proc::run_streaming_watchdog(&["reset".to_string()], cancel, std::time::Duration::from_secs(20), |_| {}),
+        Ok(crate::proc::Watched::Exited(_))
+    )
+}
+
+/// Run one gw step with the stall watchdog. If gw hangs, reset the device and
+/// run `retry_args` once (the same command, or a gentler variant). A second
+/// hang is reported as a failure naming `what`, rather than waiting forever.
+/// Every output line goes to `on_line` (callers parse their own events).
+pub fn run_step_recovering<F: FnMut(&str)>(
+    args: &[String],
+    retry_args: &[String],
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    what: &str,
+    mut on_line: F,
+) -> StepReport {
+    use crate::proc::Watched;
+    let attempt = |a: &[String], on_line: &mut F| -> Result<Watched, String> {
+        let mut fatal = crate::proc::FatalTracker::default();
+        let mut failed: Option<String> = None;
+        let r = crate::proc::run_streaming_watchdog(a, cancel.clone(), STALL_LIMIT, |line| {
+            if let Some(reason) = fatal.note(line) {
+                failed = Some(reason);
+            } else if line.contains("Command Failed") && failed.is_none() {
+                failed = Some(line.trim().to_string());
+            }
+            on_line(line);
+        })
+        .map_err(|e| format!("could not run gw: {e}"))?;
+        match (r, failed) {
+            (Watched::Exited(_), Some(reason)) => Err(reason),
+            (w, _) => Ok(w),
+        }
+    };
+    recover_step(
+        args,
+        retry_args,
+        what,
+        |a| attempt(a, &mut on_line),
+        || {
+            reset_watched();
+        },
+    )
+}
+
+/// The decision logic of [`run_step_recovering`], with the gw run and the
+/// device reset injected so it can be tested without hardware.
+fn recover_step(
+    args: &[String],
+    retry_args: &[String],
+    what: &str,
+    mut attempt: impl FnMut(&[String]) -> Result<crate::proc::Watched, String>,
+    mut reset: impl FnMut(),
+) -> StepReport {
+    use crate::proc::Watched;
+    match attempt(args) {
+        Err(reason) => StepReport { outcome: StepOutcome::Failed(reason), recovered: false },
+        Ok(Watched::Exited(_)) => StepReport { outcome: StepOutcome::Done, recovered: false },
+        Ok(Watched::Cancelled) => StepReport { outcome: StepOutcome::Cancelled, recovered: false },
+        Ok(Watched::Stalled) => {
+            reset();
+            let outcome = match attempt(retry_args) {
+                Err(reason) => StepOutcome::Failed(reason),
+                Ok(Watched::Exited(_)) => StepOutcome::Done,
+                Ok(Watched::Cancelled) => StepOutcome::Cancelled,
+                Ok(Watched::Stalled) => {
+                    reset();
+                    StepOutcome::Failed(format!(
+                        "device hung twice {what} — disk may be dragging"
+                    ))
+                }
+            };
+            StepReport { outcome, recovered: true }
+        }
+    }
+}
+
+#[cfg(test)]
+mod recover_tests {
+    use super::*;
+    use crate::proc::Watched;
+
+    fn run(script: Vec<Result<Watched, String>>) -> (StepReport, Vec<Vec<String>>, u32) {
+        let mut script = script.into_iter();
+        let mut calls = Vec::new();
+        let mut resets = 0;
+        let report = recover_step(
+            &["erase".into(), "--hfreq".into()],
+            &["erase".into()],
+            "erasing",
+            |a| {
+                calls.push(a.to_vec());
+                script.next().unwrap()
+            },
+            || resets += 1,
+        );
+        (report, calls, resets)
+    }
+
+    #[test]
+    fn a_hang_resets_and_retries_with_the_retry_args() {
+        let (r, calls, resets) = run(vec![Ok(Watched::Stalled), Ok(Watched::Exited(Some(0)))]);
+        assert_eq!(r, StepReport { outcome: StepOutcome::Done, recovered: true });
+        assert_eq!(calls, vec![vec!["erase".to_string(), "--hfreq".to_string()], vec!["erase".to_string()]]);
+        assert_eq!(resets, 1);
+    }
+
+    #[test]
+    fn two_hangs_give_up_in_plain_words_and_leave_it_reset() {
+        let (r, _, resets) = run(vec![Ok(Watched::Stalled), Ok(Watched::Stalled)]);
+        match r.outcome {
+            StepOutcome::Failed(m) => assert!(m.contains("hung twice erasing"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(resets, 2);
+    }
+
+    #[test]
+    fn no_hang_no_reset() {
+        let (r, calls, resets) = run(vec![Ok(Watched::Exited(Some(0)))]);
+        assert_eq!(r, StepReport { outcome: StepOutcome::Done, recovered: false });
+        assert_eq!((calls.len(), resets), (1, 0));
+        let (r, _, resets) = run(vec![Err("Track0 signal absent".into())]);
+        assert_eq!(r.outcome, StepOutcome::Failed("Track0 signal absent".into()));
+        assert_eq!(resets, 0, "a real gw failure isn't a hang");
+    }
+}
