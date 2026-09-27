@@ -189,7 +189,12 @@ mod tests {
             return;
         }
         std::fs::create_dir_all(&paths.store_dir).unwrap();
-        std::fs::write(paths.config_dir.join("settings.toml"), "theme = \"c64\"\ndefault_drive = \"b\"\n").unwrap();
+        // On macOS the config folder *is* the default store, so there is no
+        // separate legacy file to be tempted by; only the backup half applies.
+        let separate_legacy = paths.config_dir != paths.store_dir;
+        if separate_legacy {
+            std::fs::write(paths.config_dir.join("settings.toml"), "theme = \"c64\"\ndefault_drive = \"b\"\n").unwrap();
+        }
         std::fs::write(
             paths.store_dir.join("settings.toml.bak"),
             "theme = \"borland\"\ndefault_drive = \"a\"\n\n[tuning]\nstep = 15000\n",
@@ -201,10 +206,12 @@ mod tests {
         assert_eq!(core.settings.tuning.get("step"), Some(&15000), "the tuning survives");
 
         // With no backup either, the legacy file is still adopted (first run).
-        std::fs::remove_file(paths.settings_file()).unwrap();
-        std::fs::remove_file(paths.store_dir.join("settings.toml.bak")).unwrap();
-        let core = Core::init().unwrap();
-        assert_eq!(core.settings.theme, "c64");
+        if separate_legacy {
+            std::fs::remove_file(paths.settings_file()).unwrap();
+            std::fs::remove_file(paths.store_dir.join("settings.toml.bak")).unwrap();
+            let core = Core::init().unwrap();
+            assert_eq!(core.settings.theme, "c64");
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 }
