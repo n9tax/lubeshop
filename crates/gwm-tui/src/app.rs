@@ -78,17 +78,22 @@ pub fn test_core() -> Core {
         std::fs::create_dir_all(h.join("config")).unwrap();
         std::fs::create_dir_all(h.join("data")).unwrap();
         std::env::set_var("LUBESHOP_NO_DEVICE", "1");
+        // XDG for Linux; HOME for macOS, whose app folders hang off it.
         std::env::set_var("XDG_CONFIG_HOME", h.join("config"));
         std::env::set_var("XDG_DATA_HOME", h.join("data"));
+        std::env::set_var("HOME", &h);
         h
     });
-    let core = Core::init().unwrap();
+    // Check where the store would be *before* Core::init writes anything, so
+    // a platform the redirect doesn't reach fails here instead of touching the
+    // real store.
+    let paths = gwm_core::AppPaths::discover().unwrap();
     assert!(
-        core.paths.store_dir.starts_with(home),
+        paths.store_dir.starts_with(home),
         "a test must never open the real store (got {})",
-        core.paths.store_dir.display()
+        paths.store_dir.display()
     );
-    core
+    Core::init().unwrap()
 }
 
 /// The main menu's three columns: a heading, and the `MENU_ITEMS` indices under

@@ -178,9 +178,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let (config, data) = (home.join("config"), home.join("data"));
         std::env::set_var("LUBESHOP_NO_DEVICE", "1");
+        // XDG for Linux; HOME for macOS, whose app folders hang off it.
         std::env::set_var("XDG_CONFIG_HOME", &config);
         std::env::set_var("XDG_DATA_HOME", &data);
+        std::env::set_var("HOME", &home);
         let paths = AppPaths::discover().unwrap();
+        // Never run against a real store: bail out where the redirect fails.
+        if !paths.store_dir.starts_with(&home) {
+            eprintln!("skipping: can't redirect the app folders on this platform");
+            return;
+        }
         std::fs::create_dir_all(&paths.store_dir).unwrap();
         std::fs::write(paths.config_dir.join("settings.toml"), "theme = \"c64\"\ndefault_drive = \"b\"\n").unwrap();
         std::fs::write(
