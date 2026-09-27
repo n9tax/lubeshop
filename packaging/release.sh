@@ -2,7 +2,8 @@
 #
 # Cut a release without the version drifting between the crate, the tarballs, and
 # the .deb. Bumps the workspace version, syncs the lockfile, commits, and tags —
-# so the git tag and every built artifact always agree.
+# so the git tag and every built artifact always agree. Needs a CHANGELOG.md
+# section for the version first (its release notes).
 #
 #   packaging/release.sh 0.1.1
 #
@@ -29,6 +30,14 @@ cd "$(dirname "$0")/.."
 
 if [ -n "$(git status --porcelain)" ]; then
   echo "error: working tree isn't clean — commit or stash first." >&2
+  exit 1
+fi
+
+# The release notes are CHANGELOG.md's section for this version; release.yml
+# publishes them on GitHub. No section, no release -- otherwise it ships with a
+# bare "Full changelog" link and nobody can see what changed.
+if [ -z "$(packaging/release-notes.sh "$ver")" ]; then
+  echo "error: CHANGELOG.md has no '## $ver' section -- write the release notes first." >&2
   exit 1
 fi
 

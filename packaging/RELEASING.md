@@ -24,9 +24,14 @@ the tarballs are named from the tag, and `packaging/PKGBUILD`'s `pkgver` decides
 and the `.deb` still says `0.1.0`; leave `pkgver` behind and `makepkg -si` silently
 builds an old release. Use the helper script so they can't drift:
 
+First write the release notes: a `## X.Y.Z — YYYY-MM-DD` section at the top of
+`CHANGELOG.md`, committed with the work. `release.yml` publishes that section as
+the GitHub release's notes (plus a compare link), and `release.sh` refuses to run
+without it. `packaging/release-notes.sh X.Y.Z` prints exactly what will be published.
+
 ```sh
-packaging/release.sh 0.1.1     # bumps Cargo.toml + PKGBUILD, syncs Cargo.lock,
-                               # commits, tags
+packaging/release.sh 0.1.1     # checks the notes, bumps Cargo.toml + PKGBUILD,
+                               # syncs Cargo.lock, commits, tags
 git push && git push origin v0.1.1
 ```
 
