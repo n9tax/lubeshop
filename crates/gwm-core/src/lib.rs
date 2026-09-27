@@ -69,13 +69,19 @@ impl Core {
         std::fs::create_dir_all(&paths.store_dir)?;
         std::fs::create_dir_all(&paths.library_dir)?;
 
-        // One-time migration: earlier versions kept settings.toml in the XDG
-        // config dir. If the store has none yet, adopt the legacy file so the
-        // user's theme/tuning survive the move into the portable store.
+        // A store without settings.toml: if its own backup is there, that is
+        // the store's real, recent settings — put it back. Only a store that
+        // never had settings (first run after the move into the portable
+        // store) adopts the legacy file from the XDG config dir, which can be
+        // months old: adopting it over a live store once silently replaced a
+        // user's drive tuning with July's.
         let settings_file = paths.settings_file();
         if !settings_file.exists() {
+            let backup = paths.store_dir.join("settings.toml.bak");
             let legacy = paths.config_dir.join("settings.toml");
-            if legacy.exists() {
+            if backup.exists() {
+                let _ = std::fs::copy(&backup, &settings_file);
+            } else if legacy.exists() {
                 let _ = std::fs::copy(&legacy, &settings_file);
             }
         }
@@ -157,5 +163,41 @@ impl Core {
         // the *background* (a big folder's hashing must not block the UI) — see
         // the TUI's IndexJob. Relocation itself only re-points and re-opens.
         self.save_settings()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store that lost settings.toml gets its own .bak back — never the
+    /// months-old legacy file from the XDG config dir.
+    #[test]
+    fn missing_settings_come_back_from_the_backup_not_the_legacy_file() {
+        let home = std::env::temp_dir().join(format!("gwm-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let (config, data) = (home.join("config"), home.join("data"));
+        std::env::set_var("LUBESHOP_NO_DEVICE", "1");
+        std::env::set_var("XDG_CONFIG_HOME", &config);
+        std::env::set_var("XDG_DATA_HOME", &data);
+        let paths = AppPaths::discover().unwrap();
+        std::fs::create_dir_all(&paths.store_dir).unwrap();
+        std::fs::write(paths.config_dir.join("settings.toml"), "theme = \"c64\"\ndefault_drive = \"b\"\n").unwrap();
+        std::fs::write(
+            paths.store_dir.join("settings.toml.bak"),
+            "theme = \"borland\"\ndefault_drive = \"a\"\n\n[tuning]\nstep = 15000\n",
+        )
+        .unwrap();
+
+        let core = Core::init().unwrap();
+        assert_eq!(core.settings.theme, "borland");
+        assert_eq!(core.settings.tuning.get("step"), Some(&15000), "the tuning survives");
+
+        // With no backup either, the legacy file is still adopted (first run).
+        std::fs::remove_file(paths.settings_file()).unwrap();
+        std::fs::remove_file(paths.store_dir.join("settings.toml.bak")).unwrap();
+        let core = Core::init().unwrap();
+        assert_eq!(core.settings.theme, "c64");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

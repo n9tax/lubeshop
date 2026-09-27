@@ -173,24 +173,34 @@ impl Settings {
     /// Save atomically: write a temp file, then rename it over the target.
     ///
     /// `fs::write` truncates first, so a crash or a kill mid-write leaves an
-    /// empty or half-written `settings.toml`. A rename is atomic on both
-    /// POSIX and Windows-with-replace, so the file on disk is only ever the
-    /// old contents or the new ones. The previous copy is kept alongside as
-    /// `settings.toml.bak` for [`load`] to fall back on.
+    /// empty or half-written `settings.toml`. A rename over an existing file is
+    /// atomic on POSIX and on Windows (std replaces), so `settings.toml` always
+    /// exists and holds either the old contents or the new ones.
+    ///
+    /// The previous contents are *copied* to `settings.toml.bak` first, never
+    /// moved: moving the live file aside left a moment with no settings.toml
+    /// at all, and saves racing in one process (they also shared one temp
+    /// name) could make that moment permanent — and a store without a
+    /// settings.toml adopts the ancient legacy config on the next launch.
     pub fn save(&self, store_dir: &Path) -> std::io::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
         let text = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let target = Self::file(store_dir);
 
-        // Same directory as the target: a rename across filesystems fails, and
-        // the store can sit on a different mount from the temp dir.
-        let tmp = store_dir.join(format!("settings.toml.tmp{}", std::process::id()));
+        // Same directory as the target (a rename across filesystems fails, and
+        // the store can sit on a different mount from the temp dir), and a name
+        // no other save — in this process or another — is using.
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = store_dir.join(format!("settings.toml.tmp{}-{n}", std::process::id()));
         std::fs::write(&tmp, &text)?;
 
-        // Roll the current file aside first. Losing the backup is not worth
-        // failing the save over, so this is best-effort.
+        // Keep the previous version. Best-effort: losing the backup is not
+        // worth failing the save over.
         if target.exists() {
-            let _ = std::fs::rename(&target, Self::backup_file(store_dir));
+            let _ = std::fs::copy(&target, Self::backup_file(store_dir));
         }
         match std::fs::rename(&tmp, &target) {
             Ok(()) => Ok(()),
@@ -305,6 +315,42 @@ mod tests {
         assert!(Settings::load_checked(&dir).1.is_none());
         std::fs::write(Settings::file(&dir), "").unwrap();
         assert!(Settings::load_checked(&dir).1.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Saves racing in one process must never leave the store without a
+    /// settings.toml. They used to share one temp name (`.tmp<pid>`), so one
+    /// thread could rename the other's temp away and leave the file missing —
+    /// which then made the next launch adopt an ancient legacy config.
+    #[test]
+    fn concurrent_saves_never_lose_the_file() {
+        let dir = std::env::temp_dir().join(format!("gwm-settings-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Settings::default();
+        s.tuning.insert("step".to_string(), 15000);
+        s.save(&dir).unwrap();
+        for _round in 0..40 {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (d, s) = (dir.clone(), s.clone());
+                    std::thread::spawn(move || {
+                        let _ = s.save(&d);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert!(Settings::file(&dir).exists(), "settings.toml went missing");
+            assert_eq!(Settings::load(&dir).tuning.get("step"), Some(&15000));
+        }
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "no temp files left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

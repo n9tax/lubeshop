@@ -62,13 +62,33 @@ pub const MENU_ITEMS: [&str; 17] = [
     "Repair / condition a disk",
 ];
 
-/// The core for a test: started with the Greaseweazle left alone (no `gw info`
-/// probe, no timing push), so a test run can't disturb a real read or write
-/// going on in a running copy of the app.
+/// The core for a test. It never touches the user's things:
+/// - the Greaseweazle is left alone (no `gw info` probe, no timing push), so a
+///   test run can't disturb a read or write in a running copy of the app;
+/// - the store is a throwaway folder: XDG config/data point into the temp dir,
+///   so the store locator, settings.toml and catalog are the test's own. Tests
+///   used to open the user's real store, and their parallel settings saves
+///   once deleted its settings.toml (and with it the drive tuning).
 #[cfg(test)]
 pub fn test_core() -> Core {
-    std::env::set_var("LUBESHOP_NO_DEVICE", "1");
-    Core::init().unwrap()
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let home = HOME.get_or_init(|| {
+        let h = std::env::temp_dir().join(format!("lubeshop-test-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        std::fs::create_dir_all(h.join("config")).unwrap();
+        std::fs::create_dir_all(h.join("data")).unwrap();
+        std::env::set_var("LUBESHOP_NO_DEVICE", "1");
+        std::env::set_var("XDG_CONFIG_HOME", h.join("config"));
+        std::env::set_var("XDG_DATA_HOME", h.join("data"));
+        h
+    });
+    let core = Core::init().unwrap();
+    assert!(
+        core.paths.store_dir.starts_with(home),
+        "a test must never open the real store (got {})",
+        core.paths.store_dir.display()
+    );
+    core
 }
 
 /// The main menu's three columns: a heading, and the `MENU_ITEMS` indices under
