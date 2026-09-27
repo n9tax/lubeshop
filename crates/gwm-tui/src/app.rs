@@ -8029,8 +8029,11 @@ mod batch_write {
         assert_eq!(v, ["Set-disk1.img", "set-disk2.img", "Set-disk02b.img", "Set-disk10.img"]);
     }
 
-    fn setup() -> (App, PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("gwm-bwrite-{}", std::process::id()));
+    /// A sample folder of images. `tag` keeps each test's folder its own: the
+    /// tests run in parallel, and one cleaning up must not pull the floor out
+    /// from under another (it did, on CI).
+    fn setup(tag: &str) -> (App, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("gwm-bwrite-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("Games");
         std::fs::create_dir_all(&dir).unwrap();
@@ -8048,7 +8051,7 @@ mod batch_write {
     /// would pick; sidecars and KryoFlux streams left out.
     #[test]
     fn candidates_are_ordered_filtered_and_planned() {
-        let (app, root, dir) = setup();
+        let (app, root, dir) = setup("candidates");
         let c = app.bwrite_candidates(&dir);
         let names: Vec<String> = c.iter().map(|f| file_name(&f.path)).collect();
         assert_eq!(names, ["boot.td0", "Set-disk1.scp", "Set-disk2.img", "Set-disk10.img"]);
@@ -8066,7 +8069,7 @@ mod batch_write {
     /// in as outcomes: nothing here presses `y`, so the drive is never touched.
     #[test]
     fn choose_files_then_write_disk_by_disk() {
-        let (mut app, root, dir) = setup();
+        let (mut app, root, dir) = setup("flow");
         let key = |app: &mut App, k| app.test_key(k, KeyModifiers::NONE);
         app.bwrite_folder_chosen(dir.clone());
         assert_eq!(app.screen, Screen::BatchWriteSelect);
